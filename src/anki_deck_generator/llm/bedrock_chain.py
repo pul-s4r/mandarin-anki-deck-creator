@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_aws import ChatBedrockConverse
+
+from anki_deck_generator.config.settings import Settings
+from anki_deck_generator.llm.schemas import LlmVocabularyItem, LlmVocabularyResult
+
+logger = logging.getLogger(__name__)
+
+_SYSTEM_PROMPT = """You are extracting Mandarin vocabulary flashcards from raw study notes. Output only structured data matching the schema. Do not extract, summarize, or output example sentences, dialogue lines, or multi-clause Chinese passages as separate fields; omit them entirely. If a line is primarily an example sentence rather than a headword or pattern, skip it unless it contains a clear vocabulary item that can be turned into one card row (headword + gloss) without treating the whole sentence as a field. Use simplified Chinese for simplified unless the note clearly targets traditional. Infer part_of_speech when possible (noun, verb, adjective, adverb, measure_word, idiom, phrase, grammar_pattern, sentence_pattern, etc.—multiple allowed, use semicolons). If the line is a grammar template, include grammar_pattern in part_of_speech and put the pattern explanation in usage_notes. Merge sub-items (a./b.) into meaning separated by ';'. If pinyin appears as tone numbers, convert to standard pinyin with tone marks when you can; otherwise preserve and note in usage_notes. If English or pinyin is missing and cannot be inferred, leave meaning or pinyin empty (do not invent). Ignore lesson metadata lines that are only dates, payments, or chat unless they contain vocabulary. Do not include Sentence* or example-sentence fields."""
+
+_USER_TEMPLATE = """Here is plain text from Chinese study notes (possibly with dates and numbering). Extract one card per distinct vocabulary item, phrase, or grammar point.
+
+{chunk_text}
+"""
+
+
+def build_bedrock_model(settings: Settings) -> ChatBedrockConverse:
+    kwargs: dict[str, Any] = {
+        "model_id": settings.bedrock_model_id,
+        "temperature": settings.bedrock_temperature,
+        "max_tokens": settings.bedrock_max_tokens,
+    }
+    if settings.aws_region:
+        kwargs["region_name"] = settings.aws_region
+    if settings.bedrock_top_p is not None:
+        kwargs["top_p"] = settings.bedrock_top_p
+    return ChatBedrockConverse(**kwargs)
+
+
+def extract_vocabulary_from_chunk(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
+    structured = model.with_structured_output(LlmVocabularyResult)
+    messages = [
+        SystemMessage(content=_SYSTEM_PROMPT),
+        HumanMessage(content=_USER_TEMPLATE.format(chunk_text=chunk_text)),
+    ]
+    try:
+        out = structured.invoke(messages)
+        if isinstance(out, LlmVocabularyResult):
+            return list(out.cards)
+        if isinstance(out, dict):
+            return list(LlmVocabularyResult.model_validate(out).cards)
+        logger.warning("unexpected structured output type %s", type(out))
+        return []
+    except Exception as e:
+        logger.warning("structured output failed (%s); attempting JSON fallback", e)
+        return _fallback_json_invoke(model, chunk_text)
+
+
+_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
+def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
+    human = _USER_TEMPLATE.format(chunk_text=chunk_text)
+    human += (
+        "\n\nRespond with JSON only: {\"cards\":[{"
+        '"simplified":"...", "traditional":"", "pinyin":"", "meaning":"", '
+        '"part_of_speech":"", "usage_notes":""}]}'
+    )
+    messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human)]
+    raw = model.invoke(messages)
+    text = _message_content_to_text(raw.content)
+    text = _FENCE.sub("", text).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        logger.error("JSON fallback parse failed; snippet=%s", text[:200])
+        return []
+    try:
+        result = LlmVocabularyResult.model_validate(data)
+        return list(result.cards)
+    except Exception:
+        logger.exception("validate fallback JSON failed")
+        return []
