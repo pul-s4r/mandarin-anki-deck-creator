@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are extracting Mandarin vocabulary flashcards from raw study notes. Output only structured data matching the schema. Do not extract, summarize, or output example sentences, dialogue lines, or multi-clause Chinese passages as separate fields; omit them entirely. If a line is primarily an example sentence rather than a headword or pattern, skip it unless it contains a clear vocabulary item that can be turned into one card row (headword + gloss) without treating the whole sentence as a field. Use simplified Chinese for simplified unless the note clearly targets traditional. Infer part_of_speech when possible (noun, verb, adjective, adverb, measure_word, idiom, phrase, grammar_pattern, sentence_pattern, etc.—multiple allowed, use semicolons). If the line is a grammar template, include grammar_pattern in part_of_speech and put the pattern explanation in usage_notes. Merge sub-items (a./b.) into meaning separated by ';'. If pinyin appears as tone numbers, convert to standard pinyin with tone marks when you can; otherwise preserve and note in usage_notes. If English or pinyin is missing and cannot be inferred, leave meaning or pinyin empty (do not invent). Ignore lesson metadata lines that are only dates, payments, or chat unless they contain vocabulary. Do not include Sentence* or example-sentence fields."""
 
-_USER_TEMPLATE = """Here is plain text from Chinese study notes (possibly with dates and numbering). Extract one card per distinct vocabulary item, phrase, or grammar point.
+_USER_TEMPLATE = """Here is plain text from Chinese study notes (possibly with dates and numbering). Extract one card per distinct vocabulary item, phrase, or grammar point. Be exhaustive: include all vocabulary items present in the text and do not stop early.
 
 {chunk_text}
 """
@@ -35,22 +35,9 @@ def build_bedrock_model(settings: Settings) -> ChatBedrockConverse:
 
 
 def extract_vocabulary_from_chunk(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
-    structured = model.with_structured_output(LlmVocabularyResult)
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=_USER_TEMPLATE.format(chunk_text=chunk_text)),
-    ]
-    try:
-        out = structured.invoke(messages)
-        if isinstance(out, LlmVocabularyResult):
-            return list(out.cards)
-        if isinstance(out, dict):
-            return list(LlmVocabularyResult.model_validate(out).cards)
-        logger.warning("unexpected structured output type %s", type(out))
-        return []
-    except Exception as e:
-        logger.warning("structured output failed (%s); attempting JSON fallback", e)
-        return _fallback_json_invoke(model, chunk_text)
+    # NOTE: Bedrock structured output can be brittle across models and releases.
+    # We always use an explicit JSON-only response contract and validate locally.
+    return _fallback_json_invoke(model, chunk_text)
 
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -86,11 +73,35 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        logger.error("JSON fallback parse failed; snippet=%s", text[:200])
-        return []
+        # Try to recover if the model wrapped JSON in extra text.
+        recovered = _extract_first_json_object(text)
+        if recovered is None:
+            logger.error("JSON fallback parse failed; snippet=%s", text[:200])
+            return []
+        try:
+            data = json.loads(recovered)
+        except json.JSONDecodeError:
+            logger.error("JSON fallback recovery parse failed; snippet=%s", recovered[:200])
+            return []
     try:
         result = LlmVocabularyResult.model_validate(data)
         return list(result.cards)
     except Exception:
         logger.exception("validate fallback JSON failed")
         return []
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None

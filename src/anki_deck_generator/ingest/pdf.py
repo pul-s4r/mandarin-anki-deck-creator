@@ -9,8 +9,10 @@ def extract_text_from_pdf(path: Path) -> str:
     doc = fitz.open(path)
     try:
         parts: list[str] = []
-        for page in doc:
-            parts.append(page.get_text())
-        return "\n".join(parts)
+        for idx, page in enumerate(doc):
+            page_text = page.get_text()
+            parts.append(page_text)
+        out = "\n".join(parts)
+        return out
     finally:
         doc.close()

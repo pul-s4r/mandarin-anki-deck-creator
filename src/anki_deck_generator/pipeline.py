@@ -60,7 +60,8 @@ def run_pipeline(
     all_cards: list[LlmVocabularyItem] = []
     for i, chunk in enumerate(chunks):
         logger.info("Processing chunk %s/%s (%s chars)", i + 1, len(chunks), len(chunk))
-        all_cards.extend(extract_vocabulary_from_chunk(model, chunk))
+        cards = extract_vocabulary_from_chunk(model, chunk)
+        all_cards.extend(cards)
     deduped = _dedupe_cards(all_cards)
     rows = [_llm_item_to_row(c, k + 1) for k, c in enumerate(deduped)]
 
