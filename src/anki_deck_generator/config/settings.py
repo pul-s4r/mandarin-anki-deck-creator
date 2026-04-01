@@ -20,14 +20,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ANKI_PIPELINE_AWS_REGION", "AWS_REGION"),
     )
     bedrock_model_id: str = Field(
-        default="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        default="us.meta.llama4-scout-17b-instruct-v1:0",
         validation_alias=AliasChoices(
             "ANKI_PIPELINE_BEDROCK_MODEL_ID",
             "BEDROCK_MODEL_ID",
         ),
         description="Bedrock inference profile or model ID",
     )
-    bedrock_temperature: float = 0.2
+    bedrock_temperature: float = 0.0
     bedrock_top_p: Optional[float] = None
     bedrock_top_k: Optional[int] = None
     bedrock_max_tokens: int = 8192
