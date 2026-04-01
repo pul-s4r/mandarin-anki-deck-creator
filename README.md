@@ -26,6 +26,10 @@ anki-notes-pipeline run /path/to/notes.pdf --output out.csv --cedict-path /path/
 
 Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, model params via environment (see `anki_deck_generator.config.settings`).
 
+## Debug logging helper
+
+The module `anki_deck_generator.debuglog` is kept in the repo as a small NDJSON logger you can use when diagnosing pipeline issues. By default, the pipeline does **not** emit debug logs; add temporary calls to `debug_log(...)` where needed and remove them after verification.
+
 ## Tests
 
 ```bash
