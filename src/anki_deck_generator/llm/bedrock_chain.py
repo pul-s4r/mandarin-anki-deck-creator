@@ -9,11 +9,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
 
 from anki_deck_generator.config.settings import Settings
-from anki_deck_generator.llm.schemas import LlmVocabularyItem, LlmVocabularyResult
+from anki_deck_generator.llm.schemas import (
+    LlmVocabularyItem,
+    LlmVocabularyResult,
+    llm_vocabulary_response_json_schema_text,
+)
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are extracting Mandarin vocabulary flashcards from raw study notes. Output only structured data matching the schema. Do not extract, summarize, or output example sentences, dialogue lines, or multi-clause Chinese passages as separate fields; omit them entirely. If a line is primarily an example sentence rather than a headword or pattern, skip it unless it contains a clear vocabulary item that can be turned into one card row (headword + gloss) without treating the whole sentence as a field. Use simplified Chinese for simplified unless the note clearly targets traditional. Infer part_of_speech when possible (noun, verb, adjective, adverb, measure_word, idiom, phrase, grammar_pattern, sentence_pattern, etc.—multiple allowed, use semicolons). If the line is a grammar template, include grammar_pattern in part_of_speech and put the pattern explanation in usage_notes. Merge sub-items (a./b.) into meaning separated by ';'. If pinyin appears as tone numbers, convert to standard pinyin with tone marks when you can; otherwise preserve and note in usage_notes. If English or pinyin is missing and cannot be inferred, leave meaning or pinyin empty (do not invent). Ignore lesson metadata lines that are only dates, payments, or chat unless they contain vocabulary. Do not include Sentence* or example-sentence fields."""
+_SYSTEM_PROMPT = """You are extracting Mandarin vocabulary flashcards from raw study notes. Reply with a single JSON object only (no markdown fences, no commentary); it must validate against the JSON Schema appended to the user message. Do not extract, summarize, or output example sentences, dialogue lines, or multi-clause Chinese passages as separate fields; omit them entirely. If a line is primarily an example sentence rather than a headword or pattern, skip it unless it contains a clear vocabulary item that can be turned into one card row (headword + gloss) without treating the whole sentence as a field. Use simplified Chinese for simplified unless the note clearly targets traditional. Infer part_of_speech when possible (noun, verb, adjective, adverb, measure_word, idiom, phrase, grammar_pattern, sentence_pattern, etc.—multiple allowed, use semicolons). If the line is a grammar template, include grammar_pattern in part_of_speech and put the pattern explanation in usage_notes. Merge sub-items (a./b.) into meaning separated by ';'. If pinyin appears as tone numbers, convert to standard pinyin with tone marks when you can; otherwise preserve and note in usage_notes. If English or pinyin is missing and cannot be inferred, leave meaning or pinyin empty (do not invent). Ignore lesson metadata lines that are only dates, payments, or chat unless they contain vocabulary. Do not include Sentence* or example-sentence fields."""
 
 _USER_TEMPLATE = """Here is plain text from Chinese study notes (possibly with dates and numbering). Extract one card per distinct vocabulary item, phrase, or grammar point. Be exhaustive: include all vocabulary items present in the text and do not stop early.
 
@@ -62,9 +66,8 @@ def _message_content_to_text(content: Any) -> str:
 def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
     human = _USER_TEMPLATE.format(chunk_text=chunk_text)
     human += (
-        "\n\nRespond with JSON only: {\"cards\":[{"
-        '"simplified":"...", "traditional":"", "pinyin":"", "meaning":"", '
-        '"part_of_speech":"", "usage_notes":""}]}'
+        "\n\nJSON Schema for your response (conform exactly; property descriptions are authoritative):\n"
+        + llm_vocabulary_response_json_schema_text()
     )
     messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human)]
     raw = model.invoke(messages)

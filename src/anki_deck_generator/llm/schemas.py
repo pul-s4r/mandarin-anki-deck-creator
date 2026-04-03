@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -38,4 +39,12 @@ class LlmVocabularyItem(BaseModel):
 
 
 class LlmVocabularyResult(BaseModel):
-    cards: list[LlmVocabularyItem] = Field(default_factory=list)
+    cards: list[LlmVocabularyItem] = Field(
+        default_factory=list,
+        description="One object per distinct vocabulary item, phrase, or grammar point",
+    )
+
+
+def llm_vocabulary_response_json_schema_text() -> str:
+    """JSON Schema for LLM responses; kept in sync with validation via LlmVocabularyResult."""
+    return json.dumps(LlmVocabularyResult.model_json_schema(), ensure_ascii=False, indent=2)
