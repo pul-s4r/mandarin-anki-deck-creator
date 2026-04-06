@@ -20,6 +20,10 @@ class VocabularyRow:
     meaning: str = ""
     part_of_speech: str = ""
     usage_notes: str = ""
+    sentence_simplified: str = ""
+    sentence_traditional: str = ""
+    sentence_pinyin: str = ""
+    sentence_meaning: str = ""
 
 
 class EnrichmentService:

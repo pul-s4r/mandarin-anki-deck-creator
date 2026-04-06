@@ -41,3 +41,11 @@ class Settings(BaseSettings):
     input_path: Optional[Path] = None
     output_csv: Optional[Path] = None
     cedict_path: Optional[Path] = None
+
+    enable_sentences: bool = True
+    prior_csv: Optional[Path] = None
+    sentence_links_csv: Optional[Path] = None
+    sentence_assignment_strategy: str = "importance"  # "importance" | "random"
+    sentence_random_seed: Optional[int] = None
+    sentences_per_term: int = 1
+    sentences_delimiter: str = " | "

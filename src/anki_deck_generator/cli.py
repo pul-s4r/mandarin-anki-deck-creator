@@ -18,6 +18,40 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("input", type=Path, help="Input PDF, Markdown, or DOCX file")
     run.add_argument("--output", "-o", type=Path, required=True, help="Output CSV path")
     run.add_argument("--cedict-path", type=Path, default=None, help="Path to cedict_ts.u8")
+    run.add_argument("--prior-csv", type=Path, default=None, help="Optional prior exported CSV for term index")
+    run.add_argument("--sentence-links-csv", type=Path, default=None, help="Write sentence_links.csv to this path")
+    run.add_argument(
+        "--enable-sentences",
+        dest="enable_sentences",
+        action="store_true",
+        help="Enable dialogue sentence parsing + linking (default)",
+    )
+    run.add_argument(
+        "--disable-sentences",
+        dest="enable_sentences",
+        action="store_false",
+        help="Disable dialogue sentence parsing + linking",
+    )
+    run.set_defaults(enable_sentences=True)
+    run.add_argument(
+        "--sentence-assignment-strategy",
+        choices=["importance", "random"],
+        default=None,
+        help="When multiple terms match a sentence, pick winner by 'importance' (default) or 'random'",
+    )
+    run.add_argument("--sentence-random-seed", type=int, default=None, help="Seed for random sentence assignment")
+    run.add_argument(
+        "--sentences-per-term",
+        type=int,
+        default=None,
+        help="Max number of sentences to store per term in the main CSV (default 1)",
+    )
+    run.add_argument(
+        "--sentences-delimiter",
+        type=str,
+        default=None,
+        help="Delimiter when storing multiple sentences per term (default: ' | ')",
+    )
     run.add_argument("--chunk-size", type=int, default=None)
     run.add_argument("--chunk-overlap", type=int, default=None)
     run.add_argument("--csv-bom", action="store_true", help="Write UTF-8 BOM for Excel")
@@ -37,6 +71,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.command == "run":
         settings = Settings()
+        settings.enable_sentences = bool(args.enable_sentences)
+        if args.prior_csv is not None:
+            settings.prior_csv = args.prior_csv
+        if args.sentence_links_csv is not None:
+            settings.sentence_links_csv = args.sentence_links_csv
+        if args.sentence_assignment_strategy is not None:
+            settings.sentence_assignment_strategy = args.sentence_assignment_strategy
+        if args.sentence_random_seed is not None:
+            settings.sentence_random_seed = args.sentence_random_seed
+        if args.sentences_per_term is not None:
+            settings.sentences_per_term = args.sentences_per_term
+        if args.sentences_delimiter is not None:
+            settings.sentences_delimiter = args.sentences_delimiter
         if args.chunk_size is not None:
             settings.chunk_size = args.chunk_size
         if args.chunk_overlap is not None:

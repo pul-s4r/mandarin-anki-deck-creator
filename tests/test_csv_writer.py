@@ -21,7 +21,7 @@ def test_write_csv_headers(tmp_path) -> None:
     ]
     write_vocabulary_csv(path, rows, bom=False)
     text = path.read_text(encoding="utf-8")
-    assert "Sentence" not in text
+    assert "SentenceSimplified" in text
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         assert r.fieldnames == [
@@ -32,4 +32,8 @@ def test_write_csv_headers(tmp_path) -> None:
             "Meaning",
             "PartOfSpeech",
             "UsageNotes",
+            "SentenceSimplified",
+            "SentenceTraditional",
+            "SentencePinyin",
+            "SentenceMeaning",
         ]

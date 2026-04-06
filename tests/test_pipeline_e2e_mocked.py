@@ -39,7 +39,7 @@ def test_run_pipeline_csv_with_cedict(tmp_path: Path, monkeypatch: pytest.Monkey
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
         fake_extract,
     )
-    settings = Settings(cedict_path=cedict, skip_lines_filter=False)
+    settings = Settings(cedict_path=cedict, skip_lines_filter=False, enable_sentences=False)
     run_pipeline(md, out, settings)
     data = out.read_text(encoding="utf-8")
     assert "的" in data
