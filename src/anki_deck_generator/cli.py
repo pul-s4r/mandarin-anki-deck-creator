@@ -32,7 +32,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable dialogue sentence parsing + linking",
     )
-    run.set_defaults(enable_sentences=True)
     run.add_argument(
         "--sentence-assignment-strategy",
         choices=["importance", "random"],
@@ -57,6 +56,23 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--csv-bom", action="store_true", help="Write UTF-8 BOM for Excel")
     run.add_argument("--no-skip-lines-filter", action="store_true", help="Disable date-only line dropping")
     run.add_argument("--cedict-force-overwrite", action="store_true", help="Overwrite LLM meaning/pinyin from CEDICT")
+    run.add_argument(
+        "--no-decomposition-fallback",
+        dest="enable_decomposition_fallback",
+        action="store_false",
+        help="Disable greedy CEDICT decomposition when exact headword is missing",
+    )
+    run.add_argument(
+        "--no-llm-translation-fallback",
+        dest="enable_llm_translation_fallback",
+        action="store_false",
+        help="Disable Bedrock batch translation for rows still missing English after enrichment",
+    )
+    run.set_defaults(
+        enable_sentences=True,
+        enable_decomposition_fallback=True,
+        enable_llm_translation_fallback=True,
+    )
     run.add_argument("-v", "--verbose", action="store_true")
     return p
 
@@ -72,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         settings = Settings()
         settings.enable_sentences = bool(args.enable_sentences)
+        settings.enable_decomposition_fallback = bool(args.enable_decomposition_fallback)
+        settings.enable_llm_translation_fallback = bool(args.enable_llm_translation_fallback)
         if args.prior_csv is not None:
             settings.prior_csv = args.prior_csv
         if args.sentence_links_csv is not None:

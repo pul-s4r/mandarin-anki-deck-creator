@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     skip_lines_filter: bool = True
     csv_bom: bool = False
     cedict_force_overwrite: bool = False
+    enable_decomposition_fallback: bool = True
+    enable_llm_translation_fallback: bool = True
 
     input_path: Optional[Path] = None
     output_csv: Optional[Path] = None

@@ -44,3 +44,74 @@ def test_enrich_respects_existing_llm_fields() -> None:
     out = svc.enrich_row(row)
     assert out.meaning == "already filled"
     assert out.pinyin == "dè"
+
+
+def test_apply_decomposition_fills_compound_headword() -> None:
+    entries = [
+        CedictEntry(
+            traditional="团圆",
+            simplified="团圆",
+            pinyin_raw="tuan2 yuan2",
+            glosses=("reunion",),
+        ),
+        CedictEntry(
+            traditional="饭",
+            simplified="饭",
+            pinyin_raw="fan4",
+            glosses=("meal", "cooked rice"),
+        ),
+    ]
+    index = DictionaryIndex.build(entries)
+    svc = EnrichmentService(index)
+    row = VocabularyRow(key=1, simplified="团圆饭", traditional="", pinyin="", meaning="")
+    changed = svc.apply_decomposition_to_row(row)
+    assert changed is True
+    assert "reunion" in row.meaning.lower()
+    assert "meal" in row.meaning.lower() or "rice" in row.meaning.lower()
+    assert "CEDICT decomposition" in row.usage_notes
+
+
+def test_enrich_decomposition_can_be_disabled() -> None:
+    entries = [
+        CedictEntry(
+            traditional="团圆",
+            simplified="团圆",
+            pinyin_raw="tuan2 yuan2",
+            glosses=("reunion",),
+        ),
+        CedictEntry(
+            traditional="饭",
+            simplified="饭",
+            pinyin_raw="fan4",
+            glosses=("meal",),
+        ),
+    ]
+    index = DictionaryIndex.build(entries)
+    svc = EnrichmentService(index, enable_decomposition_fallback=False)
+    row = VocabularyRow(key=1, simplified="团圆饭", meaning="", pinyin="")
+    changed = svc.apply_decomposition_to_row(row)
+    assert changed is False
+    assert row.meaning == ""
+    assert row.usage_notes == ""
+
+
+def test_decompose_and_lookup_returns_segments() -> None:
+    entries = [
+        CedictEntry(
+            traditional="团圆",
+            simplified="团圆",
+            pinyin_raw="tuan2 yuan2",
+            glosses=("reunion",),
+        ),
+        CedictEntry(
+            traditional="饭",
+            simplified="饭",
+            pinyin_raw="fan4",
+            glosses=("meal",),
+        ),
+    ]
+    index = DictionaryIndex.build(entries)
+    svc = EnrichmentService(index)
+    segs = svc.decompose_and_lookup("团圆饭")
+    assert segs is not None
+    assert [e.simplified for e in segs] == ["团圆", "饭"]

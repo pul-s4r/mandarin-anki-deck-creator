@@ -4,7 +4,13 @@ import logging
 from pathlib import Path
 
 from anki_deck_generator.config.settings import Settings
-from anki_deck_generator.dictionary.enrich import EnrichmentService, VocabularyRow
+from anki_deck_generator.dictionary.enrich import (
+    LLM_TRANSLATION_SOURCE_NOTE,
+    EnrichmentService,
+    VocabularyRow,
+    append_usage_note,
+    is_unknown_translation,
+)
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
 from anki_deck_generator.export.csv_writer import write_vocabulary_csv
@@ -12,7 +18,11 @@ from anki_deck_generator.export.sentence_links import SentenceLinkRow, write_sen
 from anki_deck_generator.ingest.router import extract_text_from_path
 from anki_deck_generator.linking.sentence_assign import choose_winner_key, find_candidate_matches
 from anki_deck_generator.linking.term_index import TermIndex, load_term_index_from_prior_csv
-from anki_deck_generator.llm.bedrock_chain import build_bedrock_model, extract_vocabulary_from_chunk
+from anki_deck_generator.llm.bedrock_chain import (
+    build_bedrock_model,
+    extract_vocabulary_from_chunk,
+    translate_simplified_terms,
+)
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
@@ -97,16 +107,52 @@ def run_pipeline(
     deduped = _dedupe_cards(all_cards)
     rows = [_llm_item_to_row(c, k + 1) for k, c in enumerate(deduped)]
 
+    enricher: EnrichmentService | None = None
     if settings.cedict_path and settings.cedict_path.is_file():
         source = FileLineDictionarySource(settings.cedict_path)
         index = DictionaryIndex.from_source(source)
         enricher = EnrichmentService(
             index,
             force_overwrite=settings.cedict_force_overwrite,
+            enable_decomposition_fallback=settings.enable_decomposition_fallback,
         )
+        # Exact headword fill only; fallback order is handled below.
         rows = [enricher.enrich_row(r) for r in rows]
     else:
         logger.warning("No CEDICT path provided or file missing; skipping dictionary enrichment")
+
+    # Default fallback: LLM translation first (more accurate).
+    if settings.enable_llm_translation_fallback:
+        missing_terms: list[str] = []
+        for r in rows:
+            if not is_unknown_translation(r.meaning):
+                continue
+            t = r.simplified.strip()
+            if t:
+                missing_terms.append(t)
+        uniq_terms = list(dict.fromkeys(missing_terms))
+        if uniq_terms:
+            try:
+                translations = translate_simplified_terms(model, uniq_terms)
+            except Exception:
+                logger.exception("LLM translation fallback failed")
+                translations = {}
+            for r in rows:
+                if not is_unknown_translation(r.meaning):
+                    continue
+                t = r.simplified.strip()
+                eng = translations.get(t, "").strip()
+                if not eng:
+                    continue
+                r.meaning = eng
+                append_usage_note(r, LLM_TRANSLATION_SOURCE_NOTE)
+
+    # Secondary fallback: CEDICT decomposition for anything still missing.
+    if enricher is not None and settings.enable_decomposition_fallback:
+        for r in rows:
+            if not is_unknown_translation(r.meaning):
+                continue
+            enricher.apply_decomposition_to_row(r)
 
     if settings.enable_sentences:
         term_index = TermIndex.from_rows(rows)
