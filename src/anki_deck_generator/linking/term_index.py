@@ -1,14 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
 from pathlib import Path
-
-
-@dataclass(frozen=True)
-class TermEntry:
-    simplified: str
-    key: int
 
 
 class TermIndex:
@@ -60,7 +53,8 @@ def load_term_index_from_prior_csv(path: Path) -> TermIndex:
     Extra columns are ignored.
     """
     idx = TermIndex()
-    with path.open("r", encoding="utf-8", newline="") as f:
+    # Use utf-8-sig to gracefully handle both BOM and non-BOM CSVs.
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if not row:

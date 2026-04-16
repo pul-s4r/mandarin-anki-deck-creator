@@ -78,12 +78,18 @@ def extract_dialogue_sentences(text: str) -> list[ExtractedSentence]:
         if not stripped:
             blank_run += 1
             if saw_speaker and blank_run >= 2:
-                break
+                in_dialogue = False
+                saw_speaker = False
+                blank_run = 0
+                continue
             continue
         blank_run = 0
 
         if saw_speaker and _RE_SECTION_HEADERISH.match(stripped) and not _RE_SPEAKER_LINE.match(stripped):
-            break
+            in_dialogue = False
+            saw_speaker = False
+            blank_run = 0
+            continue
 
         m = _RE_SPEAKER_LINE.match(_strip_invisible(line))
         if not m:

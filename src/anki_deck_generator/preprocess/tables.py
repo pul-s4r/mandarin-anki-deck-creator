@@ -51,7 +51,8 @@ def parse_table_block(block_text: str) -> TableParseResult:
             prev.meaning = (prev.meaning + " " + line.strip()).strip()
             continue
 
-        cells = [c.strip() for c in line.split("\t") if c.strip() or c == ""]
+        # Preserve empty and whitespace-only cells to avoid shifting columns.
+        cells = [c.strip() for c in line.split("\t")]
         if not cells:
             continue
 
