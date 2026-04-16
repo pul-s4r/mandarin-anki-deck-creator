@@ -48,3 +48,26 @@ class LlmVocabularyResult(BaseModel):
 def llm_vocabulary_response_json_schema_text() -> str:
     """JSON Schema for LLM responses; kept in sync with validation via LlmVocabularyResult."""
     return json.dumps(LlmVocabularyResult.model_json_schema(), ensure_ascii=False, indent=2)
+
+
+class LlmTranslationItem(BaseModel):
+    simplified: str = Field(description="Simplified Chinese term exactly as given in the input list")
+    english: str = Field(description="Concise English gloss suitable for a flashcard")
+
+    @field_validator("simplified", "english", mode="before")
+    @classmethod
+    def _strip_strings(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
+
+
+class LlmTranslationBatch(BaseModel):
+    translations: list[LlmTranslationItem] = Field(
+        default_factory=list,
+        description="One object per input term, in any order",
+    )
+
+
+def llm_translation_batch_json_schema_text() -> str:
+    return json.dumps(LlmTranslationBatch.model_json_schema(), ensure_ascii=False, indent=2)

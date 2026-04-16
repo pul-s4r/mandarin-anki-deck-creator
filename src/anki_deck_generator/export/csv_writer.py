@@ -13,6 +13,10 @@ FIELDNAMES = (
     "Meaning",
     "PartOfSpeech",
     "UsageNotes",
+    "SentenceSimplified",
+    "SentenceTraditional",
+    "SentencePinyin",
+    "SentenceMeaning",
 )
 
 
@@ -32,5 +36,9 @@ def write_vocabulary_csv(path: Path, rows: list[VocabularyRow], *, bom: bool = F
                     "Meaning": r.meaning,
                     "PartOfSpeech": r.part_of_speech,
                     "UsageNotes": r.usage_notes,
+                    "SentenceSimplified": r.sentence_simplified,
+                    "SentenceTraditional": r.sentence_traditional,
+                    "SentencePinyin": r.sentence_pinyin,
+                    "SentenceMeaning": r.sentence_meaning,
                 }
             )

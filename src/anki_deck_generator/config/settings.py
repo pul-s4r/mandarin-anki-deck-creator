@@ -37,7 +37,17 @@ class Settings(BaseSettings):
     skip_lines_filter: bool = True
     csv_bom: bool = False
     cedict_force_overwrite: bool = False
+    enable_decomposition_fallback: bool = True
+    enable_llm_translation_fallback: bool = True
 
     input_path: Optional[Path] = None
     output_csv: Optional[Path] = None
     cedict_path: Optional[Path] = None
+
+    enable_sentences: bool = True
+    prior_csv: Optional[Path] = None
+    sentence_links_csv: Optional[Path] = None
+    sentence_assignment_strategy: str = "importance"  # "importance" | "random"
+    sentence_random_seed: Optional[int] = None
+    sentences_per_term: int = 1
+    sentences_delimiter: str = " | "
