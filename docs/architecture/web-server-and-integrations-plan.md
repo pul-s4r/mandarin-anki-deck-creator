@@ -10,6 +10,14 @@
 6. [Shared Concerns](#6-shared-concerns)
 7. [Module Layout](#7-module-layout)
 8. [Implementation Sequence](#8-implementation-sequence)
+9. [Expanded Use Cases (Scheduled / Event-Driven Operation)](#9-expanded-use-cases-scheduled--event-driven-operation)
+10. [Deployment Target Selection](#10-deployment-target-selection)
+11. [Scheduled & Triggered Execution](#11-scheduled--triggered-execution)
+12. [Incremental Processing & Persistent Memory](#12-incremental-processing--persistent-memory)
+13. [Export Targets — XLSX and AnkiWeb](#13-export-targets--xlsx-and-ankiweb)
+14. [Revised Module Layout](#14-revised-module-layout)
+15. [Revised Implementation Sequence](#15-revised-implementation-sequence)
+16. [Open Questions & Risks](#16-open-questions--risks)
 
 ---
 
@@ -541,3 +549,500 @@ The work decomposes into four phases. Each phase is self-contained and produces 
 - **Dropbox** — download files via Dropbox API.
 - **OneNote** — export via Microsoft Graph API.
 - **Direct URL** — fetch a file from a URL (simplest possible provider).
+
+---
+
+## 9. Expanded Use Cases (Scheduled / Event-Driven Operation)
+
+The original plan (§§1–8) covers a user-initiated model: a human uploads a file via CLI or HTTP, the pipeline runs once, and a CSV comes back. The expanded scope below turns the pipeline into a long-lived service that tracks a corpus of source documents over time and keeps a deck in sync with them, with minimal human input and minimal always-on infrastructure.
+
+### 9.1 Use cases to support
+
+| # | Use case | Trigger | Expected behavior |
+|---|----------|---------|-------------------|
+| U1 | Weekly refresh of a "study notes" Google Drive folder | Cron (e.g. `Fri 23:59:59 local`) | Scan configured sources, process only what changed, append to deck. |
+| U2 | "I just edited a doc, update my deck now" | Google Drive push notification (webhook) or manual trigger | Same as U1 but scoped to one document. |
+| U3 | Manual one-shot run (existing CLI flow) | Human | Unchanged from today. |
+| U4 | Export everything accumulated so far | Human or schedule | Emit a full CSV / XLSX / AnkiWeb sync of the persistent deck state. |
+| U5 | Push new/changed cards to AnkiWeb automatically | After any pipeline run | New/modified cards appear on the user's AnkiWeb account without manual CSV import. |
+
+### 9.2 Non-functional requirements
+
+- **Intermittent compute**: no resource should be "always on" unless run frequency or payload size justifies it. The default deployment shape must be serverless / scale-to-zero.
+- **Idempotency**: re-running a trigger on the same inputs must not produce duplicate cards on AnkiWeb or in exported files.
+- **Durability across runs**: all state the pipeline needs (document revisions, per-chunk hashes, card inventory, AnkiWeb sync cursors, OAuth tokens) must survive between invocations on ephemeral compute.
+- **Observability**: every scheduled run must produce a structured log/summary the user can inspect (docs scanned, docs changed, chunks processed, cards added/updated/skipped, AnkiWeb sync result).
+- **Safety**: a failed run must not corrupt persistent memory or leave AnkiWeb in a half-synced state; retries must be safe.
+
+### 9.3 Relationship to the §§1–8 plan
+
+The original plan stays intact. Sections 9–15 add three orthogonal capabilities on top of the web/CLI modes:
+
+1. A **serverless entry point** (AWS Lambda) that can host the same `run_pipeline_from_text` core as the FastAPI app.
+2. A **persistence + change-tracking layer** that lets any entry point (CLI, web, Lambda) ingest only what's new.
+3. Two **new export targets** — XLSX and AnkiWeb — that plug into the export layer alongside CSV.
+
+None of these require abandoning FastAPI/CLI; they share code with them.
+
+---
+
+## 10. Deployment Target Selection
+
+### 10.1 Candidate shapes
+
+| Option | Always-on cost | Fits U1 (weekly cron)? | Fits U2 (webhook)? | Notes |
+|--------|----------------|-----------------------|--------------------|-------|
+| A. Local cron + existing CLI | $0 | Yes, if laptop is on | No (no public URL) | Acceptable for solo personal use; fails the "runs from anywhere on schedule" goal. |
+| B. Long-running EC2 / container with APScheduler | High (24/7) | Yes | Yes | Violates the "no constantly-on resources" requirement. |
+| C. **AWS Lambda + EventBridge Scheduler + API Gateway (HTTP API)** | Pennies/month | Yes (EventBridge cron) | Yes (API Gateway → Lambda) | Scale-to-zero. Natural fit for Bedrock (same account). Primary recommendation. |
+| D. Google Cloud Run Jobs + Cloud Scheduler | Pennies/month | Yes | Yes | Viable if Bedrock access migrated; adds a second cloud. Secondary option. |
+| E. GitHub Actions scheduled workflow | $0 for personal repos (within free minutes) | Yes | Awkward (webhooks land via `repository_dispatch`) | Viable fallback; cold starts less of an issue because cron-only. |
+
+**Recommendation: Option C (AWS Lambda).** It satisfies every non-functional requirement, keeps credentials for Bedrock in the same account, and scales to zero between runs. Options A and E are documented as fallback modes so the code does not require AWS to run.
+
+### 10.2 Lambda packaging strategy
+
+The existing codebase has two heavy dependencies that affect Lambda sizing:
+
+- `boto3` / `langchain-aws` for Bedrock (already required).
+- Potentially `python-docx`, `pypdf`, and the CEDICT index (~120 MB parsed).
+
+To keep package size manageable:
+
+- Ship the Lambda as a **container image** (up to 10 GB, vs. 250 MB zip). This sidesteps the CEDICT size problem entirely and lets us reuse a single image per entry point.
+- Base image: `public.ecr.aws/lambda/python:3.12`.
+- Store CEDICT in **EFS mounted on the Lambda** or in **S3**, loaded lazily on cold start. EFS is simpler (filesystem semantics, no manual download) and its always-on cost is negligible at the sizes we need; S3 + local cache in `/tmp` is cheaper still but requires a parser cold-start each time.
+- Decision defaulted to **S3 + `/tmp` cache** because CEDICT is write-once and the cold-start cost of reading ~120 MB from S3 is acceptable for a weekly-ish schedule. EFS stays listed as a fallback.
+
+### 10.3 Shared code shape across entry points
+
+The goal is that the following are all thin shims around the same core:
+
+```
+FastAPI route handler  ─┐
+CLI `run` sub-command  ─┤──► run_pipeline_from_text (pure)
+CLI `import` command   ─┤
+Lambda handler         ─┘
+```
+
+The Lambda handler adds only: (a) event parsing (EventBridge vs. API Gateway vs. SNS), (b) settings loaded from environment + SSM Parameter Store / Secrets Manager, (c) persistent-state wiring (see §12), (d) export dispatch (see §13).
+
+### 10.4 Local development parity
+
+Every piece deployed to Lambda must also run locally with no AWS involvement:
+
+- EventBridge schedule → replaced by a `schedule` sub-command on the CLI that runs the same handler once (`anki-notes-pipeline schedule --source <name>`).
+- API Gateway webhook → replaced by FastAPI routes (§3) that call the same handler.
+- DynamoDB state store → replaced by a SQLite-backed implementation behind the same interface (§12).
+
+This keeps the "no AWS required for dev" invariant from §6 and makes unit testing cheap.
+
+---
+
+## 11. Scheduled & Triggered Execution
+
+### 11.1 Trigger taxonomy
+
+| Trigger | Source | Payload (conceptual) | Entry point |
+|---------|--------|----------------------|-------------|
+| T1: Cron | EventBridge Scheduler | `{ "source_set": "weekly-chinese-notes" }` | Lambda handler `handle_schedule` |
+| T2: Drive push notification | Google Drive `changes.watch` webhook → API Gateway | Drive channel headers + resource state | Lambda handler `handle_drive_webhook` |
+| T3: Manual API | FastAPI `/api/integrations/google-drive/import` or CLI | File IDs / folder IDs | Shared `run_sync(...)` function |
+| T4: Dead-letter / retry | SQS DLQ replay | Original event | Same as originating handler |
+
+All four funnel into one internal function:
+
+```python
+def run_sync(
+    *,
+    source_set: SourceSet,
+    settings: Settings,
+    only_file_ids: list[str] | None = None,   # for T2/T3 targeted runs
+    state_store: StateStore,
+    exporters: list[Exporter],
+) -> SyncReport: ...
+```
+
+`SyncReport` carries counts, per-document results, and export results so every trigger can produce a uniform log entry.
+
+### 11.2 EventBridge Scheduler (T1)
+
+- One schedule per "source set". A source set is a named bundle of integration configs (e.g. `weekly-chinese-notes` → Google Drive folder X + file Y on cron `cron(59 23 ? * FRI *)`).
+- Schedule configuration lives in source code / IaC (see §15 phase 8), not hand-edited in the AWS console, so it's reproducible.
+- Schedules invoke the Lambda directly (no SQS hop needed for cron; cron is already idempotent at our volumes).
+
+### 11.3 Google Drive change notifications (T2)
+
+Drive supports webhook-style push via `changes.watch`. Flow:
+
+1. At setup, call `changes.getStartPageToken` and store it as the initial cursor in `StateStore` (§12).
+2. Call `changes.watch(pageToken, address=<API Gateway URL>, expiration=...)` to register a push channel. Drive channels expire (max ~7 days), so a nightly EventBridge schedule renews them. Channel metadata (id, resourceId, expiration) lives in `StateStore`.
+3. On webhook delivery, the Lambda reads the stored `pageToken`, calls `changes.list` to get the actual diff, enqueues affected file IDs into the same `run_sync` path with `only_file_ids=[...]`, then advances the cursor.
+4. Drive webhooks carry no body — just headers (`X-Goog-Channel-ID`, `X-Goog-Resource-State`). The handler is just a thin dispatcher; the real work is the `changes.list` call.
+
+### 11.4 Idempotency and retries
+
+- API Gateway → Lambda can retry on 5xx. Handlers must be safe to run twice on the same input. §12 (persistent memory) ensures this at the data layer; the handler layer enforces it by making all writes keyed on content hashes and Drive revision IDs.
+- A Lambda **dead-letter SQS queue** captures terminal failures for manual replay. Alarms on DLQ depth are the "something broke" signal.
+
+### 11.5 Scheduling for local/GitHub Actions fallback
+
+- Local: `cron` invokes `anki-notes-pipeline schedule --source-set weekly-chinese-notes` which is the exact function the Lambda calls.
+- GitHub Actions: a `.github/workflows/weekly-sync.yml` on `schedule:` runs the same command inside the container image used for Lambda, so behavior is identical. Secrets come from repo secrets instead of AWS Secrets Manager; the settings loader abstracts this.
+
+---
+
+## 12. Incremental Processing & Persistent Memory
+
+This is the keystone of the new design. Without it, the pipeline either reprocesses every document every run (expensive and non-deterministic thanks to the LLM) or it drops changes silently.
+
+### 12.1 What needs to persist
+
+| Category | Example fields | Access pattern | Size (order of magnitude) |
+|----------|---------------|----------------|---------------------------|
+| Source document state | `source_id`, `provider`, `external_id`, `revision_id`, `etag`, `content_sha256`, `last_ingested_at` | Lookup by `(provider, external_id)` | 10s–100s of rows |
+| Chunk state | `source_id`, `chunk_index`, `chunk_sha256`, `processed_at`, `model_id`, `llm_output_card_ids` | Lookup by `(source_id, chunk_index)` | 1k–10k rows |
+| Card inventory (the deck) | `card_id` (stable), `simplified` (natural key), `traditional`, `pinyin`, `meaning`, `part_of_speech`, `usage_notes`, `first_seen_source_id`, `last_updated_at`, `content_hash`, `ankiweb_note_id`, `ankiweb_last_synced_at` | Lookup by `simplified`; scan for "changed since X" | 1k–10k rows |
+| Drive channel / cursor state | `channel_id`, `resource_id`, `page_token`, `expiration` | Singleton-ish | <10 rows |
+| OAuth tokens & secrets | refresh tokens, encrypted | Per-provider | Handful |
+| Run history | `run_id`, `trigger`, `started_at`, `finished_at`, `sync_report_json` | Time-ordered | 100s/year |
+
+### 12.2 Storage choice
+
+Requirements:
+
+- Survives Lambda restarts (so not in-memory).
+- Pay-per-request / scale-to-zero (so not RDS).
+- Atomic upsert on a key (for the card inventory).
+- Queryable by secondary attributes at small scale.
+
+**Primary pick: DynamoDB (on-demand billing).**
+
+- Scale-to-zero fits the "no always-on" rule.
+- Single-digit-ms reads from Lambda in the same region.
+- Conditional writes give us the idempotency guarantees we need for card upserts.
+
+**Local/dev pick: SQLite file** accessed through the same abstraction, so tests don't need DynamoDB Local.
+
+### 12.3 Abstraction
+
+```python
+# state/store.py
+
+class StateStore(Protocol):
+    # Source documents
+    def get_source_record(self, provider: str, external_id: str) -> SourceRecord | None: ...
+    def upsert_source_record(self, rec: SourceRecord) -> None: ...
+
+    # Chunks
+    def get_processed_chunk(self, source_id: str, chunk_index: int) -> ChunkRecord | None: ...
+    def upsert_processed_chunk(self, rec: ChunkRecord) -> None: ...
+
+    # Cards (deck inventory)
+    def get_card_by_key(self, natural_key: str) -> CardRecord | None: ...
+    def upsert_card(self, rec: CardRecord) -> CardUpsertResult: ...      # returns {created, updated, unchanged}
+    def iter_cards_changed_since(self, ts: datetime) -> Iterable[CardRecord]: ...
+
+    # Drive cursors
+    def get_drive_channel(self, channel_id: str) -> DriveChannelRecord | None: ...
+    def upsert_drive_channel(self, rec: DriveChannelRecord) -> None: ...
+
+    # Run history
+    def record_run(self, report: SyncReport) -> None: ...
+```
+
+Two concrete implementations: `DynamoStateStore`, `SqliteStateStore`. Selection is by config (`ANKI_PIPELINE_STATE_BACKEND=dynamodb|sqlite`).
+
+### 12.4 Change detection strategy
+
+Layered, cheap → expensive:
+
+1. **Document level.** For each configured source, ask the provider for its current revision/etag. Compare to `SourceRecord.revision_id`. If unchanged, skip; don't even download.
+2. **Content level.** If the provider doesn't expose a stable revision (or to double-check), hash the downloaded bytes (`content_sha256`). If unchanged, skip.
+3. **Chunk level.** When a document *has* changed, re-chunk it and hash each chunk. Only chunks whose `chunk_sha256` is new go through the LLM. This is the single biggest cost optimization: a one-line edit in a long doc should not re-LLM 20 chunks.
+4. **Card level.** Upsert by natural key (`simplified`). Only mark a card "changed" if `content_hash` differs from the stored one; otherwise upsert is a no-op. This is what makes AnkiWeb sync deterministic.
+
+### 12.5 Pipeline wiring
+
+Core pipeline gains a variant that is persistence-aware:
+
+```python
+def run_incremental_sync(
+    source_set: SourceSet,
+    *,
+    settings: Settings,
+    state_store: StateStore,
+    exporters: list[Exporter],
+    only_file_ids: list[str] | None = None,
+) -> SyncReport:
+    for source in source_set.resolve(state_store, only_file_ids=only_file_ids):
+        if not source.changed_since_last_run():
+            report.skipped.append(source.id); continue
+        text = extract_text_from_bytes(source.data, format=source.format)
+        text = normalize_unicode(text)
+        text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
+        new_chunks = select_unprocessed_chunks(text, source, state_store, settings)
+        cards = run_llm_over_chunks(new_chunks, settings)
+        upsert_results = [state_store.upsert_card(to_card_record(c, source)) for c in cards]
+        mark_chunks_processed(new_chunks, state_store)
+        state_store.upsert_source_record(source.to_record())
+        report.add(source, upsert_results)
+    for exporter in exporters:
+        report.exports.append(exporter.export(state_store, since=report.run_started_at))
+    state_store.record_run(report)
+    return report
+```
+
+Key properties:
+
+- Existing `run_pipeline_from_text` is reused for the "text → cards" substep (no duplication).
+- The incremental layer is a strict superset: if `StateStore` is empty, it behaves like a full run.
+- Exporters consume from `StateStore`, not from in-memory pipeline state, so exports are always consistent with what was persisted (no partial-success CSV).
+
+### 12.6 CEDICT enrichment in this model
+
+Today, enrichment runs inside `run_pipeline_from_text`. Two options going forward:
+
+- **Keep it inside the pipeline** (current behavior). Cheapest for small documents; fine.
+- **Run it as an enrichment pass over the card inventory** after upsert, only for cards whose `enrichment_version` is older than the current CEDICT version. Useful when CEDICT updates or when we add new enrichment fields; avoids re-running the LLM just to refresh a translation.
+
+Recommendation: start with option 1 (no change) and leave option 2 as a follow-up; `StateStore` is designed to support it via an `enrichment_version` column on `CardRecord`.
+
+### 12.7 Data lifecycle
+
+- `SourceRecord`, `ChunkRecord`: retained indefinitely (cheap; allows "why is this chunk in the deck?" audits).
+- `CardRecord`: retained indefinitely. Soft-delete flag (`retired_at`) instead of hard delete, since AnkiWeb has its own notion of deletion.
+- Run history: TTL 90 days (DynamoDB TTL attribute) to avoid unbounded growth.
+- OAuth refresh tokens: stored in AWS Secrets Manager rather than DynamoDB; handler pulls at cold start.
+
+---
+
+## 13. Export Targets — XLSX and AnkiWeb
+
+### 13.1 Exporter protocol
+
+```python
+# export/base.py
+
+class Exporter(Protocol):
+    name: str                                    # "csv" | "xlsx" | "ankiweb"
+
+    def export(
+        self,
+        state_store: StateStore,
+        *,
+        since: datetime | None = None,           # None → full export
+    ) -> ExportResult: ...
+```
+
+`ExportResult` carries counts (created / updated / unchanged / failed), artifact URIs (for file exports), and provider-specific metadata (e.g. AnkiWeb sync timestamp).
+
+The existing `write_vocabulary_csv` becomes the body of `CsvExporter.export`. Same for a new `vocabulary_csv_bytes` (already in §2.3).
+
+### 13.2 XLSX export
+
+- New optional dependency: `openpyxl` (behind extras group `[xlsx]`).
+- Schema: same columns as CSV, plus optional metadata sheet (`Run metadata`, `Source documents`) that includes the SyncReport summary — useful when a human wants to audit a given run.
+- File written to:
+  - Local path (CLI mode).
+  - Presigned S3 URL (Lambda mode). Bucket configured via `ANKI_PIPELINE_EXPORT_S3_BUCKET`.
+  - In-memory bytes (web mode; streamed as download).
+
+### 13.3 AnkiWeb export
+
+AnkiWeb is the trickiest integration because its official external API is limited. Two viable approaches:
+
+#### 13.3.1 Option A — AnkiConnect bridge (preferred for local / self-hosted)
+
+- The user runs the [AnkiConnect](https://foosoft.net/projects/anki-connect/) add-on on a desktop Anki install.
+- Our exporter POSTs JSON-RPC calls (`addNotes`, `updateNoteFields`, `findNotes`) to a local URL (e.g. `http://127.0.0.1:8765`).
+- Desktop Anki then syncs to AnkiWeb.
+- Pros: officially sanctioned, rich API, stable, no scraping.
+- Cons: requires desktop Anki to be running during sync.
+
+#### 13.3.2 Option B — AnkiWeb session-cookie client (fallback, no desktop)
+
+- Log into AnkiWeb via form POST with username/password, maintain the session cookie.
+- Use undocumented endpoints (CSV import, note add). Brittle; terms-of-service considerations apply.
+- Listed as a fallback only; default is Option A.
+
+#### 13.3.3 Option C — Hybrid: bring-your-own Anki on a schedule
+
+- Lambda cannot reach a home-LAN AnkiConnect instance directly. Solution: a tiny **pull-based agent** (a script run by launchd / systemd on the user's desktop) fetches a delta feed from our service (`GET /api/ankiweb/pending?since=...`), applies it via AnkiConnect, and POSTs the result back (`POST /api/ankiweb/ack`).
+- Our Lambda never initiates an outbound connection to the user's machine; all sync is driven from the desktop.
+- Requires the user's machine to be on and Anki running at some point after a sync, but not during it.
+
+Recommendation: implement **Option C** because it matches the "no always-on resources" rule and sidesteps firewall/NAT issues, while still giving the user automatic AnkiWeb sync whenever their desktop comes online. Keep Option B as a manual CSV fallback for users who can't run the agent.
+
+### 13.4 AnkiWeb exporter responsibilities
+
+Regardless of option:
+
+- Operate on `CardRecord`s with `ankiweb_last_synced_at is None or < last_updated_at`.
+- Maintain `ankiweb_note_id` and `ankiweb_last_synced_at` in `StateStore` after successful sync.
+- Report per-card outcome in `ExportResult` so a user can see "added 3, updated 1, skipped 47".
+- Handle duplicate detection (AnkiConnect rejects duplicate first-field notes by default; our exporter handles this by falling back to `updateNoteFields`).
+
+### 13.5 Exporter composition
+
+Source sets declare which exporters fire:
+
+```yaml
+source_sets:
+  weekly-chinese-notes:
+    sources:
+      - provider: google-drive
+        folder_id: "1aBcDeFgHiJ"
+    schedule: "cron(59 23 ? * FRI *)"
+    exporters:
+      - type: csv
+        destination: s3://my-bucket/decks/chinese-latest.csv
+      - type: xlsx
+        destination: s3://my-bucket/decks/chinese-latest.xlsx
+      - type: ankiweb
+        deck_name: "Chinese::301"
+        note_type: "Chinese vocabulary"
+```
+
+This config is the same whether loaded by the CLI, the web server, or the Lambda.
+
+---
+
+## 14. Revised Module Layout
+
+Superset of §7; new directories marked **NEW**, modified ones marked **MOD**.
+
+```
+src/anki_deck_generator/
+├── __init__.py
+├── cli.py                          # MOD: adds `serve`, `import`, `schedule`, `export` sub-commands
+├── pipeline.py                     # MOD: run_pipeline_from_text + run_incremental_sync
+├── config/
+│   ├── __init__.py
+│   ├── settings.py                 # MOD: ServerSettings + LambdaSettings + SourceSet loader
+│   └── source_sets.py              # NEW: YAML/py loader for §13.5 configs
+├── ingest/ ...                     # (unchanged from §7)
+├── preprocess/ ...                 # (unchanged)
+├── llm/ ...                        # (unchanged)
+├── dictionary/ ...                 # (unchanged)
+├── export/
+│   ├── __init__.py
+│   ├── base.py                     # NEW: Exporter protocol + ExportResult
+│   ├── csv_writer.py               # MOD: wrapped into CsvExporter
+│   ├── xlsx_writer.py              # NEW: XlsxExporter
+│   └── ankiweb/                    # NEW
+│       ├── __init__.py
+│       ├── anki_connect.py         # Option A (§13.3.1)
+│       ├── session_client.py       # Option B fallback (§13.3.2)
+│       └── pull_agent_api.py       # Option C hybrid server-side half (§13.3.3)
+├── integrations/ ...               # (as in §7) + google_drive gains `get_revision`, `watch_changes`
+├── state/                          # NEW
+│   ├── __init__.py
+│   ├── records.py                  # SourceRecord, ChunkRecord, CardRecord, DriveChannelRecord
+│   ├── store.py                    # StateStore protocol
+│   ├── dynamo_store.py             # DynamoDB impl
+│   └── sqlite_store.py             # SQLite impl (dev/local)
+├── sync/                           # NEW
+│   ├── __init__.py
+│   ├── orchestrator.py             # run_incremental_sync (§12.5)
+│   ├── change_detection.py         # doc/content/chunk diffing (§12.4)
+│   └── report.py                   # SyncReport
+├── web/ ...                        # (as in §3) + /api/sync/* and /api/ankiweb/* routes
+├── lambda/                         # NEW
+│   ├── __init__.py
+│   ├── handler_schedule.py         # T1 entry
+│   ├── handler_drive_webhook.py    # T2 entry
+│   ├── handler_api.py              # API Gateway shim around FastAPI (via Mangum or direct)
+│   └── bootstrap.py                # shared cold-start wiring (CEDICT, settings, StateStore)
+├── infra/                          # NEW (deployment only, no runtime code)
+│   ├── README.md
+│   ├── lambda.Dockerfile
+│   └── cdk/ or sam/                # whichever IaC we pick in phase 8
+└── errors.py                       # (as in §7)
+```
+
+Notes:
+
+- `sync/` is a new layer that sits between `integrations/` (fetchers) and the existing `pipeline.py` core.
+- `lambda/` contains *only* handlers; all real logic lives in shared modules so tests don't need AWS.
+- `infra/` is intentionally separated from runtime code so it can be excluded from the Python package build.
+
+---
+
+## 15. Revised Implementation Sequence
+
+Phases 1–4 from §8 stay unchanged and remain prerequisites. The new work is phases 5–8.
+
+### Phase 5 — Persistent state layer
+
+| Step | Change | Risk |
+|------|--------|------|
+| 5a | Define `state/records.py` dataclasses. | Low. |
+| 5b | Define `StateStore` protocol in `state/store.py`. | Low. |
+| 5c | Implement `SqliteStateStore` + unit tests (in-memory DB). | Low. |
+| 5d | Wire a `--state-db` flag into CLI; add a `state` subcommand for inspection (`state list-cards`, `state list-runs`). | Low. |
+| 5e | Implement `DynamoStateStore` behind the same protocol; integration-tested against [moto](https://github.com/getmoto/moto). | Medium — access patterns must match DynamoDB's single-table idioms. |
+
+### Phase 6 — Incremental sync orchestrator
+
+| Step | Change | Risk |
+|------|--------|------|
+| 6a | Build `sync/change_detection.py` (document/content/chunk diffing). | Medium — chunk hashing must be stable under text normalization. |
+| 6b | Build `sync/orchestrator.run_incremental_sync` using existing `run_pipeline_from_text` for the LLM substep. | Medium — ensure exact behavioral parity with today's pipeline when state store is empty. |
+| 6c | Add `schedule` CLI sub-command that loads a `SourceSet` config and invokes the orchestrator locally. | Low. |
+| 6d | Extend Google Drive provider with `get_revision()` and `changes.list` helpers. | Medium — Drive API quirks, token expiry. |
+| 6e | End-to-end test: two runs over the same folder, with a single edit between them → second run processes only the edited chunks. | Medium. |
+
+### Phase 7 — New export targets
+
+| Step | Change | Risk |
+|------|--------|------|
+| 7a | Introduce `export/base.py` Exporter protocol; wrap existing CSV writer as `CsvExporter`. | Low. |
+| 7b | Implement `XlsxExporter` with optional `[xlsx]` extras. | Low. |
+| 7c | Implement AnkiConnect client (`export/ankiweb/anki_connect.py`) + exporter that diffs against `StateStore`. | Medium — AnkiConnect duplicate handling and note-type schema mapping. |
+| 7d | Implement pull-agent endpoints (`/api/ankiweb/pending`, `/api/ankiweb/ack`) and a sample desktop agent script under `scripts/ankiweb-pull-agent/`. | Medium — need robust idempotency via `ack` tokens. |
+| 7e | (Optional / fallback) Implement session-cookie AnkiWeb client. | High — unofficial endpoints; treat as experimental and gate behind a config flag. |
+
+### Phase 8 — Serverless deployment
+
+| Step | Change | Risk |
+|------|--------|------|
+| 8a | Add `lambda/bootstrap.py` that assembles `Settings`, `StateStore`, and loads CEDICT from S3 into `/tmp` (cached across warm invocations). | Medium — cold-start budget. |
+| 8b | Implement `handler_schedule` (T1) delegating to `run_incremental_sync`. | Low. |
+| 8c | Implement `handler_drive_webhook` (T2) using stored Drive cursor. | Medium — channel lifecycle. |
+| 8d | Add `handler_api` for API Gateway → FastAPI via Mangum (reuses §3 routes unchanged). | Low. |
+| 8e | Build `infra/lambda.Dockerfile` and pick an IaC (AWS SAM or CDK). Define: one Lambda function, one EventBridge schedule per source set, one HTTP API route, one DynamoDB table, one S3 bucket, one Secrets Manager secret per provider, DLQ, CloudWatch alarms. | Medium — IaC choice affects reproducibility. |
+| 8f | GitHub Actions workflow: build & push image to ECR, update Lambda, deploy stack. | Low. |
+| 8g | GitHub Actions *fallback* scheduled workflow that runs the same container locally in CI (for users who don't want AWS). | Low. |
+| 8h | Smoke test: trigger EventBridge manually in a dev account, observe SyncReport in CloudWatch Logs. | Low. |
+
+### Dependency graph between phases
+
+```
+Phase 1 (core refactor)
+   ├── Phase 2 (web server)
+   ├── Phase 3 (integration framework)
+   │       └── Phase 4 (Google Drive provider)
+   │               └── Phase 6 (incremental sync)
+   ├── Phase 5 (state layer)  ─────────────┐
+   │                                       │
+   └────────────── Phase 6 (needs 1+4+5) ──┤
+                            │              │
+                            ├── Phase 7 (exporters rely on StateStore)
+                            └── Phase 8 (Lambda deployment; consumes 6+7)
+```
+
+Phases 5 and 6 can start once phase 1 is done; they do not require phases 2 or 3 to be finished. Phase 8 is gated on 6 and 7.
+
+---
+
+## 16. Open Questions & Risks
+
+1. **AnkiWeb sync without desktop Anki.** Option C (§13.3.3) is the current plan, but it assumes the user is willing to run a small desktop agent. If not, the only automated path is the unsupported Option B. Need to confirm acceptability before committing to phase 7.
+2. **CEDICT cold-start cost on Lambda.** Loading ~120 MB from S3 into `/tmp` and parsing on every cold start may push per-run latency beyond a few seconds. Mitigations: provisioned concurrency (violates scale-to-zero, so avoid), EFS mount (more ops), or splitting CEDICT into a pre-parsed pickle to skip parse time. Needs a quick benchmark before phase 8.
+3. **Google Docs → text fidelity.** The current ingest router treats DOCX as the canonical format. Google Docs export-as-DOCX preserves structure but may introduce noise (comments, track changes). Export-as-text drops structure that the chunker might benefit from. Need a small experiment comparing the two for real study notes.
+4. **Bedrock determinism.** Temperature is already 0.0, but the LLM can still produce slightly different card sets on re-runs of the same chunk. Chunk-level skipping (§12.4) eliminates the problem in steady state, but first-run results will vary. Acceptable, but worth flagging.
+5. **Schema evolution for `CardRecord`.** If we ever add a field (e.g. an HSK level), we need a migration story. Plan: include `schema_version` on every record; on read, transparently upgrade older rows.
+6. **Multi-user vs. single-user assumption.** Everything above implicitly assumes one user's deck. If this ever becomes multi-tenant, `StateStore` keys need a `user_id` prefix. Cheap to add now (include `user_id` on every record, default it to a constant) vs. a painful migration later. Recommendation: include it from the start.
+7. **Cost ceiling.** EventBridge + Lambda + DynamoDB on-demand + S3 + Secrets Manager for a weekly run should total well under $1/month. Webhook-driven runs scale with edit frequency; worst-case (~hundreds of edits/day) still stays under a few dollars/month. No monitoring dashboards needed at these levels, but CloudWatch billing alarm at $5 is cheap insurance.
+8. **"Do we even need DynamoDB?"** For a single-user deck, SQLite on EFS would work. Rejected because EFS attached to Lambda is more moving parts than DynamoDB and has a non-trivial idle cost. Revisit only if Dynamo access patterns become awkward.
