@@ -1953,6 +1953,295 @@ H3 is only the right answer if the user has no machine of their own that runs An
 | Aligns with §11–§12 invariants | Yes | Yes | Yes |
 | Aligns with "no always-on cloud" rule | Yes | Yes | **No** |
 
+#### 13.3.15 H1 implementation details (selected)
+
+This subsection pins down exactly what gets built to realize H1 end-to-end: the local-machine side (Anki + AnkiConnect + the pull agent) and the cloud side (the pull-agent endpoints, DynamoDB keys, and secrets it consumes). It is a plan, not an implementation.
+
+##### 13.3.15.1 User-visible artifacts
+
+Two things get shipped to the user:
+
+1. A **one-shot setup CLI command** (part of our existing `anki-notes-pipeline` package) that walks them through installing AnkiConnect, minting an agent token, and installing the agent under whichever OS init system they use.
+2. A **standalone pull-agent script** installed into `~/.local/share/anki-notes-pipeline/agent/` (macOS/Linux) or `%LOCALAPPDATA%\AnkiNotesPipeline\agent\` (Windows), with an accompanying init-system unit file.
+
+Everything else (credentials, state, logs) is in well-known per-user paths — no shared system locations, no `sudo`.
+
+##### 13.3.15.2 Directory layout on the user's machine
+
+```
+~/.local/share/anki-notes-pipeline/        # macOS/Linux (XDG_DATA_HOME)
+  agent/
+    agent.py                      # the pull agent (single file)
+    requirements.txt              # pinned deps: httpx, tenacity (and stdlib)
+    venv/                         # created by installer, isolated from user's Python
+  cache/
+    last_cursor                   # opaque cursor as a plain text file
+    inflight_batches/             # staged batches we received but haven't fully acked
+      <batch_id>.json
+    applied_log.ndjson            # append-only log of what we've applied (observability)
+
+~/.config/anki-notes-pipeline/              # XDG_CONFIG_HOME
+  agent.toml                      # user-editable config (see §13.3.15.4)
+  agent.token                     # agent bearer token, chmod 0600
+
+~/.local/state/anki-notes-pipeline/         # XDG_STATE_HOME
+  agent.log                       # rotating log file (10 MB × 3)
+```
+
+Windows equivalents: `%LOCALAPPDATA%\AnkiNotesPipeline\{agent,cache,config,state}`.
+
+##### 13.3.15.3 Setup command: `anki-notes-pipeline agent setup`
+
+Interactive, idempotent, safe to re-run. Flow:
+
+1. **Detect Anki.** Attempt `GET http://127.0.0.1:8765/` (AnkiConnect responds with literal string `AnkiConnect`). If absent, print the canonical install instructions (AnkiWeb shared add-on code `2055492159`) and exit.
+2. **Verify AnkiConnect version.** `POST {"action":"version","version":6}`; require `>= 6`. Warn below `23.10.29.0`.
+3. **Check AnkiConnect config.** Call `getProfiles`/`getActiveProfile` to confirm a profile is selected. Inspect `webBindAddress` via `getConfig` if available; refuse to continue if it isn't `127.0.0.1` (if the user has intentionally exposed AnkiConnect we surface a clear "this is H2, not H1" error).
+4. **Request permission.** `POST {"action":"requestPermission","version":6}`. Expect `{permission:"granted"}`. If AnkiConnect's popup permission prompt is enabled, instruct the user to approve it.
+5. **Pre-flight the deck/model.** For each source set with an AnkiWeb exporter: verify the deck exists (auto-create with explicit consent if configured) and that the note type has the expected fields (§13.3.5). If the user has an existing note type with a different field order, offer a mapping file override.
+6. **Mint an agent token.** `POST https://<our-api>/api/ankiweb/agent/register` with the OAuth login the user already has for the pipeline. Server returns `agent_id` and one-time bearer `token`. Both are written to `~/.config/anki-notes-pipeline/agent.token` (chmod 0600).
+7. **Write `agent.toml`** with sensible defaults (§13.3.15.4).
+8. **Install the init-system unit.** OS-specific (§13.3.15.7). The installer never writes to `/etc/` or `%SystemRoot%`; everything stays under the user account.
+9. **Start the agent**. Tail 30 lines of `agent.log`; confirm one successful `/api/ankiweb/pending` poll; confirm it reports `anki_connect_ok: true`. Print a success summary.
+
+All steps are also exposed individually for scripting: `agent setup --step verify-anki`, `agent setup --step mint-token`, etc.
+
+##### 13.3.15.4 Agent configuration (`agent.toml`)
+
+```toml
+[server]
+base_url    = "https://agent.anki-notes-pipeline.example.com"
+agent_id    = "desktop-laptop"
+token_file  = "~/.config/anki-notes-pipeline/agent.token"
+
+[anki_connect]
+url         = "http://127.0.0.1:8765"
+api_key     = ""                          # empty = not configured in AnkiConnect
+timeout_s   = 15
+# If Anki isn't running, how long to back off before next probe.
+startup_probe_interval_s = 30
+startup_probe_max_s      = 300
+
+[polling]
+idle_interval_s   = 60                     # when /pending was empty last time
+active_interval_s = 5                      # after a successful non-empty apply
+active_window_s   = 120                    # how long to stay in "active" mode
+jitter_ratio      = 0.2                    # +/- 20% randomization to avoid thundering herd
+max_backoff_s     = 900                    # on repeated failures
+
+[sync]
+request_ankiweb_sync_after_batch = true
+# If true, agent aborts if desktop Anki reports "full sync required" instead
+# of attempting to choose a direction. User must resolve in Anki's UI.
+abort_on_full_sync_conflict = true
+
+[conflict]
+policy = "prefer-remote"                   # "prefer-remote" | "prefer-local" | "tag-and-skip"
+
+[logging]
+level     = "info"
+path      = "~/.local/state/anki-notes-pipeline/agent.log"
+max_bytes = 10485760
+backups   = 3
+```
+
+All values are overridable via environment variables with prefix `ANKI_AGENT_` (flat keys: `ANKI_AGENT_POLLING_IDLE_INTERVAL_S=120`).
+
+##### 13.3.15.5 Agent runtime behavior
+
+The agent is a single-threaded event loop that alternates between four states:
+
+```
+    ┌───────────── start ─────────────┐
+    ▼                                 │
+ WAITING_FOR_ANKI ──detect── IDLE ◀───┤
+        ▲                    │        │
+        │           empty    │ batch  │
+        │           pending  │ received
+        │                    ▼        │
+        │                 APPLYING ───┘
+        │                    │
+        │   any error        │
+        └────── back-off ────┘
+```
+
+State transitions:
+
+- **WAITING_FOR_ANKI**: AnkiConnect probe fails. Back off with jitter, up to `startup_probe_max_s`. No cloud traffic in this state.
+- **IDLE**: AnkiConnect is healthy. `GET /api/ankiweb/pending?cursor=<last>` every `idle_interval_s`. Empty response → stay idle.
+- **APPLYING**: Non-empty batch received.
+  - Stage batch to `cache/inflight_batches/<batch_id>.json` first (crash safety).
+  - For each item, run the corresponding AnkiConnect action (§13.3.5).
+  - Compute the three-way merge locally (§13.3.6) using the `base_fields` the server sent.
+  - Collect per-item results.
+  - After all items applied, optionally call AnkiConnect `sync`. Capture `sync_status`.
+  - `POST /api/ankiweb/ack` with the full `results[]` + `sync_status`.
+  - On successful ack, delete `cache/inflight_batches/<batch_id>.json` and write the new cursor to `cache/last_cursor`.
+  - Append a summary line to `applied_log.ndjson`.
+  - Enter ACTIVE polling (§13.3.15.6).
+- **Back-off** (any state): exponential with full jitter, capped at `max_backoff_s`. Three consecutive ack failures with the same `batch_id` escalate to a log warning and a stderr message; we never drop the batch — we keep retrying.
+
+Concurrency: strictly one inflight batch at a time per agent. The server's FIFO cursor guarantees no parallel batches are ever issued, but the agent enforces it locally too by refusing to fetch a new batch while `inflight_batches/` is non-empty.
+
+##### 13.3.15.6 Active-polling heuristic
+
+After a non-empty ack, the agent switches to `active_interval_s` polling for `active_window_s`, then decays back to `idle_interval_s`. Motivation: lesson-notes runs tend to produce several batches in quick succession (different source files settling around the same time). Active polling catches the cascade without costing anything during quiet periods. At `idle_interval_s = 60`, the steady-state cost to API Gateway is ~1 request/minute per agent — negligible.
+
+##### 13.3.15.7 Init-system integration
+
+The agent is installed as a per-user long-running service so it starts at login and restarts on crash.
+
+###### macOS — `launchd`
+
+`~/Library/LaunchAgents/com.anki-notes-pipeline.agent.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key>        <string>com.anki-notes-pipeline.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USER/.local/share/anki-notes-pipeline/agent/venv/bin/python</string>
+    <string>/Users/USER/.local/share/anki-notes-pipeline/agent/agent.py</string>
+  </array>
+  <key>RunAtLoad</key>    <true/>
+  <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key>  <string>Background</string>
+  <key>StandardOutPath</key>
+    <string>/Users/USER/.local/state/anki-notes-pipeline/agent.stdout</string>
+  <key>StandardErrorPath</key>
+    <string>/Users/USER/.local/state/anki-notes-pipeline/agent.stderr</string>
+  <key>EnvironmentVariables</key>
+    <dict><key>ANKI_AGENT_CONFIG</key>
+          <string>/Users/USER/.config/anki-notes-pipeline/agent.toml</string></dict>
+</dict></plist>
+```
+
+Loaded with `launchctl bootstrap gui/$(id -u) <plist>`. Survives reboots; restarts automatically on non-zero exit.
+
+###### Linux — `systemd --user`
+
+`~/.config/systemd/user/anki-notes-pipeline-agent.service`:
+
+```ini
+[Unit]
+Description=Anki Notes Pipeline pull agent
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/anki-notes-pipeline/agent/venv/bin/python \
+          %h/.local/share/anki-notes-pipeline/agent/agent.py
+Environment=ANKI_AGENT_CONFIG=%h/.config/anki-notes-pipeline/agent.toml
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+```
+
+Enabled with `systemctl --user enable --now anki-notes-pipeline-agent`. Plus `loginctl enable-linger $USER` so the agent runs even when the user isn't logged in graphically — optional and off by default, because Anki itself is a GUI app the user probably launches interactively anyway.
+
+###### Windows — Task Scheduler
+
+A registered task with trigger `At log on of user <USER>`, action `pythonw.exe %LOCALAPPDATA%\AnkiNotesPipeline\agent\agent.py`, restart on failure, hidden window. Distributed as a `.xml` task definition applied with `schtasks /Create /XML <path> /TN "AnkiNotesPipelineAgent"`.
+
+##### 13.3.15.8 Ensuring Anki is actually running
+
+The agent does not start Anki for the user. That's deliberate: the user already knows when they want Anki open, and launching it automatically (especially on macOS where Anki is a `.app`) surprises people and interferes with password managers / autolaunch settings.
+
+Instead, the agent exposes its current state via two signals the user can check:
+
+- `anki-notes-pipeline agent status` — prints health (`AnkiConnect reachable`, last successful poll, pending batches in-flight, pending count from last poll).
+- Optional desktop notification on first transition from `WAITING_FOR_ANKI` → `IDLE` in a given day ("Anki-Connect reachable; 12 pending cards applied"). Off by default, on via `notifications.enabled = true`.
+
+For the narrow case where the user *does* want auto-launch, we document a 3-line snippet for each OS (e.g. on macOS, a second launchd item that runs `open -a Anki` at login) rather than baking it into the agent itself.
+
+##### 13.3.15.9 Security properties (the upside of H1)
+
+- **AnkiConnect never leaves the loopback interface.** `webBindAddress` stays at `127.0.0.1`. The agent connects via `http://127.0.0.1:8765`; no TLS is needed because the traffic never leaves the kernel's loopback.
+- **Only the agent process reaches AnkiConnect.** The laptop's OS firewall can safely drop all inbound traffic to port 8765 (and already does by default when bound to `127.0.0.1`).
+- **Agent token is a narrow-purpose credential**, scoped to `/api/ankiweb/*` only, revocable independently of the user's OAuth session. Stored at `chmod 0600`.
+- **Outbound-only traffic** means no router or corporate firewall configuration on the user's end. Hotels, coffee shops, and employer networks just work.
+- **No inbound DNS, no ACME certs, no reverse proxy** — the moving parts that make H2 a nightmare are all absent.
+- **AnkiConnect's `apiKey` is still set** even though it isn't strictly needed for loopback. Defense-in-depth, and it matches what the installer offers as a default for consistency with H3 deployments.
+
+##### 13.3.15.10 Cloud-side additions (Lambda/FastAPI)
+
+The H1 choice adds three endpoints and one DynamoDB table shape to the server side. None of this is new architecture — just pinning down names and schemas.
+
+Endpoints (under `/api/ankiweb/`):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/ankiweb/agent/register` | Authenticated by user's OAuth; mints an agent token, returns `{agent_id, token}`. Idempotent on `agent_id`. |
+| `POST` | `/api/ankiweb/agent/revoke` | Revokes a token by `agent_id`. |
+| `GET`  | `/api/ankiweb/pending` | Returns next batch for this agent (§13.3.7 format). Requires `Authorization: Bearer <token>`. |
+| `POST` | `/api/ankiweb/ack` | Acks a batch, advances cursor and updates `CardRecord.ankiweb_*` fields. |
+
+DynamoDB records (added to §12.1):
+
+| Record | Keys | Purpose |
+|---|---|---|
+| `AgentRecord` | `pk=agent#<user_id>`, `sk=<agent_id>` | Stores bcrypt-hashed token, `created_at`, `last_seen_at`, `last_poll_at`, `last_batch_id`, `last_sync_status`, `revoked_at`. |
+| `PendingSyncCursor` | `pk=sync_cursor#<user_id>`, `sk=<agent_id>` | Per-agent cursor (timestamp + `card_id` tiebreaker). |
+
+Existing `CardRecord` already carries `ankiweb_note_id`, `ankiweb_last_synced_at`, `ankiweb_last_synced_fields` (§12.1 + §13.3.6), so no change there.
+
+##### 13.3.15.11 What we ask the user to do, concretely
+
+The complete happy-path bootstrap from the user's perspective:
+
+1. Install AnkiConnect from Anki's Tools → Add-ons dialog using code `2055492159`, restart Anki.
+2. From a terminal on the same machine, run `anki-notes-pipeline agent setup` and follow the interactive prompts (logs into the pipeline OAuth, mints a token, writes config, installs the login-item/service).
+3. Leave Anki running whenever they want cards to propagate. That's it.
+
+Subsequent lesson note processing causes cards to appear in Anki (and, after the next desktop-Anki AnkiWeb sync, on AnkiWeb) without any further action on the user's part.
+
+##### 13.3.15.12 Observability for the user
+
+Three surfaces:
+
+- `anki-notes-pipeline agent status` — local, immediate.
+- `/api/sync/runs/{run_id}` (already in §13.3.11) — shows, per run, how many cards landed on which agent and what the `sync_status` was.
+- Optional weekly email digest summarizing: runs completed, cards created/updated, conflicts (with links to Anki notes the user should review), any stuck agent (haven't seen a poll in >48 h).
+
+##### 13.3.15.13 Failure modes unique to H1 (and how we handle them)
+
+| Situation | Detection | Handling |
+|---|---|---|
+| User's laptop is closed for a week | No polls from the agent. | Cards accumulate in the `PendingSyncCursor` queue. When the laptop comes back online the agent catches up in one or more batches. `SyncReport.export.ankiweb.latency_p95` will spike; alert threshold `48h` is documented. |
+| Agent's venv breaks (e.g. user upgrades system Python and the isolated venv points at a missing interpreter) | Init system reports repeated failures. | `agent setup --step rebuild-venv` recreates the venv; we ship it as a recovery subcommand. |
+| User runs `agent setup` twice | Server returns the existing `agent_id` and rotates the token; old token is revoked. | Idempotent by design. |
+| User migrates to a new laptop | They run `agent setup` on the new machine; old `agent_id` can be revoked via `agent revoke --agent-id old-laptop`. | `AgentRecord.last_seen_at` makes it obvious which one is stale. |
+| AnkiConnect add-on auto-updated, new version breaks compatibility | `version` handshake or an action fails at startup. | Agent pins a known-good minimum AnkiConnect version in `agent.toml` and prints a clear remediation message; we also publish a compatibility matrix in the agent's README. |
+| Desktop Anki is running in a different profile than the one the user set up against | `deckNames` returns a profile-scoped list; the expected deck is missing. | Agent fails loudly with "Anki is open under profile X but exporter was configured for profile Y." No silent writes to the wrong profile. |
+| User manually edited AnkiConnect's `webBindAddress` to `0.0.0.0` | Detected by `getConfig` on startup. | Agent warns ("this is H2; you no longer need to expose AnkiConnect") but continues working; exit code remains 0. |
+| Full-sync-required prompt appears in Anki | `sync` action returns a specific error. | Agent returns `sync_status: "full-sync-required"` in the ack; server surfaces this prominently in the UI. Agent does **not** attempt to answer the prompt. |
+
+##### 13.3.15.14 Uninstall
+
+`anki-notes-pipeline agent uninstall` removes the init unit, deletes the venv and cache, and calls `POST /api/ankiweb/agent/revoke`. Config and token files are preserved by default (common: users reinstall and want their existing config back); `--purge` deletes those too.
+
+##### 13.3.15.15 Implementation sequence delta
+
+This subsection slots cleanly into the existing **Phase 7 — New export targets** from §15 without inventing a new phase. Specifically §15.7d, "Implement pull-agent endpoints and a sample desktop agent script," expands to:
+
+| Step | Change | Risk |
+|---|---|---|
+| 7d.1 | Implement `POST /agent/register`, `POST /agent/revoke`, `AgentRecord` DynamoDB model. | Low. |
+| 7d.2 | Implement `GET /pending` and `POST /ack` with cursor semantics per §13.3.7. | Medium — cursor + batch idempotency must be tested carefully. |
+| 7d.3 | Build the `agent.py` single-file script (no heavy deps). | Medium — three-way merge + AnkiConnect interaction + crash-safe batch staging. |
+| 7d.4 | Ship init-system templates (launchd plist, systemd unit, Task Scheduler XML). | Low. |
+| 7d.5 | Build the `agent setup` / `agent status` / `agent uninstall` CLI subcommands. | Low. |
+| 7d.6 | Agent integration tests with a fake AnkiConnect + FastAPI `TestClient`; property tests for the three-way merge. | Low. |
+| 7d.7 | User-facing documentation in `docs/users/ankiweb-agent.md` with screenshots for the three OS installers. | Low. |
+
+No change is needed to Phase 5/6/8 from this subsection.
+
 ### 13.4 AnkiWeb exporter responsibilities
 
 Regardless of option:
