@@ -1053,6 +1053,227 @@ CloudWatch alarms:
 - Local: `cron` invokes `anki-notes-pipeline schedule --source-set weekly-chinese-notes` which is the exact function the Lambda calls.
 - GitHub Actions: a `.github/workflows/weekly-sync.yml` on `schedule:` runs the same command inside the container image used for Lambda, so behavior is identical. Secrets come from repo secrets instead of AWS Secrets Manager; the settings loader abstracts this.
 
+### 11.6 Waiting for the end of an editing session before processing
+
+A naive "process on every edit" trigger is wasteful and, for Google Docs specifically, misleading: Drive emits push notifications frequently during a live editing session (multiple per minute is normal), and `changes.list` will happily return the same `fileId` dozens of times before the user is done. What we really want as the **start condition** is "the user has stopped editing this doc for long enough that further edits are unlikely in the immediate term."
+
+This subsection specifies how we add that start condition, what it does to change-tracking logic, and how it affects resource usage.
+
+#### 11.6.1 Defining "session ended"
+
+Drive does not expose an explicit "editing session ended" signal. We infer it from the absence of further change notifications. Two definitions worth considering:
+
+| Definition | Description | Trade-off |
+|---|---|---|
+| **D1 — Quiescence window (chosen)** | A doc is considered "settled" once no `change` notification has arrived for it in the last *N* minutes. | Simple, provider-agnostic, tunable per source set. |
+| D2 — Explicit user signal | The user taps a "done" button in a companion UI, or adds a specific tag/label (e.g. renames the doc with a `✓` suffix, or moves it to a "ready" subfolder). | More accurate, but requires ritualized behavior from the user and a UI. Useful as an override, not as the default. |
+| D3 — Edit-rate heuristic | Start processing when the instantaneous change-notification rate drops below some threshold. | Sensitive to tuning, harder to reason about, no obvious benefit over D1. Rejected. |
+
+The plan uses **D1 as the primary mechanism**, with **D2 available as an override** (a "force now" API + a "mark done" Drive label) for users who want to short-circuit the wait.
+
+Per-source-set configuration:
+
+```yaml
+source_sets:
+  weekly-chinese-notes:
+    # ... existing fields ...
+    edit_settling:
+      enabled: true
+      quiet_minutes: 10          # N
+      max_delay_minutes: 120     # hard ceiling (see §11.6.4)
+      allow_force_override: true
+```
+
+Typical default: `quiet_minutes = 10`. The value is deliberately generous because (a) the cost of waiting an extra few minutes is negligible, and (b) the cost of processing mid-session is re-running the LLM on a chunk that will change again.
+
+#### 11.6.2 Mechanism: debounced per-file timers
+
+Implemented as a **per-file debounce** on top of the existing two-tier webhook architecture from §11.3.8. Conceptually:
+
+```
+Drive ──► API Gateway ──► Lambda A (webhook)
+                              │  verifies, identifies affected fileIds
+                              ▼
+                          SQS FIFO (drive-change-events)  ── one message per (channel_id, fileId)
+                              │
+                              ▼
+                          Lambda C (debouncer)
+                              │  upserts a "pending" record per fileId with a scheduled
+                              │  `ready_at = now + quiet_minutes`, or extends an existing one
+                              ▼
+                          DynamoDB table: PendingEdits  (TTL-driven)
+                              │
+                              ▼
+                          EventBridge rule (every 1 minute)
+                              │  scans PendingEdits WHERE ready_at <= now
+                              ▼
+                          Lambda B (worker)
+                              │  processes the settled fileIds via run_sync
+                              ▼
+                          StateStore advances `pageToken`, records cards, exports
+```
+
+Two important changes versus §11.3.8:
+
+1. The SQS FIFO queue no longer drives the worker directly. It drives a **debouncer** whose only job is to maintain the `PendingEdits` table. This is cheap, fast, and idempotent.
+2. A new **polling Lambda (B)** runs on a 1-minute EventBridge rule (or is invoked by a DynamoDB Streams→Lambda flow keyed on TTL expiry if we want sub-minute precision — see §11.6.6).
+
+`PendingEdits` schema:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `pk` | `"pending#<source_set>"` | Partition key; groups by source set. |
+| `sk` | `fileId` | Sort key; one row per file currently "cooling off". |
+| `first_seen_at` | ISO datetime | When the first notification in the current session arrived. |
+| `last_seen_at` | ISO datetime | When the most recent notification arrived. |
+| `ready_at` | ISO datetime | `last_seen_at + quiet_minutes`. |
+| `hard_deadline_at` | ISO datetime | `first_seen_at + max_delay_minutes` (§11.6.4). |
+| `message_count` | int | Number of notifications coalesced into this row (observability). |
+| `last_message_number` | int | For replay absorption at the debouncer tier. |
+| `force` | bool | Set by the override API to bypass `ready_at`. |
+
+Debouncer logic is a conditional upsert:
+
+```
+UpdateItem PendingEdits
+  Key: (pk="pending#<source_set>", sk=fileId)
+  UpdateExpression:
+    SET last_seen_at = :now,
+        ready_at     = :now_plus_N,
+        message_count = if_not_exists(message_count, 0) + 1,
+        first_seen_at = if_not_exists(first_seen_at, :now),
+        hard_deadline_at = if_not_exists(hard_deadline_at, :now_plus_max)
+  ConditionExpression: attribute_not_exists(force) OR force = :false
+```
+
+That single atomic update is all the debouncer needs to do per incoming event.
+
+#### 11.6.3 Interaction with the `pageToken`
+
+This is where change tracking gets subtle. In §11.3.6 the rule was: advance `pageToken` only after every change on a `changes.list` page has been *persisted* by `run_sync`. With debouncing, we have an in-between state: a change has been *observed* (so we don't want to re-pull it from Drive) but not yet *processed* (so we can't let downstream artifacts consider it done).
+
+The plan splits responsibility cleanly:
+
+- The **debouncer** (Lambda C) is allowed to advance `pageToken` as soon as it has durably recorded the affected fileIds in `PendingEdits`. This is safe because `PendingEdits` itself is durable; losing the `pageToken` cursor after that point would not lose information, it would only cause one redundant (idempotent) re-pull.
+- The **worker** (Lambda B) never touches `pageToken`. It only reads `PendingEdits` and calls `run_sync`.
+
+Concretely, `StateStore.DriveChannelRecord.page_token` now represents "Drive changes I have *observed*, whether or not they are yet processed." A new per-source-set view, `PendingEdits`, represents "observed but not yet processed."
+
+Invariant (useful for reasoning and testing):
+
+> *For every fileId in `PendingEdits`, there exists a `SourceRecord` whose `revision_id` may be stale relative to Drive but whose on-disk cards are consistent with some past revision. For every fileId NOT in `PendingEdits`, `SourceRecord.revision_id` reflects the content that was last successfully processed.*
+
+#### 11.6.4 Bounded delay (preventing indefinite postponement)
+
+Pure debouncing has a failure mode: a user who keeps typing sporadically every 9 minutes would never trigger processing with `quiet_minutes=10`. Two guards:
+
+1. **Hard deadline (`max_delay_minutes`)**. `PendingEdits.hard_deadline_at` is set once on the first notification of a session and never extended. The worker treats a row as ready when `now >= min(ready_at, hard_deadline_at)`. Default: 2 hours. This guarantees progress even under pathological edit patterns.
+2. **Session reset on long gaps**. If a notification arrives for a fileId whose row has already been consumed (no pending row exists), it starts a fresh session with a new `first_seen_at`. This is the common case — most users edit a doc, stop for hours, then come back later — and it must feel natural, not like edits are being "queued forever."
+
+The two knobs together express a clean intent:
+
+- *Short bursts* (minutes): debounced; processed exactly once at the end.
+- *Long sessions* (hours): processed at least every `max_delay_minutes`, even while still active.
+- *Discontinuous edits separated by > `quiet_minutes`*: processed as separate sessions.
+
+#### 11.6.5 Interaction with `run_sync` and per-chunk change tracking
+
+The content-level change tracking from §12.4 is what makes the debounce safe and efficient when a session is *cut short* by the hard deadline. Suppose a user is in the middle of a marathon edit and we force-process after 2 hours:
+
+1. The worker pulls the current Drive revision, downloads it, hashes it.
+2. If the hash matches the last-processed hash, nothing to do (the user may have edited and reverted).
+3. Otherwise, re-chunk, hash each chunk. Only chunks with new hashes go through the LLM.
+4. Cards are upserted by natural key; unchanged ones are no-ops.
+5. `SourceRecord.revision_id` is advanced to the just-processed Drive revision.
+6. The `PendingEdits` row is **deleted only if** `last_seen_at ≤ run_started_at`. If new notifications arrived while the run was in flight, the row is left behind with its original `first_seen_at` preserved but a fresh `ready_at`, ensuring another round will fire later.
+
+This design means "force-processing" in the middle of a session is never destructive — it's just an early incremental pass that the next debounced pass will correct if needed.
+
+#### 11.6.6 Worker triggering: polling vs. scheduled vs. DynamoDB TTL
+
+Three mechanisms are viable for turning "this row just became ready" into a Lambda invocation:
+
+| Mechanism | Precision | Idle cost | Complexity | Verdict |
+|---|---|---|---|---|
+| **EventBridge rule every 1 min → Lambda scans `PendingEdits` for ready rows** | ~60s resolution | Negligible; a query with `ready_at <= now` on a small table is effectively free. | Low. | **Default.** Matches the "no always-on" rule and is trivial to reason about. |
+| DynamoDB Streams + TTL on `ready_at` | Seconds | Negligible. | Medium — TTL-based delivery is eventually consistent, with up to ~48h slack on the SLA. Drive edits don't need sub-minute response, so the extra complexity isn't worth it. | Not recommended. |
+| Step Functions wait state per file | Sub-second | Per-file cost; many active sessions × many hours → non-trivial. | Higher; also harder to cancel/extend a wait. | Rejected for this use case. |
+
+Polling is selected as the default. A 1-minute granularity is well inside the noise for study-notes workloads.
+
+#### 11.6.7 Observability changes
+
+Two new log events and two new metrics:
+
+- `drive.debounce.extended` — every time an existing `PendingEdits` row has its `ready_at` pushed out. Field: `message_count` after the update. Lets us see how "chatty" sessions are in practice.
+- `drive.debounce.fired` — every time a row transitions to processing. Fields: `waited_seconds = ready_at - first_seen_at`, `message_count`, `reason ∈ {quiet, hard_deadline, force}`.
+- Metric: **p50 / p95 wait-to-process latency**, per source set. Used to tune `quiet_minutes`.
+- Metric: **sessions collapsed per processing run** = `message_count` distribution. Should trend > 1 for this feature to be earning its keep.
+
+Alarms:
+
+- `drive.debounce.fired reason=hard_deadline` fires more than, say, 5× in a rolling 24h window → notify, because that's a signal the `quiet_minutes` is too short for this user's editing style.
+
+#### 11.6.8 Effects on resource usage
+
+The feature is a net reducer of resource usage in the steady state, because its entire purpose is to collapse *k* notifications into 1 run. A concrete back-of-envelope:
+
+Assume one editing session produces ~30 `change` notifications over 15 minutes (a realistic number for an active Google Docs edit). Without debouncing, each notification that passes the mime-type / ancestor filter produces one `changes.list` + one `run_sync`. With debouncing:
+
+| Resource | No debounce | With debounce | Change |
+|---|---|---|---|
+| Lambda A (webhook) invocations per session | 30 | 30 | unchanged — still responds to every ping |
+| Lambda C (debouncer) invocations | 0 | 30 | +30 trivial writes (≈1 ms each) |
+| Lambda B (worker) invocations | up to 30 | 1 | **−29** (each one is the expensive Bedrock-using one) |
+| `changes.list` API calls | 30 | 1 | **−29** |
+| `files.get` / `files.export` | 30 | 1 | **−29** |
+| Bedrock token spend | 30× new-chunks work | 1× | **≈ −96%** for this session |
+| DynamoDB writes | ~30× `SourceRecord` upserts + chunk/card upserts | 1× all that, plus 30 `PendingEdits` upserts | Roughly flat; slightly more small writes, far fewer large transactions |
+| API Gateway requests | 30 | 30 | unchanged |
+| SQS messages | 30 | 30 (into debouncer) | unchanged in count; the expensive worker stage is what shrinks |
+
+The dominant cost in this system is Bedrock. Cutting worker invocations by an order of magnitude per session roughly shrinks the LLM bill by the same factor in the webhook-driven path. The added debouncer Lambda and `PendingEdits` table add costs measured in cents/month, dwarfed by the savings.
+
+Corner cases where resource usage *grows*:
+
+1. **One-shot edits.** A user opens a doc, makes a single change, closes it. Debouncing adds `quiet_minutes` of latency but otherwise costs the same: 1 debouncer write, 1 worker invocation.
+2. **Many small docs edited together.** e.g. mass-applying a tag. `PendingEdits` might accumulate hundreds of rows simultaneously. Acceptable: reads are by `(pk, ready_at)` and DynamoDB on-demand handles bursty write volume natively. The worker processes all ready rows in a single fan-out batch (one `run_sync` per fileId or grouped into one `run_sync` with many `only_file_ids` — the orchestrator already accepts a list).
+3. **Abandoned sessions.** A user starts editing then walks away for days. With `max_delay_minutes = 120`, we still fire once at 2h and then once more at the end if they return. Acceptable. To be thorough, `PendingEdits` rows carry a DynamoDB TTL of `hard_deadline_at + 30 days` as a garbage-collection backstop.
+
+#### 11.6.9 Effects on change-tracking invariants
+
+Re-stating the §12.4 layered change detection explicitly now that events are debounced:
+
+1. **Document level.** Debouncer coalesces many notifications for one `fileId` into one "the file is probably different from last time we processed it." The worker still verifies against `SourceRecord.revision_id` / content hash before doing any work, so spurious debounce fires (e.g. user typed a character and then `⌘Z`'d it) cost only one Drive metadata fetch.
+2. **Content level.** Unchanged if the revision differs but content bytes hash the same (happens with some Google Docs metadata-only edits like share-settings changes). We short-circuit with no LLM.
+3. **Chunk level.** When the document did change, the re-chunk + chunk-hash layer picks up only the edited chunks. The debounce window means a session that edits five chunks over 20 minutes results in one worker run that re-LLMs five chunks — not 30 worker runs re-LLMing the same five chunks over and over.
+4. **Card level.** Cards upsert by natural key; unchanged cards → no-op → no AnkiWeb sync churn. This matters: without debouncing, an in-progress session can produce transient card states (e.g. a half-typed sentence that the LLM misreads) that would all get pushed to AnkiWeb and then overwritten. With debouncing, the user's draft never leaves our system.
+
+The integrity guarantees from §12 are preserved; debouncing only changes *when* the worker runs, not *how* it reasons about state.
+
+#### 11.6.10 Overrides and escape hatches
+
+1. **Force-process a specific file.** `POST /api/integrations/google-drive/force-process` with `{"file_id": "..."}` sets `PendingEdits.force = true` for the matching row and adjusts `ready_at = now`. Worker picks it up on the next poll.
+2. **Force-process a whole source set.** `POST /api/sync/run` with `{"source_set": "..."}` bypasses `PendingEdits` entirely (goes through the manual-trigger T3 path) and then clears any rows for files covered by the run.
+3. **"Mark done" label.** Optional: if the user renames a watched doc to end with a configurable sentinel (e.g. `[done]`), the webhook handler treats that revision as settled immediately. Cheap to implement (regex on `file.name` in the webhook verifier) and matches D2 from §11.6.1.
+4. **Pause debouncing entirely.** `edit_settling.enabled: false` reverts to the §11.3 behavior.
+
+#### 11.6.11 Provider-agnosticism
+
+The debouncing layer is defined in terms of `(provider, external_id)`, not Drive specifics. When future providers (Notion, Dropbox, OneNote) emit edit events, they publish to the same `PendingEdits` table with their own `provider` column. Each provider's webhook handler stays small; the debouncer and worker are shared infrastructure. This is why §14's module layout puts `sync/debounce.py` in the generic `sync/` package rather than inside `integrations/google_drive/`.
+
+#### 11.6.12 Summary of application-logic deltas
+
+| Area | Before | After |
+|---|---|---|
+| Webhook handler | Verifies + enqueues for worker. | Verifies + enqueues for **debouncer** (same shape, different consumer). |
+| Worker trigger | SQS message per notification. | EventBridge 1-minute tick reading `PendingEdits`. |
+| `pageToken` ownership | Worker advances it after successful `run_sync`. | **Debouncer** advances it after successful `PendingEdits` write. |
+| StateStore | `DriveChannelRecord`, `SourceRecord`, `ChunkRecord`, `CardRecord`. | Adds `PendingEdits`. `DriveChannelRecord` gains `edit_settling` snapshot for audit. |
+| run_sync | Called per notification. | Called once per "settled" session, with `only_file_ids` collapsed from many events. |
+| Invariant | "pageToken reflects what's processed." | "pageToken reflects what's observed; PendingEdits reflects the gap." |
+| Test surface | Worker tests. | Worker tests + debouncer tests (pure DynamoDB-layer logic, very easy to mock). |
+
 ---
 
 ## 12. Incremental Processing & Persistent Memory
