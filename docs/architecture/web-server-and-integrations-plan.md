@@ -1867,6 +1867,92 @@ For completeness, if AnkiWeb ever exposes a first-party upload API the exporter 
 
 Until that exists, Option C + AnkiConnect is the path.
 
+#### 13.3.14 Where should the Anki desktop instance live?
+
+Assuming the pipeline lives in the cloud (Lambda), the desktop-Anki+AnkiConnect stack still has to live somewhere. Three realistic homes:
+
+##### Option H1 — On the user's existing local machine, privately (no public exposure)
+
+**This is the design §13.3.7 already assumes.** Because the pull agent polls outbound to the cloud, AnkiConnect on the laptop never needs a public address, an open port, a reverse proxy, or a DNS record. The laptop makes egress HTTPS calls only; inbound traffic is the cloud responding to those polls. It works behind any NAT, firewall, or carrier-grade NAT with zero network configuration, and passes every corporate-network + hotel-wifi scenario.
+
+| Dimension | Rating |
+|---|---|
+| Always-on cost | $0 (uses a machine the user already owns and runs). |
+| Ongoing ops cost | Zero day-to-day. Agent is a ~300-line script installed once. |
+| Network config | None. Outbound-only. |
+| Security surface | Tiny: AnkiConnect bound to `127.0.0.1` (default), only the agent process on that same host talks to it. |
+| Latency cards-landing-on-AnkiWeb | Seconds to ~minute when the laptop is online; next login when it's closed. |
+| Hard requirement | Desktop Anki must be running at some point for cards to land — exactly the same requirement as a human user clicking "Sync". |
+| Works on mobile-only users? | No — but neither do any of the alternatives. |
+
+##### Option H2 — On the user's local machine, publicly accessible (reverse direction)
+
+This is what you *would* need if the cloud pipeline called AnkiConnect directly instead of the agent polling. It's worth documenting so we can explicitly reject it.
+
+To make it work you'd need:
+
+- A public hostname (dynamic DNS or static IP).
+- Port forwarding on the router (or a reverse tunnel like `ngrok` / `cloudflared`).
+- TLS termination (ACME certs on the laptop, or via the tunnel provider).
+- An authentication layer on top of AnkiConnect's weak `apiKey` — realistically a reverse proxy (`nginx`, Caddy) with OAuth/mTLS, because exposing a shared-secret-only endpoint to the public internet is not defensible.
+- Firewall ACLs on the laptop restricting which source IPs can hit the tunnel.
+- A story for the laptop's dynamic IP, sleep/wake cycles, travel, corporate wifi that blocks inbound tunnels, carrier-grade NAT on cellular fallback, etc.
+
+| Dimension | Rating |
+|---|---|
+| Always-on cost | $0–$5/mo (DDNS, possibly a paid tunnel). |
+| Ongoing ops cost | **High** — every moving part above is a future breakage. Cert renewals, tunnel drops, router firmware resets. |
+| Network config | Invasive; sometimes impossible (hotels, airports, many employer networks). |
+| Security surface | **Bad.** AnkiConnect's `apiKey` is a single shared secret with no rotation story, no per-request signing, no audit log; you're bolting a real auth layer on top of an add-on that wasn't written with public exposure in mind. |
+| Latency | Excellent when it works. |
+| Hard requirement | Anki must be running *and* the tunnel must be up *and* the laptop must have routable egress. |
+
+**Rejected** — all the cost of running a server plus all the security risk of exposing a desktop. The pull-agent design removes the only reason you'd ever want this.
+
+##### Option H3 — On a separate cloud server running Anki headlessly
+
+A small persistent VM (EC2 `t4g.small`, Hetzner CX11, etc.) running desktop Anki under a virtual display (`xvfb`) with AnkiConnect enabled. The cloud pipeline writes to this instance, and it in turn syncs to AnkiWeb.
+
+| Dimension | Rating |
+|---|---|
+| Always-on cost | ~$5–10/mo (the cheapest VM that can run the Anki GUI under Xvfb without swapping). Violates the "no always-on resources" rule unless we're willing to make an exception for this. |
+| Ongoing ops cost | **Highest.** Anki is a GUI app forced into a headless role; it breaks in unusual ways (Qt platform plugin failures, display-server upgrades, AppImage/Flatpak path surprises). Requires keeping Anki itself updated so AnkiConnect stays compatible. |
+| Network config | Moderate. Inbound reachable only from the pipeline's VPC or via signed requests, similar to our other Lambda endpoints. |
+| Security surface | Moderate. `apiKey` plus mTLS between Lambda and the VM is defensible. |
+| Latency | Seconds. |
+| Hard requirement | Anki process stays up; sync runs on schedule or on push. |
+| Multi-device Anki | **Breaks badly.** If the user also runs desktop Anki on their laptop, both instances will sync to the same AnkiWeb account and Anki's full-sync-required prompt will appear intermittently. Fixable only by making the cloud Anki the sole writer, which means the user loses the ability to edit notes on their own desktop Anki app. |
+| Cloud/serverless version | Not viable. Anki is a GUI app with persistent on-disk state (`collection.anki2`) and can't be containerized into a stateless Lambda. You can shove it into a container on ECS/Fargate but you're still paying for it 24/7 because cold-start of the Anki GUI under Xvfb is slow and fragile, and the `.anki2` file has to live on a persistent EFS or EBS volume. |
+
+##### Recommendation
+
+**H1 — run the AnkiConnect instance on your existing local machine, no public exposure.** The pull-agent protocol in §13.3.7 is specifically designed to make this the path of least resistance: no port forwarding, no DDNS, no certs, no reverse proxy, no special hardware, and no always-on cost beyond the machine you already own. The only real constraint is that desktop Anki needs to be running at some point for cards to propagate to AnkiWeb — but that's the same constraint every Anki user already lives with (review days still require an open Anki at some point).
+
+H2 should be avoided entirely. It trades a clean polling design for a large, permanent security and ops burden.
+
+H3 is only the right answer if the user has no machine of their own that runs Anki daily (e.g. mobile-only Anki setup, but in that case AnkiWeb isn't the user's primary endpoint either) **or** has an explicit need for near-zero latency between pipeline output and AnkiWeb propagation. Neither applies to the stated lesson-notes workflow, where cards are consumed the next evening or later.
+
+##### What changes depending on the choice
+
+- **H1 (recommended):** no changes to §13.3.7. The agent ships as a pre-written script; the user runs a one-liner installer.
+- **H2 (not recommended):** would require adding an inverse exporter mode `ankiweb_push` that calls AnkiConnect directly from Lambda, plus a whole network-verification dance (DNS, TLS, reverse proxy) that lives entirely outside our codebase. We don't plan this path in.
+- **H3:** same agent code as H1, just running on a headless VM instead of a laptop. The plan keeps H3 as a documented fallback but doesn't build any H3-specific tooling beyond a `cloud-init` example so the user can stand one up if they must.
+
+##### Summary table
+
+| | H1 — your laptop, private (selected) | H2 — your laptop, public | H3 — headless cloud VM |
+|---|---|---|---|
+| Monthly cost | $0 | $0–5 | $5–10+ |
+| Network setup | None | DDNS/tunnel + certs + proxy | Standard VPC |
+| Security burden | Minimal (`127.0.0.1`-only) | Severe | Moderate |
+| Ops burden | Near-zero | High and ongoing | Highest (headless GUI) |
+| Works on restrictive networks | Yes | No | Yes |
+| Multi-device Anki friendly | Yes | Yes | No |
+| Sync latency | Seconds–minutes when online | Seconds | Seconds |
+| Requires Anki running | Yes | Yes | Yes, 24/7 |
+| Aligns with §11–§12 invariants | Yes | Yes | Yes |
+| Aligns with "no always-on cloud" rule | Yes | Yes | **No** |
+
 ### 13.4 AnkiWeb exporter responsibilities
 
 Regardless of option:
