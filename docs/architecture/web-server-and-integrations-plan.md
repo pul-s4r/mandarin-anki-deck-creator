@@ -1262,7 +1262,121 @@ The integrity guarantees from §12 are preserved; debouncing only changes *when*
 
 The debouncing layer is defined in terms of `(provider, external_id)`, not Drive specifics. When future providers (Notion, Dropbox, OneNote) emit edit events, they publish to the same `PendingEdits` table with their own `provider` column. Each provider's webhook handler stays small; the debouncer and worker are shared infrastructure. This is why §14's module layout puts `sync/debounce.py` in the generic `sync/` package rather than inside `integrations/google_drive/`.
 
-#### 11.6.12 Summary of application-logic deltas
+#### 11.6.12 Worked example: 1-hour lesson with intermittent note-taking
+
+Your reported pattern:
+
+- A document is held open for roughly 1 hour (the duration of a lesson).
+- Within that hour, there are typically **3 note-taking bursts**.
+- Between bursts there is a **10–15 minute quiet window**.
+- After the third burst the lesson ends and the doc goes quiet for the rest of the day.
+
+Reasonable timing assumptions for the worked example below:
+
+| Interval | Duration |
+|---|---|
+| Burst 1 (active typing) | ~10 min, ~20 notifications |
+| Gap 1 (listening) | 10–15 min, 0 notifications |
+| Burst 2 | ~10 min, ~20 notifications |
+| Gap 2 (listening) | 10–15 min, 0 notifications |
+| Burst 3 | ~10 min, ~20 notifications |
+| Post-lesson | silent until next lesson (hours) |
+| **Total elapsed** | **~50–60 min, ~60 notifications** |
+
+The tuning question is: does `quiet_minutes` comfortably exceed 15 min, or not?
+
+##### Tuning comparison
+
+| Setting | Worker runs per lesson | Latency: cards visible after final edit | Fragility (if a gap happens to be 16 min) |
+|---|---|---|---|
+| `quiet_minutes = 5` (aggressive) | 3 (one per burst) | 5 min | Ultra-stable; but triples LLM spend vs. merged runs |
+| `quiet_minutes = 10` (generic default) | Usually 3; sometimes 1–2 | 10 min after each burst | **Brittle** — a 10-min gap is right at the threshold; a 10½-min gap splits the lesson |
+| `quiet_minutes = 20` (**recommended**) | **1 per lesson** | 20 min | Safe margin above the observed 15-min max gap |
+| `quiet_minutes = 25` (conservative) | 1 per lesson, occasionally 1 across two back-to-back lessons | 25 min | Safe, slightly worse immediacy |
+| `quiet_minutes = 45` (very conservative) | 1 per lesson; merges some back-to-back lessons | 45 min | Over-merges; obscures per-lesson audit story |
+
+**Recommendation for this user: `quiet_minutes = 20`.** Rationale:
+
+- 20 min ≥ max observed gap (15 min) + 5 min of slack — covers the worst gap plus instrumentation/timer skew.
+- Below the plausible *post-lesson* silence (which is hours), so sessions still close cleanly after the lesson ends.
+- Produces exactly one worker run per lesson, which is the natural "audit unit" for a student's notes.
+
+##### `max_delay_minutes` for this pattern
+
+With lessons capped at ~60 min, the 120-min default is overkill. Tightening it lets the hard deadline act as a safety net for the edge case where a lesson overruns *or* where a subsequent study session blends into the lesson without a 20-min break.
+
+**Recommendation: `max_delay_minutes = 90`.**
+
+- A normal lesson (~60 min) never trips the deadline — the session closes via `quiet_minutes` first.
+- If editing continues >90 min for any reason, the worker fires anyway, ensuring progress.
+- Leaves a 30-min cushion over the expected 60-min lesson length, so instructor overruns don't trigger the hard deadline unnecessarily.
+
+##### Configuration block
+
+```yaml
+source_sets:
+  lesson-notes:
+    # ... Google Drive folder(s) for lesson docs ...
+    edit_settling:
+      enabled: true
+      quiet_minutes: 20
+      max_delay_minutes: 90
+      allow_force_override: true
+```
+
+##### Resource-usage math for this pattern
+
+Per lesson (60 min, 3 bursts, ~60 notifications):
+
+| Resource | No debounce | `quiet_minutes=10` (brittle) | `quiet_minutes=20` (recommended) |
+|---|---|---|---|
+| Webhook-Lambda invocations | 60 | 60 | 60 |
+| Debouncer-Lambda invocations | 0 | 60 | 60 |
+| Worker-Lambda invocations | up to 60 | ~3 (usually splits) | **1** |
+| `changes.list` API calls | 60 | ~3 | **1** |
+| `files.export` (Google Doc → DOCX) | up to 60 | ~3 | **1** |
+| Bedrock-driven chunk re-processing | up to 60 (duplicated across splits) | ~3 (partial dedup by chunk hash) | **1** (full chunk-level dedup) |
+| AnkiWeb pushes (at the end of each run) | up to 60 | ~3 | **1** |
+
+Cross-week (assume ~3 lessons/week):
+
+| Metric | No debounce | `quiet_minutes=10` | `quiet_minutes=20` |
+|---|---|---|---|
+| Worker runs/week | ~180 | ~9 | **~3** |
+| Bedrock tokens/week | ~180 × per-chunk × duplication | ~9 × per-chunk | **~3 × per-chunk**, with §12.4 chunk hashing making later runs nearly free for unchanged chunks |
+| Expected Bedrock savings vs. no debounce | baseline | ~95% | **~98%** |
+
+The jump from `quiet_minutes=10` to `quiet_minutes=20` is disproportionately valuable for this specific pattern because 10 sits *right at* the gap boundary — every lesson is a coin flip on how many runs fire. 20 moves you off the boundary and into a stable regime.
+
+##### Immediacy considerations
+
+Trade-off: at `quiet_minutes=20`, new cards don't appear until ~20 min after the final edit of a lesson. For a student reviewing notes that evening, this is negligible. If immediacy ever matters (e.g. wanting cards right after class to quiz each other on the bus ride home), there are two cheap escape hatches from §11.6.10 that don't require re-tuning:
+
+1. **Force override endpoint**: the FastAPI `POST /api/integrations/google-drive/force-process` with the doc's `fileId` — fires the worker on the next 1-min tick.
+2. **"[done]" sentinel in filename**: renaming the doc to end with `[done]` short-circuits the quiet window; the webhook handler marks the `PendingEdits` row as `force=true` immediately.
+
+The hard deadline (`max_delay_minutes`) is not a useful immediacy tool here — it's strictly a safety net for pathological patterns, not a normal-operation lever.
+
+##### Effect on change-tracking invariants
+
+The §12.4 four-layer change detection works *better* under this tuning than under the generic default:
+
+- **Document level**: one `SourceRecord.revision_id` bump per lesson instead of three.
+- **Content level**: no effect — cheap hash comparison regardless.
+- **Chunk level**: the single worker run sees the *final* state of the document, so `chunk_sha256` comparisons identify exactly the set of chunks whose contents differ from last week's lesson notes. With `quiet_minutes=10` + split sessions, the middle-of-lesson runs would compute chunk hashes against an intermediate state, then the next run would see more chunks "new" than is really meaningful. The tighter the debounce, the more jittery the chunk-level story becomes.
+- **Card level**: AnkiWeb sees one clean upsert batch per lesson, not a mid-lesson push of "lesson so far" followed by corrections. This improves the diff readability in the AnkiWeb audit feed and eliminates any case where an intermediate card state gets surfaced to the user and then overwritten minutes later.
+
+##### Summary of the tuning choice
+
+| Knob | Generic default | **This user's lessons** | Why the change |
+|---|---|---|---|
+| `quiet_minutes` | 10 | **20** | Observed inter-burst gaps reach 15 min; need safe margin above that |
+| `max_delay_minutes` | 120 | **90** | Lessons are ~60 min; 90 is a snug safety net |
+| `allow_force_override` | true | true | Unchanged; "[done]" sentinel + force endpoint cover immediacy needs |
+
+`quiet_minutes = 20` is the only material change vs. the default; `max_delay_minutes` is a minor tightening with no visible behavior change in the normal case.
+
+#### 11.6.13 Summary of application-logic deltas
 
 | Area | Before | After |
 |---|---|---|
