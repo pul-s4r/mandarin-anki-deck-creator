@@ -1548,38 +1548,334 @@ The existing `write_vocabulary_csv` becomes the body of `CsvExporter.export`. Sa
 
 ### 13.3 AnkiWeb export
 
-AnkiWeb is the trickiest integration because its official external API is limited. Two viable approaches:
+#### 13.3.1 The AnkiWeb API landscape (what actually exists)
 
-#### 13.3.1 Option A — AnkiConnect bridge (preferred for local / self-hosted)
+This is worth stating plainly up-front, because it shapes every design decision that follows:
 
-- The user runs the [AnkiConnect](https://foosoft.net/projects/anki-connect/) add-on on a desktop Anki install.
-- Our exporter POSTs JSON-RPC calls (`addNotes`, `updateNoteFields`, `findNotes`) to a local URL (e.g. `http://127.0.0.1:8765`).
-- Desktop Anki then syncs to AnkiWeb.
-- Pros: officially sanctioned, rich API, stable, no scraping.
-- Cons: requires desktop Anki to be running during sync.
+- **AnkiWeb has no public API for uploading cards/notes from third-party apps.** The AnkiWeb team has explicitly stated that "because other clients can cause problems, AnkiWeb does not currently allow access from browser extensions or other third-party clients." There is no OAuth flow, no REST endpoint for notes, no published schema.
+- The **sync protocol** between desktop/mobile Anki and AnkiWeb is documented in the Anki source tree (`rslib/src/sync/`), but it's a bidirectional full-collection sync built for Anki itself. It is not a "push a note" API; it's closer to "merge two whole databases, including scheduling state." Re-implementing it from scratch for our exporter would mean owning a mirror of Anki's collection format, including media, note types, scheduling, and historical review logs. Not viable.
+- What *is* official and stable is the **AnkiConnect add-on**: a local HTTP JSON-RPC server that exposes Anki's internal API to other processes on the same machine (default bind `127.0.0.1:8765`). AnkiConnect has full actions for note creation, update, lookup, deletion, media import, deck and model management, and a passthrough `sync` action that tells desktop Anki to sync to AnkiWeb. This is the canonical way for third-party tools to land cards on AnkiWeb.
+- AnkiWeb itself *does* have a web UI with forms (login, deck edit, etc.). Scripting it via session cookies is possible but undocumented, unsupported, and explicitly discouraged by the AnkiWeb operators. We list this only as a last-resort fallback.
 
-#### 13.3.2 Option B — AnkiWeb session-cookie client (fallback, no desktop)
+Implication for the plan: the exporter is **always** really an AnkiConnect client. The three "options" below are different answers to "how does our cloud-side pipeline talk to an AnkiConnect instance that lives on the user's desktop?"
 
-- Log into AnkiWeb via form POST with username/password, maintain the session cookie.
-- Use undocumented endpoints (CSV import, note add). Brittle; terms-of-service considerations apply.
-- Listed as a fallback only; default is Option A.
+#### 13.3.2 Option A — Direct AnkiConnect (local/self-hosted deployments only)
 
-#### 13.3.3 Option C — Hybrid: bring-your-own Anki on a schedule
+Used when the pipeline runs on the same machine as Anki (e.g. a user running `anki-notes-pipeline run …` locally, or a server the user hosts on their LAN).
 
-- Lambda cannot reach a home-LAN AnkiConnect instance directly. Solution: a tiny **pull-based agent** (a script run by launchd / systemd on the user's desktop) fetches a delta feed from our service (`GET /api/ankiweb/pending?since=...`), applies it via AnkiConnect, and POSTs the result back (`POST /api/ankiweb/ack`).
-- Our Lambda never initiates an outbound connection to the user's machine; all sync is driven from the desktop.
-- Requires the user's machine to be on and Anki running at some point after a sync, but not during it.
+- Exporter POSTs JSON-RPC to `http://127.0.0.1:8765`.
+- Works unchanged in all three CLI / FastAPI / AnkiConnect server modes as long as the host has network access to the add-on.
+- Does not work for Lambda — Lambda cannot route to a desktop in the user's home network.
 
-Recommendation: implement **Option C** because it matches the "no always-on resources" rule and sidesteps firewall/NAT issues, while still giving the user automatic AnkiWeb sync whenever their desktop comes online. Keep Option B as a manual CSV fallback for users who can't run the agent.
+#### 13.3.3 Option B — AnkiWeb session-cookie client (last-resort fallback)
+
+- Log into AnkiWeb with stored credentials, maintain a session cookie, drive the web UI's undocumented endpoints (primarily the CSV import form).
+- Brittle: any HTML change breaks it. Also likely violates AnkiWeb's stated stance on third-party access; we don't enable this by default.
+- Kept documented only so a user who truly can't run desktop Anki has an escape hatch that still produces a deck on AnkiWeb.
+
+#### 13.3.4 Option C — Pull-based desktop agent (**selected for Lambda mode**)
+
+Because the AWS-hosted exporter can't initiate connections to a home LAN, we invert the relationship: our Lambda exposes a small HTTPS API that holds a delta feed; a tiny agent on the user's desktop polls it, applies changes via AnkiConnect, and acks back.
+
+This is fully described in §13.3.7; it is the recommended default for any non-local deployment.
+
+#### 13.3.5 AnkiConnect: the operational details that matter
+
+These are the parts of the AnkiConnect spec our exporter depends on. Versions and field names below reflect AnkiConnect's public action reference (latest stable version at planning time is `v23.10.29.0`, API version `6`).
+
+##### Request envelope
+
+Every request is an HTTP POST to the AnkiConnect base URL (default `http://127.0.0.1:8765`) with a JSON body:
+
+```json
+{
+  "action":  "<action name>",
+  "version": 6,
+  "params":  { ... action-specific ... },
+  "key":     "<optional API key if configured>"
+}
+```
+
+Every response is:
+
+```json
+{ "result": <action-specific or null>, "error": <string|null> }
+```
+
+We always send `version: 6`. Error handling policy: treat `error != null` as an actionable failure — never silently skip.
+
+##### Authentication
+
+AnkiConnect supports an optional shared-secret `apiKey`. We treat this as required for any AnkiConnect instance that listens on anything other than `127.0.0.1`. The key is stored in the same secrets backend as other provider secrets (AWS Secrets Manager in Lambda mode, `.env` / keychain locally). We verify at exporter startup by calling `requestPermission`; if it returns `{permission: "granted", requireApiKey: true}` we know we're configured correctly.
+
+##### Actions the exporter uses
+
+| Action | Purpose | Notes |
+|---|---|---|
+| `version` | Handshake, feature gate. | Fail fast if `< 6`. |
+| `requestPermission` | Confirm AnkiConnect will honor our requests and whether `apiKey` is required. | Called once on agent startup. |
+| `deckNames` | Confirm target deck exists. | If missing, we call `createDeck` (configurable). |
+| `createDeck` | Auto-create the target deck. | Used only when `auto_create_deck: true` in the source-set config. |
+| `modelNames`, `modelFieldNames` | Confirm target note type and that its fields match our exporter's mapping. | Validation is done once per agent run; a mismatch fails loudly with a clear message rather than silently producing broken notes. |
+| `createModel` | Optional: create a "Chinese vocabulary" note type if the user doesn't already have one. Guarded behind `auto_create_note_type: true`. | Fields we ship: `Simplified`, `Traditional`, `Pinyin`, `Meaning`, `PartOfSpeech`, `UsageNotes`, `SourceRef`, `ExtId`. `ExtId` is our canonical per-card identifier (see §13.3.6); it ends up both in a field and in a tag for reliable lookup. |
+| `canAddNotesWithErrorDetail` | Batch-check whether a list of notes can be added without creating duplicates. Returned payload includes a per-note `canAdd` + `error` so we know which specific notes collide. | Preferred over the older `canAddNotes` because it surfaces the reason per note. |
+| `addNote` / `addNotes` | Create notes. `addNotes` takes an array and returns an array of note IDs (or `null` for ones it couldn't create — we inspect `canAddNotesWithErrorDetail` beforehand to avoid relying on silent nulls). | Batching: we use `addNotes` with a batch size of 50. Larger batches work, but 50 keeps error messages scoped. |
+| `updateNoteFields` / `updateNote` | Modify an existing note's fields (and tags, with `updateNote`). | `updateNote` is newer (2023+); exporter prefers it when available and falls back to `updateNoteFields` + `updateNoteTags` otherwise. |
+| `findNotes` | Look up existing note ID by our tag `ext_id:<uuid>`. This is the bridge between our `CardRecord.card_id` and Anki's `note_id`. | Query used: `tag:"ext_id:<card_id>"` — safer than relying on the `Simplified` field being a unique key. |
+| `notesInfo` | Read back current fields for conflict detection. | Used only when the exporter detects a "local update that may conflict with a user edit" case (§13.3.6). |
+| `addTags` / `removeTags` / `updateNoteTags` | Tag management (see tagging policy §13.3.6). | |
+| `storeMediaFile` | Upload media (currently unused; vocabulary cards have no images) but kept in the roadmap for future card types. | |
+| `sync` | Ask desktop Anki to push to AnkiWeb. | Called once at end of an exporter run. Best-effort: a failure here leaves local Anki in a valid state; next sync picks up the delta. |
+| `multi` | Batch multiple unrelated actions into one HTTP round trip. | Used to reduce latency on large exports. |
+
+##### Actions the exporter intentionally does **not** use
+
+- Any scheduling / review-state mutation (`setDueDate`, `forgetCards`, `answerCards`, `setEaseFactors`, etc.). The exporter never touches the user's review progress.
+- `deleteNotes`. Cards that disappear from source documents are marked `retired_at` in `StateStore` but left alone on AnkiWeb. Deleting a note there would destroy review history; that's a manual decision the user makes from Anki's UI.
+
+#### 13.3.6 Identity, duplicates, and conflict resolution
+
+Our `CardRecord.card_id` is a stable UUID minted the first time a card is seen. Anki has its own `noteId` (timestamp-based, assigned by Anki). We need a bidirectional mapping that survives across runs and across user edits in Anki's UI.
+
+Design:
+
+1. **Each exported note carries a tag `ext_id:<card_id>`.** Set at creation time, never edited. This tag is our source of truth for "is this note ours?" — far more reliable than first-field matching, because the user may edit the `Simplified` field, merge notes, or use a note type with a different field order.
+2. **Each exported note also stores `<card_id>` in a hidden `ExtId` field** on the "Chinese vocabulary" note type. The tag alone would be enough, but duplicating into a field makes it visible in the Anki browser and in CSV exports, which helps debugging.
+3. `StateStore.CardRecord.ankiweb_note_id` caches the `noteId` returned by AnkiConnect after a successful create. On subsequent runs we try this ID first via `notesInfo`; if the note still exists and still has the expected `ext_id:<card_id>` tag, we use it directly. If not (user deleted or un-tagged), we fall back to `findNotes` keyed on the tag.
+4. If `findNotes` returns nothing, we treat the card as "new on AnkiWeb even though it's old in our state" and call `addNote`, then update our `ankiweb_note_id`.
+5. If `findNotes` returns multiple notes (user accidentally duplicated), we log a warning, pick the earliest `noteId`, update that one, and leave the others alone. The exporter never merges or deletes on the user's behalf.
+
+##### Duplicate-first-field case
+
+AnkiConnect's default behavior rejects `addNote` when the first field matches an existing note in the same note type. Our exporter handles this by always calling `canAddNotesWithErrorDetail` **first** with the full batch; any note marked `canAdd: false` with `error: "cannot create note because it is a duplicate"` is routed to the update path instead of the create path. The `options.allowDuplicate: true` flag exists but we deliberately do not use it — creating a true duplicate is never what we want, since our deduplication already ran at the pipeline level.
+
+##### Conflict resolution when the user has edited a card in Anki
+
+This is the interesting case: the user opened Anki, changed `UsageNotes` on a card, and two weeks later the pipeline re-runs and wants to update that same card from updated source material. We use a **three-way check**:
+
+- `base` = the card fields we last synced (stored on `CardRecord.ankiweb_last_synced_fields`).
+- `remote` = the fields currently on Anki's side (from `notesInfo`).
+- `local` = the fields we want to push.
+
+Merge rules, per field:
+
+| base vs remote | base vs local | Action |
+|---|---|---|
+| same | same | No-op. |
+| same | different | Push `local` (normal update). |
+| different | same | Keep `remote` — the user edited; we don't overwrite. |
+| different | different | **Conflict.** Default: keep `remote`, record conflict in `SyncReport.conflicts`, tag the note with `conflict:<card_id>` so the user can find it. Configurable to "always prefer local" or "always prefer remote" per source set. |
+
+This is Option-C friendly too: the agent does exactly the same computation locally using state snapshots the server sends it.
+
+##### Idempotency for retries
+
+Every outgoing note carries a `req_id` (UUID) in `options.req_id` — which AnkiConnect ignores, but which we include in the tag `req:<req_id>` so retries can detect "this request already succeeded, do nothing" by searching for the tag. Cheap and doesn't depend on AnkiConnect remembering anything across restarts.
+
+#### 13.3.7 Option C in detail: the pull-based desktop agent
+
+The cloud service (Lambda) never initiates a connection to the user's home network. Instead, a small agent on the user's desktop owns the AnkiConnect conversation. The server just hosts a work queue.
+
+##### Components
+
+```
+Pipeline (Lambda)                             User's desktop
+──────────────────────────            ─────────────────────────────
+ StateStore ──► /api/ankiweb      ⟵──  anki-agent (long-running)
+                  delta feed              │
+                                          ├─► localhost:8765 (AnkiConnect)
+                                          │        │
+                                          │        └─► desktop Anki
+                                          │                │
+                                          │                └─► AnkiWeb sync
+                                          │
+                                          └─► POSTs /api/ankiweb/ack
+```
+
+##### Protocol
+
+Single-user at planning time, multi-user ready via `user_id`.
+
+```
+GET /api/ankiweb/pending?agent_id=<id>&cursor=<opaque>
+Authorization: Bearer <agent-token>
+
+200 OK
+{
+  "cursor":    "<next cursor>",
+  "batch_id":  "<uuid>",
+  "items": [
+    {
+      "op":      "create" | "update" | "verify" | "retire",
+      "card_id": "<uuid>",
+      "anki":    {
+        "deckName":  "Chinese::301",
+        "modelName": "Chinese vocabulary",
+        "fields":    { "Simplified": "...", ... },
+        "tags":      ["ext_id:<card_id>", "req:<req_id>", "auto-generated"],
+        "options":   { "allowDuplicate": false }
+      },
+      "base_fields": { ... }           // for conflict detection on update/verify ops
+    },
+    ...
+  ]
+}
+```
+
+```
+POST /api/ankiweb/ack
+{
+  "batch_id":  "<uuid>",
+  "agent_id":  "<id>",
+  "results": [
+    {
+      "card_id":      "<uuid>",
+      "op":           "create" | ...,
+      "status":       "applied" | "skipped" | "conflict" | "error",
+      "anki_note_id": 1682340923122,               // set on create/update
+      "error":        null | "<message>",
+      "conflict": {                                // set when status == conflict
+        "fields": ["UsageNotes"],
+        "chosen": "remote"
+      }
+    }, ...
+  ],
+  "sync_requested": true,           // whether the agent called AnkiConnect's `sync` action
+  "sync_status":    "ok"            // or "failed: <reason>"
+}
+```
+
+The server updates `CardRecord.ankiweb_note_id`, `ankiweb_last_synced_at`, and `ankiweb_last_synced_fields` when it receives `status: applied`. For `status: conflict`, it additionally records the conflict in `SyncReport` and tags the card so it surfaces in the next `/api/ankiweb/pending` response for inspection.
+
+##### Cursor semantics
+
+`cursor` is an opaque token on the server; under the hood it's a timestamp + `card_id` tiebreaker. The server treats `pending?cursor=<X>` as "give me cards where `last_updated_at > X` OR (`last_updated_at == X` AND `card_id > tiebreaker`)". Clients never move the cursor on their own; it only advances on a successful `ack`. That way partial application is safe: a crashed agent that got the batch but didn't `ack` will re-fetch the same batch next poll.
+
+##### Poll frequency and presence
+
+- Agent polls `/api/ankiweb/pending` every 60 seconds when idle, every 5 seconds for 2 minutes after a successful apply (to catch follow-up batches), then backs off.
+- If there are no pending items, the server returns `items: []` and the agent costs us ~1 API Gateway request / minute — negligible.
+- On launch the agent calls AnkiConnect's `version` and `requestPermission`; if Anki isn't running, it exponentially backs off with a max 5-minute sleep. This handles laptops that are sometimes closed.
+
+##### Desktop Anki sync handoff
+
+After applying a non-empty batch, the agent calls AnkiConnect's `sync` action. This tells desktop Anki to push to AnkiWeb using the user's already-configured credentials; our agent never handles AnkiWeb passwords. The `sync_status` field in the ack lets the server surface "cards applied locally but AnkiWeb sync pending/failed" cleanly in the dashboard.
+
+##### Agent packaging
+
+- Distributed as a single-file Python script (the agent is ~300 lines; no heavy deps). Uses `httpx` + stdlib.
+- Installer targets:
+  - macOS: `launchd` plist template.
+  - Linux: `systemd --user` unit template.
+  - Windows: `schtasks /Create /SC ONLOGON` or a WinSW wrapper.
+- Configuration file in `~/.config/anki-notes-pipeline/agent.toml`: server URL, agent token, AnkiConnect URL, poll cadence.
+- Agent ships inside this repo under `scripts/ankiweb-pull-agent/` and has its own tiny test suite that stubs both AnkiConnect and the server.
+
+##### Security on the agent API
+
+- Agent token is a long opaque string, minted by the operator via `anki-notes-pipeline auth agent mint --agent-id <id>`, stored in DynamoDB as a bcrypt hash, never logged. Tokens are revocable independently of provider credentials.
+- `/api/ankiweb/pending` and `/ack` live on the same custom domain as the Drive webhook and use mutual TLS as a future option (not day-one).
+- Rate limits: 10 rps burst, 2 rps sustained per agent token. Legitimate traffic is nowhere near these limits.
+
+#### 13.3.8 Initial deck bootstrap
+
+First run against an empty AnkiWeb account has different semantics from steady-state:
+
+1. `deckNames` → if the configured deck is missing and `auto_create_deck: true`, call `createDeck`.
+2. `modelNames` → if the configured note type is missing and `auto_create_note_type: true`, call `createModel` with the schema listed in §13.3.5.
+3. Issue `addNotes` in batches of 50.
+4. Call `sync`.
+
+If either auto-create flag is `false` (the default for `note_type`, because users often want to plug into their existing note types), a missing deck or model aborts the export with a clear remediation message rather than silently creating something unexpected.
+
+#### 13.3.9 Mapping `CardRecord` → Anki note
+
+| `CardRecord` field | Anki field | Notes |
+|---|---|---|
+| `simplified` | `Simplified` | First field; used by Anki's default duplicate check. |
+| `traditional` | `Traditional` | |
+| `pinyin` | `Pinyin` | Already normalized by `pinyin_normalize.py`. |
+| `meaning` | `Meaning` | HTML-escaped before pushing; line breaks become `<br>`. |
+| `part_of_speech` | `PartOfSpeech` | |
+| `usage_notes` | `UsageNotes` | HTML-escaped like `Meaning`. |
+| `first_seen_source_id` | `SourceRef` | Traceability: "which lesson did this come from?" |
+| `card_id` | `ExtId` | Hidden but visible in Anki browser; also replicated as tag. |
+| `card_id` | tag `ext_id:<card_id>` | Primary handle for `findNotes`. |
+| `enrichment_version` | tag `enr:<version>` | For future selective re-enrichment (§12.6). |
+| Run identifier | tag `run:<YYYY-MM-DD>` | Aids auditing; the user can filter "cards from last Friday's run" in Anki. |
+| `first_seen_source_id` | tag `src:<source_id>` | Same, but by document. |
+
+All our tags are in our own `ext_id:` / `enr:` / `run:` / `src:` / `conflict:` / `req:` namespaces — we never write general-purpose tags (e.g. `chinese`, `grammar`) onto the user's deck, to avoid colliding with their own tagging scheme.
+
+#### 13.3.10 Failure modes and recovery
+
+| Failure | Symptom | Handling |
+|---|---|---|
+| AnkiConnect not reachable (add-on off, Anki closed) | TCP connection refused to `:8765`. | Agent: back off up to 5 min. Server: no-op; items stay pending. |
+| `apiKey` mismatch | `error: "valid api key must be provided"` | Fail loudly on agent startup; do not silently apply. |
+| `addNote` duplicate first-field | Handled upstream by `canAddNotesWithErrorDetail`, but belt-and-braces catch: if AnkiConnect still returns duplicate, route that card through the update path. | |
+| Note-type field mismatch (user edited note type) | `addNotes` succeeds but field counts don't match. | Pre-flight `modelFieldNames` check fails fast with a clear "update your note type" message. |
+| `updateNoteFields` 404 (note deleted by user) | `error: "note was not found: <id>"` | Clear our `ankiweb_note_id`, re-lookup via tag, then `addNote` if truly missing. |
+| `sync` fails (user not logged in, network issue) | `error: "this action is not supported yet" / "sync failed"` | Record in ack as `sync_status: "failed"`. Cards are still locally applied; next run calls `sync` again. |
+| Agent crashes mid-batch | Some notes applied, none acked. | Server re-serves the same batch on next poll; idempotency tag `req:<req_id>` stops double-apply. |
+| AnkiWeb rejects sync (conflict with another client) | Desktop Anki's sync prompt: full-sync required. | Out of scope for our automation; agent logs and alerts the user. We do not touch the user's collection in this case. |
+| DynamoDB write fails after agent applies | Agent has applied but server doesn't know yet. | Agent retries ack with exponential backoff for 15 min; if the server eventually returns success, state converges. If not, next run's `notesInfo` check shows the applied state and realigns. |
+
+#### 13.3.11 Observability and reporting
+
+Every ack becomes a row in `SyncReport.exports[ankiweb]`:
+
+```
+{
+  "run_id":      "<uuid>",
+  "exporter":    "ankiweb",
+  "agent_id":    "desktop-laptop",
+  "batch_id":    "<uuid>",
+  "created":     7,
+  "updated":     2,
+  "unchanged":   41,
+  "conflicts":   1,
+  "errors":      0,
+  "sync_status": "ok",
+  "duration_ms": 3412
+}
+```
+
+Surfaced in the FastAPI `/api/sync/runs/{id}` response so a human can see exactly what landed on AnkiWeb per run.
+
+CloudWatch alarms (Lambda mode):
+
+- `/api/ankiweb/ack` error rate > 5% in 15 min → notify.
+- Pending queue depth (cards with `ankiweb_last_synced_at < last_updated_at`) > 500 for > 24 h → notify ("agent probably hasn't run in a while").
+- Per-agent last-poll-at older than 6 h during expected-online windows → notify.
+
+#### 13.3.12 Testing strategy
+
+- **AnkiConnect client unit tests** use a fake HTTP server that replays canned responses for each action our exporter exercises. No Anki install needed.
+- **Pull-agent tests** stub both ends: the cloud-side `/pending` endpoint is mocked with FastAPI's `TestClient`, and AnkiConnect is mocked with the same fake server as above.
+- **End-to-end manual loop**: spin up desktop Anki with AnkiConnect, point the agent at a local `uvicorn` instance running the FastAPI app against a SQLite `StateStore`, run `run_incremental_sync` against a small seed set, and verify the notes appear in Anki and then on AnkiWeb after a desktop sync.
+- **Property tests** for the three-way merge (§13.3.6): random base/remote/local triples fed to the merge function, check invariants (idempotent on reapply, never loses a user edit that the base doesn't know about).
+
+#### 13.3.13 What we would need from an official AnkiWeb API
+
+For completeness, if AnkiWeb ever exposes a first-party upload API the exporter reduces to a much simpler shape. The interface we'd want is essentially:
+
+- OAuth 2.0 user-delegated auth.
+- `POST /decks/{deck_id}/notes` (create), `PATCH /notes/{id}` (update), `GET /notes?tag=...` (lookup), `DELETE /notes/{id}` (delete — we'd still not use this).
+- A server-side `ext_id` field to replace our tag-based correlation.
+- Bulk variants with partial failure reporting (matching AnkiConnect's `canAddNotesWithErrorDetail` semantics).
+
+Until that exists, Option C + AnkiConnect is the path.
 
 ### 13.4 AnkiWeb exporter responsibilities
 
 Regardless of option:
 
 - Operate on `CardRecord`s with `ankiweb_last_synced_at is None or < last_updated_at`.
-- Maintain `ankiweb_note_id` and `ankiweb_last_synced_at` in `StateStore` after successful sync.
-- Report per-card outcome in `ExportResult` so a user can see "added 3, updated 1, skipped 47".
-- Handle duplicate detection (AnkiConnect rejects duplicate first-field notes by default; our exporter handles this by falling back to `updateNoteFields`).
+- Maintain `ankiweb_note_id`, `ankiweb_last_synced_at`, and `ankiweb_last_synced_fields` in `StateStore` after successful sync.
+- Report per-card outcome in `ExportResult` so a user can see "added 3, updated 1, skipped 47, conflicts 1".
+- Apply §13.3.6 three-way merge; never silently overwrite a field the user edited directly in Anki.
+- Use the `ext_id:<card_id>` tag as primary identity; treat `Simplified` as a non-unique user-editable field.
 
 ### 13.5 Exporter composition
 
