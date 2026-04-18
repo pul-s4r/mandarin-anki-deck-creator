@@ -673,12 +673,375 @@ def run_sync(
 
 ### 11.3 Google Drive change notifications (T2)
 
-Drive supports webhook-style push via `changes.watch`. Flow:
+This subsection specifies, end to end, how we turn "user edits a Google Doc" into "Lambda invokes `run_sync(only_file_ids=[...])`". It is the most intricate piece of the event-driven design, so it gets its own deep dive.
 
-1. At setup, call `changes.getStartPageToken` and store it as the initial cursor in `StateStore` (§12).
-2. Call `changes.watch(pageToken, address=<API Gateway URL>, expiration=...)` to register a push channel. Drive channels expire (max ~7 days), so a nightly EventBridge schedule renews them. Channel metadata (id, resourceId, expiration) lives in `StateStore`.
-3. On webhook delivery, the Lambda reads the stored `pageToken`, calls `changes.list` to get the actual diff, enqueues affected file IDs into the same `run_sync` path with `only_file_ids=[...]`, then advances the cursor.
-4. Drive webhooks carry no body — just headers (`X-Goog-Channel-ID`, `X-Goog-Resource-State`). The handler is just a thin dispatcher; the real work is the `changes.list` call.
+#### 11.3.1 Drive's push-notification model (concepts)
+
+Google Drive does not push *file diffs*. It pushes a bare "something in the scope you registered has changed" ping. Clients are expected to pull the actual diff from the **changes feed**. The moving parts:
+
+| Concept | API | Role |
+|---|---|---|
+| **Start page token** | `changes.getStartPageToken` | A cursor representing "now". Every subsequent change has a token greater than this one. |
+| **Changes feed** | `changes.list(pageToken=...)` | Returns the ordered list of changes since the given token, plus a `newStartPageToken` to store for next time. |
+| **Watch channel** | `changes.watch(pageToken=..., address=..., id=..., token=...)` | Registers an HTTPS webhook URL to be notified whenever the changes feed advances. |
+| **Channel lifecycle** | implicit | Channels expire (default and max ~7 days). They must be renewed or re-created before expiry; they can also be explicitly stopped via `channels.stop`. |
+| **Notification** | HTTPS POST from Google to our endpoint | Carries channel/resource metadata in **headers only**; body is empty. |
+
+Key implication: Drive notifications are **edge-triggered, not level-triggered**. Missing a ping means missing that change window; the `pageToken` is what makes the flow robust against this — as long as the token is persisted, we can always catch up by calling `changes.list` from the last known token, whether or not every webhook actually arrived.
+
+#### 11.3.2 Scope model: per-source-set watches
+
+We deliberately do **not** use a single account-wide watch. Instead, each **source set** (§13.5) that opts into live updates registers its own watch:
+
+- `watchType`: either `"user"` (watches the authenticating user's entire Drive) or `"folder"` (via `files.watch` on a specific folder ID, which narrows the notification surface).
+- Drive's `changes.watch` itself is always user-scoped; folder-scoped notifications use `files.watch` and behave differently (they notify on changes to that file or its immediate children, not deeply nested subfolders).
+- For the primary use case — "my `Chinese 301` folder" — the recommended pattern is:
+  1. A single `changes.watch` on the authenticating account for cheap global coverage.
+  2. At processing time, filter the returned changes down to files that live under the configured folder IDs (via `parents` traversal, cached in `StateStore`).
+- `files.watch` per folder is listed as an alternative when a source set spans only one narrow folder and we want to minimize notification noise. Both are abstracted behind the same `DriveWatcher` class.
+
+#### 11.3.3 Authentication choice
+
+Three auth shapes are viable; the plan picks the second.
+
+| Option | Works for private personal Gmail Docs? | Works for Google Workspace domain? | Tokens needed at runtime | Verdict |
+|---|---|---|---|---|
+| **Service account + domain-wide delegation** | No (delegation only works in Workspace) | Yes, but requires admin consent | SA JWT (self-signed) | Rejected for personal Gmail use; kept as an option for Workspace deployments. |
+| **OAuth 2.0 user-delegated refresh token, granted once, stored server-side** | Yes | Yes | Long-lived refresh token in Secrets Manager; exchange for access token each cold start | **Selected.** Matches the "one user, one deck" reality. |
+| **Service account with explicit file/folder shares** | Yes (docs must be shared with the SA email) | Yes | SA JWT | Backup option when the user doesn't want a user-consented OAuth token on the server. Requires re-sharing every new doc with the SA. |
+
+OAuth setup flow (one-time, human-driven):
+
+1. Operator runs `anki-notes-pipeline auth google-drive` locally.
+2. The CLI opens the OAuth consent screen requesting `https://www.googleapis.com/auth/drive.readonly`.
+3. The CLI captures the authorization code, exchanges it for a refresh token + access token.
+4. The refresh token is written to AWS Secrets Manager under `anki-pipeline/google-drive/<user_id>/refresh_token`.
+5. Lambda cold start reads the secret, uses `google-auth`'s `Credentials.from_authorized_user_info` to mint fresh access tokens as needed.
+
+Scopes requested:
+- `drive.readonly` — required for `changes.list`, `files.get`, `files.export`.
+- `drive.metadata.readonly` is insufficient because we also need to download content.
+- We do **not** request `drive.file` (that restricts us to files the app itself created, which defeats the purpose).
+
+#### 11.3.4 Domain, HTTPS, and endpoint verification
+
+Drive enforces several constraints on the webhook target address:
+
+- Must be HTTPS, with a certificate that chains to a publicly trusted root. API Gateway HTTP APIs satisfy this out of the box.
+- The domain must be **verified** in [Google Search Console](https://search.google.com/search-console) under the same Google account that issued the OAuth consent. An unverified domain causes `changes.watch` to fail with `push.webhookUrlUnauthorized`.
+- Plain `*.execute-api.<region>.amazonaws.com` URLs are **not verifiable**. The plan therefore places API Gateway behind a custom domain we own (e.g. `drive-hook.example.com`), configured with an ACM cert and a Route 53 record pointing at the API Gateway distribution.
+- Search Console verification is done once, manually, by adding a DNS TXT record. This is a one-time operator task documented in `infra/README.md`.
+
+Routing:
+
+```
+Google Drive ──HTTPS POST──► drive-hook.example.com
+                                      │
+                                      ▼
+                             API Gateway (HTTP API)
+                             POST /drive/notifications
+                                      │
+                                      ▼
+                             Lambda: handler_drive_webhook
+```
+
+#### 11.3.5 Webhook registration (setup & renewal)
+
+A small "watch manager" Lambda (invoked by CLI command `anki-notes-pipeline drive watch register --source-set ...` for initial setup, and by an EventBridge schedule for renewal) owns channel lifecycle.
+
+Registration call (conceptual):
+
+```python
+channel_id   = uuid4().hex
+channel_tok  = secrets.token_urlsafe(32)      # shared-secret, verified on each incoming POST
+expiration   = int((now + timedelta(days=6)).timestamp() * 1000)  # ms since epoch
+
+body = {
+    "id":         channel_id,
+    "type":       "web_hook",
+    "address":    "https://drive-hook.example.com/drive/notifications",
+    "token":      channel_tok,
+    "expiration": expiration,
+}
+resp = drive.changes().watch(pageToken=state.page_token, body=body).execute()
+
+state_store.upsert_drive_channel(DriveChannelRecord(
+    channel_id   = channel_id,
+    resource_id  = resp["resourceId"],
+    token        = channel_tok,
+    expiration   = datetime.fromtimestamp(int(resp["expiration"]) / 1000, tz=UTC),
+    page_token   = state.page_token,
+    source_set   = source_set.name,
+))
+```
+
+Key points:
+
+- `expiration` is capped at Drive's maximum (~7 days). We use 6 days and run renewal daily so there's always ≥24 h of slack.
+- `token` is our own opaque shared secret; Drive echoes it back on every notification as `X-Goog-Channel-Token`. Notifications with a missing or mismatched token are rejected with 401.
+- `id` is a per-channel UUID. When a channel ages out or is replaced, the previous `id` is stopped explicitly to avoid double notifications.
+
+Renewal job (`handler_watch_renewal`, scheduled via EventBridge once per day):
+
+1. Query `StateStore` for all `DriveChannelRecord` rows expiring in <48 h.
+2. For each, obtain the current `pageToken` from `StateStore` (must be the one used for the last successful `changes.list`).
+3. Call `changes.watch` with a fresh `channel_id` and `token`.
+4. Persist the new channel record.
+5. Call `channels.stop` on the **old** channel to suppress further pings on it.
+6. Do these steps in this order so that if step 5 fails, we only have an extra channel temporarily, not a gap.
+
+Explicit teardown (`anki-notes-pipeline drive watch unregister`) calls `channels.stop` and deletes the row.
+
+#### 11.3.6 Synchronization token lifecycle (`pageToken`)
+
+This is the linchpin of correctness.
+
+- Exactly one authoritative `pageToken` per source set lives in `StateStore.DriveChannelRecord.page_token`.
+- It is **advanced only after** `run_sync` has successfully persisted all card upserts for every changed file returned in that `changes.list` page.
+- On partial failure (e.g. one file's ingest errors), the token is **not** advanced. Next invocation (whether another webhook or the fallback schedule) will re-see the same changes, but §12's content-hash deduplication makes the re-process a no-op for already-handled files.
+- Drive's `changes.list` returns a `newStartPageToken` only on the final page. For multi-page diffs, paginate until that field appears, then write the new token atomically.
+
+Atomic advance pattern (DynamoDB):
+
+```
+UpdateItem
+  Key: {pk: "drive_channel", sk: channel_id}
+  ConditionExpression: page_token = :expected_prev_token
+  UpdateExpression: SET page_token = :new_token, last_advanced_at = :ts
+```
+
+The condition expression protects against two handlers racing to advance past each other (unlikely given Lambda concurrency=1 per channel, but cheap insurance).
+
+#### 11.3.7 The webhook request: shape, verification, response SLA
+
+A Drive notification looks like this:
+
+```
+POST /drive/notifications HTTP/1.1
+Host:                     drive-hook.example.com
+Content-Type:             application/json; charset=UTF-8
+Content-Length:           0
+
+X-Goog-Channel-ID:        <our channel_id from watch call>
+X-Goog-Channel-Token:     <our shared secret>
+X-Goog-Channel-Expiration: Fri, 17 Oct 2025 12:00:00 GMT
+X-Goog-Resource-ID:       <opaque resource id from watch response>
+X-Goog-Resource-URI:      https://www.googleapis.com/drive/v3/changes?...
+X-Goog-Resource-State:    sync | change | remove | update | exists
+X-Goog-Message-Number:    42
+```
+
+Notes:
+
+- **Body is empty.** API Gateway must be configured not to require a JSON body; a simple `POST` with zero content is valid.
+- **`X-Goog-Resource-State` values we handle:**
+  - `sync`: the first ping after channel registration. Acknowledged with 200 and otherwise ignored — it carries no diff.
+  - `change` / `update` / `exists`: trigger a `changes.list` pull.
+  - `remove`: channel was stopped or expired; trigger channel re-registration via the renewal job rather than pulling changes.
+- **Response SLA:** Google's docs recommend returning 200 within a couple of seconds and treats anything else (≥300, timeout, connection error) as retry-worthy. We therefore do **not** do the LLM work inside the webhook handler; we only read headers, verify the token, and enqueue (see §11.3.8).
+
+Verification steps inside `handler_drive_webhook`:
+
+1. Read `X-Goog-Channel-ID`. If not in `StateStore`, return 404.
+2. Read `X-Goog-Channel-Token`, compare against the stored shared secret using `hmac.compare_digest`. Mismatch → 401.
+3. Read `X-Goog-Resource-State`. If `sync` → 200 immediately. If `remove` → enqueue a re-registration task and 200. Otherwise, continue.
+4. Check `X-Goog-Message-Number` against the last-seen value stored in `StateStore`. If we've already processed this or a later number for this channel, return 200 without enqueueing (replay / retry absorption).
+5. Enqueue a "pull changes" job and return 200.
+
+#### 11.3.8 Two-tier architecture: webhook receiver vs. worker
+
+We split the work across two Lambdas to respect the webhook response SLA and to decouple retries.
+
+```
+Drive ──► API Gateway ──► Lambda A: handler_drive_webhook
+                              │   (verifies, enqueues, returns 200)
+                              ▼
+                          SQS queue: drive-change-jobs (FIFO, deduplicated by channel_id)
+                              │
+                              ▼
+                          Lambda B: handler_drive_changes_worker
+                              │   (pulls changes, runs run_sync)
+                              ▼
+                          DynamoDB (StateStore) + exporters
+```
+
+Why FIFO + dedup on `channel_id`:
+
+- FIFO with `MessageGroupId = channel_id` guarantees that two pings for the same channel never run in parallel, eliminating `pageToken` races.
+- A 5-minute `ContentBasedDeduplication` window absorbs rapid-fire duplicate pings (Drive often sends several for a single edit burst).
+- Different source sets (different channels) still run concurrently since they're in different message groups.
+
+Failure routing:
+
+- Worker's `redrive_policy` sends to a DLQ after 3 attempts.
+- Webhook handler itself is intentionally near-trivial so it rarely fails; retries from Drive are absorbed by the message-number check.
+
+#### 11.3.9 Processing changes: `changes.list` → file IDs
+
+The worker does the real work:
+
+```python
+def handler_drive_changes_worker(event: SQSEvent) -> None:
+    for record in event.Records:
+        channel_id = record.body["channel_id"]
+        channel    = state_store.get_drive_channel(channel_id)
+        source_set = source_sets.load(channel.source_set)
+        creds      = drive_credentials_for(source_set)
+
+        page_token = channel.page_token
+        collected_file_ids: set[str] = set()
+
+        while True:
+            resp = drive.changes().list(
+                pageToken=page_token,
+                spaces="drive",
+                includeRemoved=True,
+                fields="nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,md5Checksum,trashed))",
+            ).execute()
+
+            for change in resp.get("changes", []):
+                if change.get("removed") or change.get("file", {}).get("trashed"):
+                    continue
+                f = change["file"]
+                if not _mime_type_supported(f["mimeType"]):
+                    continue
+                if not _lives_under_configured_folders(f, source_set, state_store):
+                    continue
+                collected_file_ids.add(f["id"])
+
+            if "nextPageToken" in resp:
+                page_token = resp["nextPageToken"]
+                continue
+            new_token = resp["newStartPageToken"]
+            break
+
+        if collected_file_ids:
+            run_sync(
+                source_set=source_set,
+                settings=settings,
+                only_file_ids=sorted(collected_file_ids),
+                state_store=state_store,
+                exporters=exporters_for(source_set),
+            )
+
+        state_store.advance_drive_channel_token(
+            channel_id=channel_id,
+            expected_prev_token=channel.page_token,
+            new_token=new_token,
+        )
+```
+
+Supported mime types (`_mime_type_supported`):
+
+| mimeType | Handling |
+|---|---|
+| `application/vnd.google-apps.document` | **Primary case.** Export as DOCX (see §5.3). |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | Download via media endpoint. |
+| `application/pdf` | Download via media endpoint. |
+| `text/markdown`, `text/plain` | Download via media endpoint. |
+| `application/vnd.google-apps.folder` | Ignored (folder metadata change, not content). |
+| Everything else | Ignored with a debug log. |
+
+Folder filtering (`_lives_under_configured_folders`):
+
+- Walks `parents` via `files.get(..., fields="parents")` recursively, with a per-run memoization cache keyed by `file_id`.
+- Long-lived parent→ancestor mappings are cached in `StateStore` under `DriveAncestorCache` records (TTL 7 days) to avoid repeated tree-walks on every webhook.
+- Moves into or out of a configured folder are detected here: a doc that *used to* be in scope but has been moved out shows up as a change but fails the ancestor check; we simply skip it (its old `SourceRecord` can be retired in a cleanup pass).
+
+#### 11.3.10 Edge cases
+
+| Situation | Drive signal | Our behavior |
+|---|---|---|
+| User renames a doc | `change` with `file.name` updated; `fileId` unchanged | Processed like any other update. `SourceRecord.filename` is refreshed. |
+| User moves a doc between folders | `change`; `parents` changed | Ancestor cache for that file is invalidated, folder filter re-evaluated. |
+| User trashes a doc | `change` with `file.trashed=true` | Skipped in worker; `SourceRecord.retired_at` set. Cards from it remain in inventory unless the user runs a "retire orphan cards" maintenance command (future work). |
+| User deletes a doc permanently | `change` with `removed=true` | Same as trashing. |
+| User shares a new doc into a watched folder | `change` | Processed as a brand-new source. `SourceRecord` inserted with `first_seen_at`. |
+| Permissions revoked mid-run | `files.export` returns 403 | Worker logs, marks that file as errored in `SyncReport`, leaves `pageToken` *un*advanced so retry is possible after re-sharing. |
+| Channel silently dies | No notifications arrive | Fallback schedule (§11.5) still calls `changes.list` and catches up from `pageToken`; operator gets a CloudWatch alarm if expected daily pings are missing. |
+| `pageToken` becomes invalid (e.g. too old, Drive backend rotation) | `changes.list` returns 404 `Invalid value` | Worker calls `changes.getStartPageToken` to reset, records a warning, and triggers a full re-scan of configured folders via `files.list` as a one-off resync. |
+
+#### 11.3.11 Security
+
+- **Shared-secret token check** (§11.3.7) is the primary defense. Any unauthenticated POST to `/drive/notifications` is rejected with 401.
+- **API Gateway rate limiting**: burst limit 20 rps, sustained 5 rps on `/drive/notifications`. Legitimate Drive traffic is well under this.
+- **WAF rule**: reject POSTs whose `Host` header isn't our custom domain, which defends against cert-less direct hits on the `*.execute-api` URL.
+- **No secrets in the notification**. Channel IDs and resource IDs are opaque and non-sensitive; we still avoid logging the `token` header.
+- **TLS**: API Gateway enforces TLS 1.2+ on the custom domain.
+- **OAuth refresh token handling**: stored in Secrets Manager with KMS encryption; Lambda execution role has read permission only on its own user's secret path.
+
+#### 11.3.12 Quotas, cost, and sizing
+
+- Drive API default quota: 1,000 requests / 100 s / user, 10,000 / 100 s / project. `changes.list` is one request per page (usually one page per ping). At personal-use volumes this is nowhere near the limit.
+- Each `changes.watch` renewal is one API call; once/day is negligible.
+- Expected steady-state cost per month:
+  - API Gateway HTTP API: ~100 webhook hits × $1.00 / million requests ≈ $0.
+  - Lambda A (webhook): a few ms per invocation, essentially free tier.
+  - Lambda B (worker): dominated by LLM calls, same as the scheduled case.
+  - SQS FIFO: first 1M requests free; we'll use ~hundreds/month.
+  - Custom domain + ACM cert: free; only cost is Route 53 hosted zone ($0.50/mo).
+
+#### 11.3.13 Observability
+
+Every webhook invocation emits a single structured log line (JSON):
+
+```json
+{
+  "event":            "drive.webhook.received",
+  "channel_id":       "…",
+  "resource_state":   "change",
+  "message_number":   42,
+  "source_set":       "weekly-chinese-notes",
+  "verified":         true,
+  "enqueued":         true,
+  "duration_ms":      18
+}
+```
+
+Worker emits:
+
+```json
+{
+  "event":               "drive.changes.processed",
+  "channel_id":          "…",
+  "source_set":          "weekly-chinese-notes",
+  "changes_seen":        7,
+  "files_in_scope":      2,
+  "files_run":           2,
+  "page_token_advanced": true,
+  "duration_ms":         4120
+}
+```
+
+CloudWatch alarms:
+
+- DLQ depth > 0 for > 5 min → notify.
+- No `drive.webhook.received` for > 36 h on any channel marked `expected_traffic=daily` → notify (channel may be silently dead).
+- `changes.list` 4xx rate > 10% → notify (likely auth or token invalidation).
+
+#### 11.3.14 Local development & testing
+
+- **Unit tests**: verify header parsing, token constant-time compare, message-number dedupe, mime-type filter, folder ancestor filter. All pure Python, no Drive client needed.
+- **Worker tests**: mock `googleapiclient.discovery` with [`responses`](https://github.com/getsentry/responses) or hand-rolled fakes; assert that `pageToken` advances only on success.
+- **End-to-end local loop**: `anki-notes-pipeline drive webhook simulate --channel-id <id> --state change` crafts a valid POST to the local FastAPI app, exercising the same handler code path as production.
+- **Real-Drive loop** (operator-run, not CI): an `ngrok` tunnel + a sacrificial Google account lets us exercise the live `changes.watch`/webhook path end to end. Search Console verification for the ngrok hostname is skipped by using a long-lived dev-domain subdomain that's already verified.
+
+#### 11.3.15 Data model addition
+
+`DriveChannelRecord` (added to §12.1):
+
+| Field | Type | Purpose |
+|---|---|---|
+| `channel_id` | str (PK) | UUID we generated for `changes.watch`. |
+| `resource_id` | str | Returned by Drive; required to stop the channel. |
+| `token` | str (encrypted) | Shared secret echoed back in `X-Goog-Channel-Token`. |
+| `expiration` | datetime | When Drive will stop sending pings. |
+| `page_token` | str | Current `changes.list` cursor. |
+| `last_message_number` | int | For replay detection. |
+| `last_advanced_at` | datetime | For observability. |
+| `source_set` | str | Which source-set config owns this channel. |
+| `created_at` | datetime | For audits. |
+| `expected_traffic` | enum("daily", "weekly", "sparse") | Drives the "silent channel" alarm. |
 
 ### 11.4 Idempotency and retries
 
