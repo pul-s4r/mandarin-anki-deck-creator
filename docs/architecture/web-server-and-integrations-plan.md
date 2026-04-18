@@ -18,6 +18,7 @@
 14. [Revised Module Layout](#14-revised-module-layout)
 15. [Revised Implementation Sequence](#15-revised-implementation-sequence)
 16. [Open Questions & Risks](#16-open-questions--risks)
+17. [Story Breakdown for Implementation](#17-story-breakdown-for-implementation)
 
 ---
 
@@ -2415,3 +2416,738 @@ Phases 5 and 6 can start once phase 1 is done; they do not require phases 2 or 3
 6. **Multi-user vs. single-user assumption.** Everything above implicitly assumes one user's deck. If this ever becomes multi-tenant, `StateStore` keys need a `user_id` prefix. Cheap to add now (include `user_id` on every record, default it to a constant) vs. a painful migration later. Recommendation: include it from the start.
 7. **Cost ceiling.** EventBridge + Lambda + DynamoDB on-demand + S3 + Secrets Manager for a weekly run should total well under $1/month. Webhook-driven runs scale with edit frequency; worst-case (~hundreds of edits/day) still stays under a few dollars/month. No monitoring dashboards needed at these levels, but CloudWatch billing alarm at $5 is cheap insurance.
 8. **"Do we even need DynamoDB?"** For a single-user deck, SQLite on EFS would work. Rejected because EFS attached to Lambda is more moving parts than DynamoDB and has a non-trivial idle cost. Revisit only if Dynamo access patterns become awkward.
+
+---
+
+## 17. Story Breakdown for Implementation
+
+Everything in §§2–16 is decomposed below into independently implementable stories. Each story lists:
+
+- **Prerequisites** — which other stories must land before this one is safe to merge.
+- **Scope** — what code changes are in scope.
+- **Out of scope** — explicit non-goals, to prevent drift.
+- **Testing & verification** — unit, integration, and manual steps a reviewer can run to confirm correctness before merge.
+- **Acceptance criteria** — the observable behavior that must hold after this story is complete.
+
+Stories are grouped into six epics matching the phases already introduced in §§8 and 15. Each story produces a working, testable state of the system — a halfway-merged series leaves the main branch buildable and the existing CLI unbroken.
+
+### 17.0 Conventions that apply to every story
+
+- No story merges with failing tests or a broken CLI `run` subcommand.
+- Every story adds unit tests covering its happy path and at least one failure path.
+- Every story updates `README.md` or a file under `docs/` to document user-visible changes.
+- Breaking changes to the on-disk / on-wire schema require a bump of `schema_version` on the affected records and a migration test.
+- "Manual verification" steps assume a developer with local AWS credentials and a local Anki install (where relevant); each step lists how to skip it if those aren't available.
+
+### 17.1 Epic A — Core library refactoring (maps to Phase 1)
+
+These stories are pure-local, no cloud, no integrations. They must all land before anything in Epics B–F is safe to start.
+
+---
+
+#### Story A1 — Bytes-based ingest
+
+**Prerequisites:** none.
+
+**Scope:**
+- Add `extract_text_from_bytes(data: bytes, *, format: str) -> str` in `ingest/router.py`.
+- Add bytes-accepting helpers in `ingest/pdf.py`, `ingest/markdown.py`, `ingest/docx.py`.
+- Refactor `extract_text_from_path` to be a thin wrapper around `extract_text_from_bytes`.
+
+**Out of scope:**
+- Any new file formats.
+- Any pipeline or CLI changes.
+
+**Testing & verification:**
+- Unit: for each existing ingestor, add a test that reads a fixture file into bytes and asserts `extract_text_from_bytes(...)` returns the same string as `extract_text_from_path(fixture_path)`.
+- Unit: `extract_text_from_bytes(b"...", format="unknown")` raises `IngestError`.
+- Regression: the full existing test suite still passes (`pytest`).
+- Manual: `anki-notes-pipeline run <fixture.pdf>` still produces a byte-identical CSV to the commit immediately before the story.
+
+**Acceptance criteria:**
+- All existing tests pass.
+- New bytes-based entry points exist and are covered.
+- `extract_text_from_path` no longer contains format-specific parsing logic (it delegates).
+
+---
+
+#### Story A2 — `run_pipeline_from_text` + `PipelineResult`
+
+**Prerequisites:** A1.
+
+**Scope:**
+- Introduce `PipelineResult` and `PipelineStats` dataclasses in `pipeline.py`.
+- Extract `run_pipeline_from_text(text, settings, *, progress_callback=None) -> PipelineResult`.
+- Refactor `run_pipeline(input_path, output_csv, settings)` into a thin wrapper: read file → `extract_text_from_bytes` → `run_pipeline_from_text` → `write_vocabulary_csv`.
+
+**Out of scope:**
+- Persistence, any StateStore awareness.
+- Any export-target changes beyond CSV.
+
+**Testing & verification:**
+- Unit: call `run_pipeline_from_text(fixture_text, settings_with_mocked_llm)` and assert `result.rows` matches the golden output we use in `test_pipeline_e2e_mocked.py`.
+- Unit: assert `progress_callback` is called with `("ingest", 1, 1)`, `("chunk", N, N_total)`, `("llm", N, N_total)`, `("export", 1, 1)` in order.
+- Regression: `test_pipeline_e2e_mocked.py` still passes with no modification.
+- Manual: running the CLI against a real fixture still produces a byte-identical CSV vs. `main`.
+
+**Acceptance criteria:**
+- `run_pipeline_from_text` is pure: no file writes, no stdin reads.
+- `run_pipeline` behavior is unchanged from a user's perspective.
+
+---
+
+#### Story A3 — `vocabulary_csv_bytes` and `Exporter` protocol
+
+**Prerequisites:** A2.
+
+**Scope:**
+- Add `Exporter` Protocol in `export/base.py`.
+- Add `vocabulary_csv_bytes(rows, *, bom=False) -> bytes`.
+- Wrap existing CSV writer as `CsvExporter` implementing `Exporter`.
+- Wire `run_pipeline` to go through `CsvExporter` (not a direct function call).
+
+**Out of scope:**
+- XLSX and AnkiWeb exporters (separate stories).
+
+**Testing & verification:**
+- Unit: `CsvExporter.export` produces the same bytes as the legacy `write_vocabulary_csv` for several fixtures (including BOM on/off).
+- Unit: `vocabulary_csv_bytes(rows, bom=True)` begins with `b"\xef\xbb\xbf"`.
+- Regression: `test_csv_writer.py` passes unchanged.
+
+**Acceptance criteria:**
+- No caller of the old `write_vocabulary_csv` exists outside the wrapper shim.
+
+---
+
+#### Story A4 — Structured exception hierarchy
+
+**Prerequisites:** none (can land in parallel with A1–A3).
+
+**Scope:**
+- Add `errors.py` with `AnkiPipelineError`, `IngestError`, `LlmError`, `IntegrationError`, `AuthenticationError`.
+- Convert existing raw `raise` sites in `ingest/`, `llm/`, and `dictionary/enrich.py` to use the new hierarchy.
+
+**Out of scope:**
+- API-layer error translation (that's a later story).
+
+**Testing & verification:**
+- Unit: each existing error-raising code path now raises a subclass of `AnkiPipelineError`.
+- Regression: CLI still prints a human-readable error when given an unsupported file type (verify by invoking `anki-notes-pipeline run not-a-real.xyz`).
+
+**Acceptance criteria:**
+- No bare `raise Exception(...)` in `src/anki_deck_generator/` after this story.
+
+---
+
+### 17.2 Epic B — Persistent state layer (maps to Phase 5)
+
+---
+
+#### Story B1 — `StateStore` protocol and records
+
+**Prerequisites:** A4 (uses the error hierarchy).
+
+**Scope:**
+- Add `state/records.py` dataclasses: `SourceRecord`, `ChunkRecord`, `CardRecord`, `DriveChannelRecord`, `PendingEdits`, `AgentRecord`, `PendingSyncCursor`, `RunReportRecord`. Each carries a `schema_version: int = 1`.
+- Add `state/store.py` with `StateStore` Protocol per §12.3.
+- No implementations yet (that's B2/B3).
+
+**Out of scope:**
+- Any real storage backend.
+- Migration logic.
+
+**Testing & verification:**
+- Unit: `dataclasses.asdict()` round-trip each record type.
+- Unit: assert the Protocol signatures match the method set from §12.3 (using `typing.get_type_hints`).
+- Static: `mypy` passes on the new modules.
+
+**Acceptance criteria:**
+- The Protocol is importable and typecheck-clean.
+
+---
+
+#### Story B2 — `SqliteStateStore`
+
+**Prerequisites:** B1.
+
+**Scope:**
+- Implement `state/sqlite_store.py`.
+- One SQLite file per deployment; schema created on first open.
+- CLI: `anki-notes-pipeline state init --db-path <path>` and `anki-notes-pipeline state list-cards`.
+
+**Out of scope:**
+- DynamoDB.
+
+**Testing & verification:**
+- Unit: in-memory SQLite (`:memory:`) round-trip for every record type.
+- Unit: `upsert_card` returns `{created}` on first call, `{unchanged}` on identical repeat, `{updated}` on field change.
+- Unit: `iter_cards_changed_since(ts)` respects the timestamp.
+- Unit: concurrent writes from two threads serialize cleanly (SQLite's `BEGIN IMMEDIATE`).
+- Manual: `anki-notes-pipeline state init --db-path /tmp/test.db && state list-cards --db-path /tmp/test.db` prints an empty table.
+
+**Acceptance criteria:**
+- Ship-quality for dev/test use; 100% of `StateStore` methods covered.
+
+---
+
+#### Story B3 — `DynamoStateStore`
+
+**Prerequisites:** B2 (shares test fixtures for conformance testing).
+
+**Scope:**
+- Implement `state/dynamo_store.py` using single-table design: PK patterns like `source#<provider>`, `card#`, `channel#`, `pending#<source_set>`, `agent#<user_id>`, `run#`.
+- Conditional writes for `upsert_card` (idempotent); conditional `UpdateItem` for `advance_drive_channel_token`.
+- Helper module `state/dynamo_table.py` with the CloudFormation/CDK-agnostic table definition (hash key `pk`, range key `sk`, on-demand billing, TTL attribute `ttl_unix`).
+
+**Out of scope:**
+- IaC for the table itself — that lives in Epic F.
+
+**Testing & verification:**
+- Unit: mock DynamoDB with `moto`; replay the same conformance suite from B2.
+- Unit: conditional-write collision test — two concurrent `advance_drive_channel_token` calls, one must fail with `ConditionalCheckFailedException`.
+- Integration (optional, gated on `AWS_TEST_DYNAMO=1` env var): run the same suite against a real DynamoDB Local container.
+- Manual: `aws dynamodb scan --table-name ...` after a local test run shows the expected records.
+
+**Acceptance criteria:**
+- `SqliteStateStore` and `DynamoStateStore` pass the same conformance suite.
+
+---
+
+#### Story B4 — `StateStore` selection and settings
+
+**Prerequisites:** B2, B3.
+
+**Scope:**
+- Add `state_backend: Literal["sqlite", "dynamodb"]` to `Settings`.
+- Factory `state.get_store(settings) -> StateStore`.
+- `anki-notes-pipeline state list-runs` subcommand.
+
+**Out of scope:**
+- Wiring into the pipeline (that's C1).
+
+**Testing & verification:**
+- Unit: factory returns the right class for each setting.
+- Regression: `anki-notes-pipeline run` works with a default (no state backend configured) — the factory returns a no-op store.
+
+**Acceptance criteria:**
+- Both backends are reachable from the CLI.
+
+---
+
+### 17.3 Epic C — Incremental sync (maps to Phase 6)
+
+---
+
+#### Story C1 — `SyncReport` and `run_incremental_sync` over a cold StateStore
+
+**Prerequisites:** A2, B4.
+
+**Scope:**
+- Add `sync/report.py` with `SyncReport`, `SyncRunOutcome`.
+- Add `sync/orchestrator.run_incremental_sync(...)` per §12.5.
+- Behavior with an empty StateStore must be byte-for-byte identical to `run_pipeline_from_text` followed by CSV export.
+- New CLI: `anki-notes-pipeline schedule --source-set <name> --state-db <path>` for local dry runs.
+- Source-set config loader in `config/source_sets.py` (YAML today; schema versioned).
+
+**Out of scope:**
+- Any integration providers beyond local filesystem.
+- Chunk-level change detection (that's C2).
+
+**Testing & verification:**
+- Unit: `run_incremental_sync` with a fresh `SqliteStateStore` produces the same `CardRecord`s as a direct `run_pipeline_from_text` invocation on the same fixture.
+- Unit: `SyncReport` serializes to JSON stably.
+- Manual: define a tiny local-filesystem source-set YAML pointing at a fixture PDF; run `schedule` twice; second run should short-circuit at the document level.
+
+**Acceptance criteria:**
+- A cold run is behaviorally equivalent to the current `run_pipeline`.
+- A warm re-run over unchanged inputs completes without any LLM calls (verified by a spy on `extract_vocabulary_from_chunk`).
+
+---
+
+#### Story C2 — Four-layer change detection
+
+**Prerequisites:** C1.
+
+**Scope:**
+- `sync/change_detection.py` implementing document → content → chunk → card layers per §12.4.
+- Stable chunk hashing that survives text normalization.
+- New `ChunkRecord` writes with each processed chunk.
+
+**Out of scope:**
+- Re-enrichment passes (kept as a future option per §12.6).
+
+**Testing & verification:**
+- Unit: edit one chunk of a multi-chunk fixture; assert only that chunk is sent to the mocked LLM on the second run.
+- Unit: hash stability — `chunk_sha256("...")` produces the same output across runs and across Python versions supported by the project.
+- Unit: `content_sha256` short-circuits LLM calls when only document metadata differs.
+- Integration: two-run E2E test — first run cards `{A,B,C}`, edit the chunk that produced `B` to produce `B'`, second run should upsert only `B'` and leave `A` and `C` untouched.
+
+**Acceptance criteria:**
+- Chunk-level dedup demonstrated in a test.
+- `SyncReport.stats.chunks_skipped > 0` in the second run.
+
+---
+
+### 17.4 Epic D — Google Drive provider & scheduled/event execution (maps to Phase 4 + most of Phase 8)
+
+---
+
+#### Story D1 — Integration framework skeleton
+
+**Prerequisites:** A4.
+
+**Scope:**
+- `integrations/base.py` (`IntegrationProvider` ABC, `ImportedDocument`, `ImportResult`).
+- `integrations/registry.py`.
+- CLI: `anki-notes-pipeline import <provider>` sub-command that can list registered providers.
+
+**Out of scope:**
+- Any real provider.
+
+**Testing & verification:**
+- Unit: register a toy `echo` provider in tests; assert CLI dispatch works.
+- Unit: `get_provider("not-a-thing")` raises `IntegrationError`.
+
+**Acceptance criteria:**
+- Registry works; no real provider code yet.
+
+---
+
+#### Story D2 — Google Drive provider (service-account + OAuth refresh-token auth)
+
+**Prerequisites:** D1, A1 (bytes ingest).
+
+**Scope:**
+- `integrations/google_drive.py` implementing `IntegrationProvider`:
+  - `authenticate(credentials)` for both service-account JSON and OAuth refresh token.
+  - `list_sources(folder_id=...)`.
+  - `import_documents(file_ids=..., folder_id=...)` — handles Google Docs → DOCX export, native PDF/DOCX media downloads, text/markdown.
+  - `get_revision(file_id)` for change detection.
+- CLI: `anki-notes-pipeline auth google-drive` (OAuth flow) and `anki-notes-pipeline import google-drive --folder-id ... --output out.csv`.
+- Optional extras group `[google-drive]` in `pyproject.toml`.
+
+**Out of scope:**
+- `changes.watch` (that's D4).
+- Webhook handling.
+
+**Testing & verification:**
+- Unit: mock `googleapiclient.discovery` to test each code path (Google Doc → DOCX, native PDF, trashed file, missing permission).
+- Unit: OAuth token exchange happy path + refresh path, using `responses`.
+- Integration (operator-run only, skipped in CI): point at a real test Drive folder with one shared Google Doc; run `import google-drive`; verify a populated CSV emerges.
+
+**Acceptance criteria:**
+- Import from Drive works end-to-end in operator-run test.
+- All mock-based tests pass in CI.
+
+---
+
+#### Story D3 — Local `schedule` command uses the provider
+
+**Prerequisites:** C1, D2.
+
+**Scope:**
+- Wire `run_incremental_sync` to call `GoogleDriveProvider.import_documents` when the source-set config lists `provider: google-drive`.
+- `--dry-run` flag that fetches metadata and computes the diff but doesn't invoke the LLM.
+
+**Out of scope:**
+- Anything Lambda-specific.
+
+**Testing & verification:**
+- Unit: fake provider returning canned `ImportedDocument`s; `run_incremental_sync` writes the expected `CardRecord`s.
+- Manual: `anki-notes-pipeline schedule --source-set my-test --dry-run` prints a plan ("would process 2 docs, 14 chunks").
+
+**Acceptance criteria:**
+- A local cron entry can now drive the whole flow using this command.
+
+---
+
+#### Story D4 — Drive `changes.watch` client (no webhook server yet)
+
+**Prerequisites:** D2.
+
+**Scope:**
+- Add `changes.getStartPageToken`, `changes.list` (paginated), `changes.watch`, `channels.stop` to `integrations/google_drive.py`.
+- CLI: `anki-notes-pipeline drive watch register --source-set <name>` and `drive watch unregister --channel-id <id>`.
+- Channel record persisted via `StateStore`.
+
+**Out of scope:**
+- The HTTPS webhook endpoint.
+- Debouncing.
+
+**Testing & verification:**
+- Unit: mock all four API calls; verify pagination logic and cursor advance.
+- Unit: renewal job picks up rows expiring in <48h.
+- Manual: register a watch against a real Drive account with an `ngrok` URL; make an edit; verify `changes.list(pageToken=...)` returns it.
+
+**Acceptance criteria:**
+- Channel registration and cursor advance demonstrated against a real Drive account in manual testing.
+
+---
+
+#### Story D5 — FastAPI app skeleton + `/health` + `/api/sync/run`
+
+**Prerequisites:** C1.
+
+**Scope:**
+- `web/app.py` FastAPI app factory with CORS, upload size limits.
+- `web/dependencies.py` providing `Settings`, `StateStore`, and cached `DictionaryIndex`.
+- `web/routes/health.py`, `web/routes/pipeline.py` (`POST /api/sync/run`).
+- CLI: `anki-notes-pipeline serve --host 0.0.0.0 --port 8000`.
+
+**Out of scope:**
+- WebSocket progress.
+- Drive webhook route.
+- Integration routes.
+
+**Testing & verification:**
+- Unit: FastAPI `TestClient` for `/health` (200 and JSON body sanity) and `/api/sync/run` (multipart upload with a fixture, returns a `job_id` and a completed `PipelineResult`).
+- Manual: `curl -F "file=@fixture.pdf" http://localhost:8000/api/sync/run` returns a 200 with a job result.
+
+**Acceptance criteria:**
+- Local server starts, serves the two endpoints, doesn't block while processing (uses thread pool).
+
+---
+
+#### Story D6 — Drive webhook endpoint + two-tier dispatch
+
+**Prerequisites:** D4, D5, B3.
+
+**Scope:**
+- `web/routes/drive_webhook.py` implementing the `POST /drive/notifications` handler per §11.3.7 and §11.3.8.
+- Shared-secret token verification, `X-Goog-Message-Number` dedupe.
+- SQS FIFO producer keyed on `MessageGroupId=channel_id`.
+- Worker Lambda handler (`lambda/handler_drive_changes_worker.py`) that reads the queue, paginates `changes.list`, filters mime types and folder ancestors, invokes `run_sync(only_file_ids=...)`.
+- Channel renewal Lambda (`lambda/handler_watch_renewal.py`) on a daily EventBridge schedule.
+
+**Out of scope:**
+- Debouncing (that's D7).
+- Lambda packaging/IaC (that's F1).
+
+**Testing & verification:**
+- Unit: header verification rejects missing/mismatched tokens with 401.
+- Unit: `sync` resource-state returns 200 without enqueuing.
+- Unit: message-number replay returns 200 without enqueuing.
+- Unit: worker test paginates `changes.list` across two pages, advances cursor only on success.
+- Manual (operator): `ngrok`-exposed local FastAPI receives real Drive pings; edited doc's ID appears in the SQS queue and the worker runs.
+
+**Acceptance criteria:**
+- End-to-end loop from Drive edit → webhook → worker → `StateStore` update works in manual testing.
+- Response SLA <2s observed for the verify-and-enqueue path.
+
+---
+
+#### Story D7 — Edit-session debouncing (`PendingEdits` + poller)
+
+**Prerequisites:** D6.
+
+**Scope:**
+- `sync/debounce.py` owning `PendingEdits` reads/writes.
+- Debouncer Lambda (`lambda/handler_drive_debouncer.py`) consuming the existing SQS queue and writing/extending `PendingEdits` rows per §11.6.2.
+- Polling Lambda (`lambda/handler_pending_edits_poll.py`) on a 1-minute EventBridge rule; scans `PendingEdits WHERE ready_at <= now` and invokes the existing worker from D6 with `only_file_ids=[...]`.
+- Split of responsibilities: debouncer advances `pageToken`; worker advances `SourceRecord`.
+- Default knobs: `quiet_minutes=10`, `max_delay_minutes=120`. Per-source-set overrides (we'll use 20/90 for the lesson-notes source set per §11.6.12).
+- Force-process endpoint `POST /api/integrations/google-drive/force-process`.
+- "[done]" filename sentinel support in the webhook verifier.
+
+**Out of scope:**
+- AnkiWeb changes.
+
+**Testing & verification:**
+- Unit: debouncer upsert extends `ready_at` on repeat.
+- Unit: poller fires exactly once when `ready_at` passes, not twice.
+- Unit: hard-deadline test — 10 notifications spaced `quiet_minutes - 1` apart over `max_delay_minutes`; exactly one worker run fires at the hard deadline.
+- Unit: force-flag bypasses `ready_at`.
+- Integration: simulate a 30-ping burst via the `simulate` CLI, assert exactly one worker run is scheduled.
+- Manual: run against real Drive with a short `quiet_minutes=2`; edit a doc in sustained bursts; confirm a single run lands ~2 min after editing stops.
+
+**Acceptance criteria:**
+- Observed worker-run count per chatty session equals 1 (or 1-per-`max_delay_minutes`-window for pathological cases).
+- `drive.debounce.fired` log line present with correct `reason`.
+
+---
+
+### 17.5 Epic E — Export targets (maps to Phase 7)
+
+---
+
+#### Story E1 — XLSX exporter
+
+**Prerequisites:** A3.
+
+**Scope:**
+- `export/xlsx_writer.py` implementing `XlsxExporter` with two sheets: `Vocabulary` (same columns as CSV) and `Run metadata` (from `SyncReport`).
+- Optional extras group `[xlsx]` = `openpyxl`.
+- Source-set config support for `type: xlsx`.
+
+**Out of scope:**
+- AnkiWeb anything.
+
+**Testing & verification:**
+- Unit: open the produced file with `openpyxl.load_workbook`, assert sheet names and row counts.
+- Unit: with `openpyxl` not installed (`sys.modules` monkeypatch), importing the exporter raises a helpful `IntegrationError`.
+- Manual: open the produced file in Excel/Numbers and verify formatting.
+
+**Acceptance criteria:**
+- A run with `exporters: [..., xlsx]` produces both a CSV and an XLSX side by side, identical vocabulary rows.
+
+---
+
+#### Story E2 — AnkiConnect client library
+
+**Prerequisites:** A4.
+
+**Scope:**
+- `export/ankiweb/anki_connect.py` — thin wrapper around AnkiConnect v6: `version`, `requestPermission`, `deckNames`, `createDeck`, `modelNames`, `modelFieldNames`, `createModel`, `canAddNotesWithErrorDetail`, `addNotes`, `updateNote`, `updateNoteFields`, `updateNoteTags`, `findNotes`, `notesInfo`, `addTags`, `removeTags`, `sync`, `multi`.
+- Request envelope, error-to-exception translation, optional `apiKey`.
+
+**Out of scope:**
+- Exporter logic (that's E3).
+- Pull-agent wrapper (that's E4–E6).
+
+**Testing & verification:**
+- Unit: every wrapper method has a test that stubs `httpx` and asserts the correct JSON body and return value.
+- Unit: `error != null` in an AnkiConnect response raises an `IntegrationError` subclass.
+- Manual: against a local Anki with AnkiConnect, `python -m anki_deck_generator.export.ankiweb.anki_connect --action version` prints `6`.
+
+**Acceptance criteria:**
+- Every action listed in §13.3.5 has a thin, typed wrapper.
+
+---
+
+#### Story E3 — AnkiWeb exporter logic (identity + three-way merge)
+
+**Prerequisites:** E2, C2.
+
+**Scope:**
+- `export/ankiweb/exporter.py` implementing `AnkiWebExporter` per §13.3.6 and §13.3.9.
+- `ext_id:<card_id>` tagging, `req:<req_id>` idempotency tagging, `run:<date>` / `src:<source_id>` / `enr:<version>` metadata tags.
+- Three-way merge with policy knob `prefer-remote|prefer-local|tag-and-skip`.
+- Updates to `CardRecord.ankiweb_*` fields on success.
+
+**Out of scope:**
+- Any network-facing side of the pull agent.
+
+**Testing & verification:**
+- Unit: each row of the three-way merge matrix from §13.3.6 as a separate test (same/same, same/diff, diff/same, diff/diff with each policy).
+- Property test: merge is idempotent when re-applied to its own output.
+- Unit: `addNotes` returning a nil for one note triggers a single `findNotes`-then-`updateNote` fallback.
+- Integration: against a stubbed AnkiConnect, export 100 fixture cards; assert correct counts in `ExportResult`.
+
+**Acceptance criteria:**
+- User edits in Anki are never silently overwritten (regression tested).
+
+---
+
+#### Story E4 — Cloud-side pull-agent endpoints
+
+**Prerequisites:** E3, D5, B3.
+
+**Scope:**
+- `web/routes/ankiweb_agent.py` with `POST /agent/register`, `POST /agent/revoke`, `GET /pending`, `POST /ack`.
+- `AgentRecord` and `PendingSyncCursor` in DynamoDB.
+- Bearer-token middleware with constant-time comparison.
+- Cursor semantics per §13.3.15.10.
+
+**Out of scope:**
+- The agent binary (that's E5).
+
+**Testing & verification:**
+- Unit: `/register` mints a token, returns `{agent_id, token}`, stores a bcrypt hash.
+- Unit: `/pending` returns an empty batch with the same cursor when no `CardRecord.ankiweb_last_synced_at < last_updated_at` exists.
+- Unit: `/pending` honors `since` and batch-size limits (default 50).
+- Unit: `/ack` with a bogus `batch_id` returns 409.
+- Unit: `/ack` advances cursor only if all items in the batch are `status ∈ {applied, conflict, skipped}`.
+- Integration: happy-path round trip — register → pending → ack → `CardRecord.ankiweb_note_id` populated.
+
+**Acceptance criteria:**
+- Endpoints return the exact shapes specified in §13.3.7.
+
+---
+
+#### Story E5 — Pull agent (local H1 script) + init-system templates
+
+**Prerequisites:** E2, E4.
+
+**Scope:**
+- `scripts/ankiweb-pull-agent/agent.py` per §13.3.15.5.
+- `agent.toml` schema and loader.
+- Init-system templates for macOS (`launchd`), Linux (`systemd --user`), Windows (Task Scheduler XML), under `scripts/ankiweb-pull-agent/init/`.
+- CLI subcommands: `anki-notes-pipeline agent setup|status|uninstall|rebuild-venv|revoke`.
+
+**Out of scope:**
+- Auto-launching Anki.
+- Packaging as a PyPI extra (optional follow-up).
+
+**Testing & verification:**
+- Unit: agent state machine transitions (WAITING_FOR_ANKI → IDLE → APPLYING → back to IDLE) driven by injected stubs.
+- Unit: crash-recovery — create an inflight batch file, restart the agent, assert the batch is replayed via `POST /ack` without re-fetching.
+- Integration: against a fake AnkiConnect server + a `TestClient`-backed FastAPI app, run the agent for one full cycle; assert the expected DynamoDB state.
+- Manual (each OS):
+  - Install AnkiConnect, run `anki-notes-pipeline agent setup`.
+  - Trigger a pipeline run that creates 3 cards.
+  - Within 60 seconds, observe 3 notes in Anki, tagged `ext_id:<uuid>`.
+  - After the agent calls `sync`, observe the cards in AnkiWeb's web UI.
+
+**Acceptance criteria:**
+- End-to-end loop works on all three OSes.
+- Agent survives a `kill -9` mid-batch with no data loss on restart.
+
+---
+
+#### Story E6 — AnkiWeb exporter observability
+
+**Prerequisites:** E3, E4, E5.
+
+**Scope:**
+- `SyncReport.exports[ankiweb]` structured log per §13.3.11.
+- `/api/sync/runs/{run_id}` surfaces per-run AnkiWeb results.
+- CloudWatch alarms: `/ack` error rate, pending queue depth, silent agents.
+- Optional weekly email digest (behind a config flag; off by default).
+
+**Out of scope:**
+- A UI; this is structured-log + alarm scope only.
+
+**Testing & verification:**
+- Unit: run-report shape matches §13.3.11.
+- Unit: a simulated "agent not seen in 48 h" alarm fires.
+- Manual: trigger a run, curl `/api/sync/runs/{id}`, verify the `exports.ankiweb` block.
+
+**Acceptance criteria:**
+- A user can see, from one HTTP call, exactly what landed on AnkiWeb per run.
+
+---
+
+### 17.6 Epic F — Serverless deployment (maps to Phase 8)
+
+---
+
+#### Story F1 — Lambda container image + bootstrap
+
+**Prerequisites:** B3, C2.
+
+**Scope:**
+- `infra/lambda.Dockerfile` based on `public.ecr.aws/lambda/python:3.12`.
+- `lambda/bootstrap.py` assembling `Settings`, `StateStore`, and lazy-loading CEDICT from S3 into `/tmp` with a global cache.
+- `lambda/handler_schedule.py` (T1 from §11.1) delegating to `run_incremental_sync`.
+
+**Out of scope:**
+- Other handlers (covered by D6 and E4 code that runs inside these handlers).
+- IaC (that's F2).
+
+**Testing & verification:**
+- Unit: bootstrap caches CEDICT across warm invocations (call it twice, assert S3 mock is hit once).
+- Unit: `handler_schedule({"source_set": "x"}, ctx)` calls `run_incremental_sync` with the right args.
+- Manual: build the image, run with `docker run -p 9000:8080 ...`, invoke via the Lambda Runtime Interface Emulator.
+
+**Acceptance criteria:**
+- Image builds under 2 GB; cold start for `handler_schedule` <10s on a `t3.micro` equivalent (measured).
+
+---
+
+#### Story F2 — IaC (AWS SAM or CDK — pick one)
+
+**Prerequisites:** F1, D6, D7, E4.
+
+**Scope:**
+- One stack defining: Lambda function(s), EventBridge schedules (one per configured source set), API Gateway HTTP API with the routes from D5/D6/E4, DynamoDB table from B3, S3 export bucket, Secrets Manager secrets for Drive OAuth + agent tokens, SQS FIFO queue + DLQ, CloudWatch alarms, custom domain + ACM cert.
+- Decision: **AWS SAM** — simpler than CDK for this shape, and the deliverable is a single template file + container push.
+
+**Out of scope:**
+- Multi-region deployments.
+
+**Testing & verification:**
+- Unit: `sam validate` passes.
+- Integration: `sam local start-api` serves `/health` locally.
+- Manual: `sam deploy --guided` to a dev AWS account; invoke the schedule Lambda manually; verify `SyncReport` appears in DynamoDB and CloudWatch Logs.
+
+**Acceptance criteria:**
+- One-command deploy from a clean account.
+- Teardown via `sam delete` leaves no orphaned resources (verified by `aws resource-groups`).
+
+---
+
+#### Story F3 — CI/CD
+
+**Prerequisites:** F2.
+
+**Scope:**
+- GitHub Actions workflow `.github/workflows/deploy.yml`: build image → push to ECR → `sam deploy`.
+- Separate `.github/workflows/test.yml`: run `pytest` + `mypy` + `ruff` on every PR.
+- Fallback scheduled workflow `.github/workflows/weekly-sync.yml` running the same container once on GitHub's cron, for users who don't want AWS.
+
+**Out of scope:**
+- Blue/green / canary deploys.
+
+**Testing & verification:**
+- Manual: push to a feature branch, confirm test workflow runs.
+- Manual: merge to `main`, confirm deploy workflow runs against a staging account.
+
+**Acceptance criteria:**
+- New main commit auto-deploys to staging without human intervention.
+
+---
+
+#### Story F4 — End-to-end smoke test
+
+**Prerequisites:** F2, F3, D7, E5.
+
+**Scope:**
+- A single scripted `tests/e2e/weekly-lesson.sh` that:
+  1. Seeds a test Google Drive folder with a sample Google Doc.
+  2. Runs `sam deploy` to a scratch account.
+  3. Registers a Drive watch and an agent token.
+  4. Edits the doc.
+  5. Waits for debounce to fire.
+  6. Runs a local agent against a local Anki with AnkiConnect.
+  7. Asserts that the expected cards exist in Anki, tagged `ext_id:...`.
+  8. `sam delete`.
+
+**Out of scope:**
+- Day-to-day CI (this is operator-run only, gated on an env var).
+
+**Testing & verification:**
+- Manual: a developer runs the script on their laptop with their own test AWS + Google accounts.
+
+**Acceptance criteria:**
+- Script runs clean on a fresh environment; teardown leaves nothing.
+
+---
+
+### 17.7 Dependency graph (visual)
+
+```
+       A1 ──► A2 ──► A3                (Epic A)
+              │      │
+              │      ▼
+       A4 ────┴──► E1                  (Epic E)
+        │
+        ├─► D1 ──► D2 ──► D3            (Epic D providers)
+        │          │       │
+        │          ▼       │
+        │          D4 ─────┤
+        │                  ▼
+        │                 D5 ──► D6 ──► D7
+        │                         │       │
+        ▼                         │       │
+       B1 ──► B2 ──► B4 ──► C1 ──► C2    (Epics B, C)
+                     │       │
+                     ▼       │
+                     B3 ─────┤
+                             ▼
+                            E2 ──► E3 ──► E4 ──► E5 ──► E6   (Epic E)
+                                           │       │
+                                           ▼       ▼
+                                          F1 ──► F2 ──► F3 ──► F4   (Epic F)
+```
+
+Shortest useful slice to get *something* running end-to-end: A1 → A2 → A3 → A4 → B1 → B2 → B4 → C1 → D1 → D2 → D3. That alone gives you a locally-scheduled CLI that reads from Drive, persists to SQLite, and writes CSV — no Lambda, no AnkiWeb, no webhooks. Everything else is an add-on to that foundation.
+
+### 17.8 Verification posture
+
+Three levels of verification apply, consistently:
+
+1. **Unit tests**, in every story, run on every PR. Hermetic, fast, deterministic.
+2. **Integration tests**, most stories. Use `moto` for AWS, fake HTTP for AnkiConnect, FastAPI `TestClient` for web routes. No network, no real AWS, no real Anki. Run on every PR.
+3. **Manual / operator-run checks**, listed per story. Require real credentials or a real Anki install. Not gated on CI; documented so a reviewer can run them before approval.
+
+Every story's "Acceptance criteria" lists at least one observable property a reviewer can check without reading the diff. If a story doesn't have that, it's not ready to merge.
