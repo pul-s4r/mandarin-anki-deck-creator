@@ -2439,13 +2439,64 @@ Stories are grouped into six epics matching the phases already introduced in §�
 - Breaking changes to the on-disk / on-wire schema require a bump of `schema_version` on the affected records and a migration test.
 - "Manual verification" steps assume a developer with local AWS credentials and a local Anki install (where relevant); each step lists how to skip it if those aren't available.
 
+#### 17.0.1 Script-mode continuity invariant (applies to every story, every epic)
+
+The user depends on the existing CLI-driven script flow and will continue to use it while serverless infrastructure is being set up. Every story in this plan — not just Epic A — must satisfy the following invariant at the moment it merges:
+
+1. **`anki-notes-pipeline run <input> --output <csv> [--cedict-path ...]` must continue to work**, with the same command-line surface that exists on `main` today, with no new required flags, and without requiring any of the new subsystems to be configured (no StateStore, no web server, no source-set YAML, no Drive auth, no Lambda, no AnkiConnect). Passing zero configuration beyond what works today must still produce a CSV.
+2. **Byte-for-byte output parity with `main`** on a fixed set of fixtures, established once at the start of Epic A (see §17.1.0) and re-checked by every subsequent story. A diff against the baseline is a merge blocker. The only exception is a story that deliberately changes output, which must update the baseline in the same commit and call out the change in the PR body.
+3. **No new hard dependencies** introduced by later stories may become required for script mode. Dependencies for web/AWS/AnkiWeb/XLSX live in optional extras groups (`[server]`, `[aws]`, `[ankiweb]`, `[xlsx]`, etc.), and `pip install .` without extras must still give a working script-mode install.
+4. **No `ImportError` on a barebones install.** The CLI entry point cannot top-level-import modules that depend on optional extras. Imports for those subsystems are deferred inside the subcommands that need them.
+5. **No `main`-branch breakage between story merges.** Each story is shaped so the CLI still works after it lands, independently of whether later stories have merged.
+
+A CI check (added in story A1 and kept green thereafter) enforces items 1, 2, and 4 automatically. Items 3 and 5 are enforced by review.
+
 ### 17.1 Epic A — Core library refactoring (maps to Phase 1)
 
-These stories are pure-local, no cloud, no integrations. They must all land before anything in Epics B–F is safe to start.
+These stories are pure-local, no cloud, no integrations. They must all land before anything in Epics B–F is safe to start. **Every story in Epic A is a pure internal refactor: the public CLI behavior does not change.**
+
+#### 17.1.0 Script-mode baseline fixture and CI gate (landed as part of Story A1)
+
+Before any refactor touches production code paths, Epic A establishes a baseline artifact set that every subsequent story is compared against. This is how we enforce §17.0.1 mechanically rather than by inspection.
+
+**What the baseline contains:**
+
+- `tests/baselines/inputs/`: at least one fixture per supported format (`sample.pdf`, `sample.md`, `sample.docx`). Small enough to run end-to-end in under ~10 seconds with the LLM **mocked**.
+- `tests/baselines/outputs/`: the CSV each fixture produces, generated once on the tip of `main` before A1 is started, checked in verbatim.
+- `tests/baselines/settings.env`: the exact settings used to generate the baseline (chunk size, skip-lines filter, csv_bom, etc.).
+- `tests/baselines/llm_mock.json`: a recorded deterministic LLM response per chunk so subsequent runs produce identical output without actually calling Bedrock.
+
+**The CI gate:**
+
+A new test module `tests/test_script_mode_baseline.py` runs on every PR and does three things:
+
+1. For each `(fixture, settings)` pair, invoke `anki-notes-pipeline run` as a **subprocess** (so we exercise the real CLI entry point, not the library directly) against a mocked LLM and assert the emitted CSV file is byte-for-byte identical to the baseline.
+2. `pip install .` into a fresh temp virtualenv **without any extras**, then invoke the same CLI with `--help` and `run --help`. Assert both succeed (exit 0) and that no import warnings or `ImportError`-adjacent messages appear in stderr.
+3. Import the top-level `anki_deck_generator` package in that bare venv and verify it does **not** transitively import FastAPI, boto3, openpyxl, `googleapiclient`, or any other extras-gated dependency. (Implementation: import the package in a subprocess with those modules replaced by a `MetaPathFinder` that raises on resolution; a successful import proves no top-level dependency leak.)
+
+If any of these three checks fails, the PR is blocked.
+
+**Updating the baseline:**
+
+Intentional output changes require the PR to:
+- Regenerate the baseline CSV with the new expected output, checked in as part of the same commit.
+- Note the change prominently in the PR description ("Baseline updated because: ...").
+- Cite the user-visible behavior change in the `CHANGELOG` entry.
+
+This keeps accidental regressions noisy and deliberate changes reviewable.
+
+**What "script mode" means for this invariant:**
+
+- Entry point: the `anki-notes-pipeline` console script installed by `pyproject.toml`, invoked from a shell.
+- Minimum runtime requirements: Python 3.12, AWS creds for Bedrock (as today), optionally a CEDICT file.
+- No other services running (no FastAPI server, no DynamoDB, no AnkiConnect, no agent, no local SQLite file).
+- `settings.env` or environment variables supply all configuration, exactly as on `main` today.
+
+This is the shape the user depends on while serverless infrastructure is being set up in parallel, and it remains supported for the lifetime of the project — not just during Epic A.
 
 ---
 
-#### Story A1 — Bytes-based ingest
+#### Story A1 — Bytes-based ingest + script-mode baseline & CI gate
 
 **Prerequisites:** none.
 
@@ -2453,21 +2504,28 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 - Add `extract_text_from_bytes(data: bytes, *, format: str) -> str` in `ingest/router.py`.
 - Add bytes-accepting helpers in `ingest/pdf.py`, `ingest/markdown.py`, `ingest/docx.py`.
 - Refactor `extract_text_from_path` to be a thin wrapper around `extract_text_from_bytes`.
+- **Establish the §17.0.1 script-mode baseline**: create `tests/baselines/` with fixtures, recorded LLM mock responses, baseline CSVs (generated on the pre-refactor commit), and a settings env.
+- **Add the CI gate** `tests/test_script_mode_baseline.py` per §17.1.0 that enforces byte-for-byte CSV parity, bare-venv install, and no extras-gated top-level imports.
+- **Pin optional-extras groups** in `pyproject.toml`: existing deps stay in `[project.dependencies]` only if they are required for script mode; any that are only needed by web/AWS/AnkiWeb/XLSX subsystems move to their own extras groups (`[server]`, `[aws]`, `[ankiweb]`, `[xlsx]`). If none of those dependencies exist yet in `main`, the groups are declared empty and populated by later stories.
 
 **Out of scope:**
 - Any new file formats.
-- Any pipeline or CLI changes.
+- Any pipeline or CLI user-visible behavior changes — this story preserves behavior while adding test infrastructure and an internal alternative entry point.
 
 **Testing & verification:**
 - Unit: for each existing ingestor, add a test that reads a fixture file into bytes and asserts `extract_text_from_bytes(...)` returns the same string as `extract_text_from_path(fixture_path)`.
 - Unit: `extract_text_from_bytes(b"...", format="unknown")` raises `IngestError`.
 - Regression: the full existing test suite still passes (`pytest`).
-- Manual: `anki-notes-pipeline run <fixture.pdf>` still produces a byte-identical CSV to the commit immediately before the story.
+- **Baseline (CI)**: `tests/test_script_mode_baseline.py` runs `anki-notes-pipeline run` as a subprocess against each `tests/baselines/inputs/` fixture with the mocked LLM enabled, and diffs the output against `tests/baselines/outputs/`. Must be byte-identical.
+- **Bare install (CI)**: a CI job creates a scratch virtualenv, runs `pip install .` (no extras), and then `anki-notes-pipeline --help` + `anki-notes-pipeline run --help`. Both succeed.
+- **Import isolation (CI)**: in a subprocess where `fastapi`, `boto3`, `openpyxl`, and `googleapiclient` resolve to a raising `MetaPathFinder`, `import anki_deck_generator` must succeed. Fails if any of those are transitively imported at package top level.
+- Manual: `anki-notes-pipeline run <real-fixture.pdf> --output /tmp/x.csv` with real Bedrock credentials still produces the same CSV as the commit immediately before A1 lands.
 
 **Acceptance criteria:**
 - All existing tests pass.
 - New bytes-based entry points exist and are covered.
 - `extract_text_from_path` no longer contains format-specific parsing logic (it delegates).
+- The three CI gates (baseline, bare install, import isolation) are green and blocking on PRs.
 
 ---
 
@@ -2488,11 +2546,14 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 - Unit: call `run_pipeline_from_text(fixture_text, settings_with_mocked_llm)` and assert `result.rows` matches the golden output we use in `test_pipeline_e2e_mocked.py`.
 - Unit: assert `progress_callback` is called with `("ingest", 1, 1)`, `("chunk", N, N_total)`, `("llm", N, N_total)`, `("export", 1, 1)` in order.
 - Regression: `test_pipeline_e2e_mocked.py` still passes with no modification.
-- Manual: running the CLI against a real fixture still produces a byte-identical CSV vs. `main`.
+- **Baseline (CI)**: the baseline gate from A1 must still be green — byte-for-byte CSV parity across all fixtures.
+- **Bare install (CI)**: still green — `run_pipeline_from_text` must not pull in any extras-gated modules.
+- Manual: running `anki-notes-pipeline run <real-fixture>` against a real fixture with real Bedrock still produces a byte-identical CSV vs. `main`.
 
 **Acceptance criteria:**
 - `run_pipeline_from_text` is pure: no file writes, no stdin reads.
 - `run_pipeline` behavior is unchanged from a user's perspective.
+- §17.0.1 invariant holds: the CLI still runs against the same fixtures with the same output, with no new required flags or dependencies.
 
 ---
 
@@ -2513,9 +2574,11 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 - Unit: `CsvExporter.export` produces the same bytes as the legacy `write_vocabulary_csv` for several fixtures (including BOM on/off).
 - Unit: `vocabulary_csv_bytes(rows, bom=True)` begins with `b"\xef\xbb\xbf"`.
 - Regression: `test_csv_writer.py` passes unchanged.
+- **Baseline (CI)**: still green — the Exporter protocol indirection must not change emitted bytes.
 
 **Acceptance criteria:**
 - No caller of the old `write_vocabulary_csv` exists outside the wrapper shim.
+- §17.0.1 invariant holds: CLI still writes the same CSV bytes to disk for the same inputs.
 
 ---
 
@@ -2533,13 +2596,18 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 **Testing & verification:**
 - Unit: each existing error-raising code path now raises a subclass of `AnkiPipelineError`.
 - Regression: CLI still prints a human-readable error when given an unsupported file type (verify by invoking `anki-notes-pipeline run not-a-real.xyz`).
+- **Baseline (CI)**: still green — error-hierarchy changes must not alter happy-path CSV output.
+- Manual: invoke the CLI against each baseline fixture and confirm identical output; invoke the CLI with an invalid path and confirm the human-readable error matches the pre-A4 behavior in spirit (same exit code, same non-zero semantics).
 
 **Acceptance criteria:**
 - No bare `raise Exception(...)` in `src/anki_deck_generator/` after this story.
+- §17.0.1 invariant holds: CLI behavior (including error reporting) remains user-compatible.
 
 ---
 
 ### 17.2 Epic B — Persistent state layer (maps to Phase 5)
+
+**Script-mode continuity in this epic:** every new CLI subcommand (`state init`, `state list-cards`, `state list-runs`) is **additive**. The existing `anki-notes-pipeline run` flow is unchanged and continues to operate with no StateStore configured. The §17.1.0 baseline CI gate remains green across every B-story merge.
 
 ---
 
@@ -2636,6 +2704,8 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 
 ### 17.3 Epic C — Incremental sync (maps to Phase 6)
 
+**Script-mode continuity in this epic:** the new `schedule` subcommand is additive; the existing `run` subcommand is untouched. Any code C1 adds under `sync/` must import lazily from pipeline entry points so that `import anki_deck_generator` in a bare venv still does not pull in YAML/Drive deps. The §17.1.0 baseline CI gate remains green.
+
 ---
 
 #### Story C1 — `SyncReport` and `run_incremental_sync` over a cold StateStore
@@ -2689,6 +2759,8 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 ---
 
 ### 17.4 Epic D — Google Drive provider & scheduled/event execution (maps to Phase 4 + most of Phase 8)
+
+**Script-mode continuity in this epic:** Google API client libs, FastAPI, uvicorn, and boto3 all land in their own optional extras groups (`[google-drive]`, `[server]`, `[aws]`). `pip install .` (no extras) continues to produce a working `run`-only install. New subcommands (`import`, `serve`, `auth google-drive`, `drive watch ...`) live behind lazy imports: invoking `run` must not load any of them. The §17.1.0 baseline CI gate remains green across every D-story merge and explicitly re-verifies that `fastapi`, `boto3`, and `googleapiclient` stay out of the top-level import graph.
 
 ---
 
@@ -2868,6 +2940,8 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 
 ### 17.5 Epic E — Export targets (maps to Phase 7)
 
+**Script-mode continuity in this epic:** `openpyxl`, AnkiConnect client code, and the pull-agent live behind `[xlsx]` and `[ankiweb]` extras. `run` never reaches any of this code. The baseline CI gate remains green and the import-isolation check is extended to include `openpyxl`.
+
 ---
 
 #### Story E1 — XLSX exporter
@@ -3018,6 +3092,8 @@ These stories are pure-local, no cloud, no integrations. They must all land befo
 ---
 
 ### 17.6 Epic F — Serverless deployment (maps to Phase 8)
+
+**Script-mode continuity in this epic:** nothing in Epic F is imported by the script-mode CLI. `infra/` and `lambda/` are packaged separately (the SAM build uses them; the PyPI-distributable package excludes them). `pip install .` still produces a working script-mode install with no Lambda/SAM/`sam-cli` requirements. The baseline CI gate remains green.
 
 ---
 
