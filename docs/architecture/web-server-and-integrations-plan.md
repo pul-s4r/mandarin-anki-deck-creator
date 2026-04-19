@@ -3227,3 +3227,112 @@ Three levels of verification apply, consistently:
 3. **Manual / operator-run checks**, listed per story. Require real credentials or a real Anki install. Not gated on CI; documented so a reviewer can run them before approval.
 
 Every story's "Acceptance criteria" lists at least one observable property a reviewer can check without reading the diff. If a story doesn't have that, it's not ready to merge.
+
+### 17.9 Recommended implementation order
+
+The dependency graph in §17.7 only tells you what *can* land in what order. This subsection states what *should* land in what order, and why. The recommendation reflects three priorities, in this order:
+
+1. **Preserve script-mode utility** (§17.0.1). The user keeps a working CLI throughout. No epic begins until script-mode parity infrastructure is in place.
+2. **Deliver value early.** Each milestone unlocks a real new capability the user can use, rather than just preparing for one.
+3. **Defer the hardest, most operationally-expensive work as long as possible**, so it benefits from the most context and gets only as much engineering effort as the value justifies.
+
+#### 17.9.1 Recommended order across epics
+
+```
+Milestone 1: Script-mode safety net      → A1 → A4 → A2 → A3
+Milestone 2: Local persistence           → B1 → B2 → B4 → C1 → C2
+Milestone 3: Drive ingestion (still local) → D1 → D2 → D3
+Milestone 4: AnkiWeb on user's desktop   → E2 → E3
+Milestone 5: Cloud surface (web first)   → D5 → B3
+Milestone 6: AnkiWeb agent loop          → E4 → E5 → E6
+Milestone 7: XLSX export                 → E1
+Milestone 8: Event-driven Drive          → D4 → D6 → D7
+Milestone 9: Serverless deployment       → F1 → F2 → F3 → F4
+```
+
+Read the milestones as the order in which a single implementer should pull stories off the queue. The arrows inside each milestone show the within-milestone order.
+
+#### 17.9.2 What each milestone unlocks for the user
+
+| Milestone | After this lands, the user can… | Cost added | Risk if skipped |
+|---|---|---|---|
+| **M1** Script-mode safety net | Keep using `run` exactly as today, but with a CI gate that prevents future regressions. | None (refactor only). | Future stories silently break the CLI. |
+| **M2** Local persistence + incremental sync | Re-run the pipeline weekly without re-LLM-ing unchanged content; persistent card inventory in SQLite; `state list-cards`. | One SQLite file. | Every later epic depends on this; skipping it forces full re-runs forever. |
+| **M3** Drive ingestion (locally scheduled) | `anki-notes-pipeline schedule --source-set lessons` reads from Drive, processes only what changed, writes a CSV. Runs from `cron`/launchd today. | Google OAuth one-time. | Without this you're still uploading PDFs by hand. |
+| **M4** AnkiWeb on user's desktop | Run the pipeline locally; cards land in desktop Anki via AnkiConnect; user clicks Sync (or has Anki sync automatically). | Install AnkiConnect; one local config. | AnkiWeb stays out of reach. |
+| **M5** Cloud surface (web first) | FastAPI server runs locally (or on any box), accepts uploads, exposes status. DynamoDB-backed StateStore is now usable. | Optional self-hosting. | Without this you can't move toward serverless. |
+| **M6** AnkiWeb agent loop | The pull-agent on your desktop polls the cloud server; cards from any pipeline run (local or remote) land in Anki automatically. | One init-system unit on the desktop. | AnkiWeb sync remains manual. |
+| **M7** XLSX export | Get an audit-friendly XLSX alongside the CSV per run. | `openpyxl` install. | No functional impact; nice-to-have. |
+| **M8** Event-driven Drive | Edit a Google Doc, debounce settles, cards appear minutes later — no cron. | Drive watch channel + custom domain. | M3's weekly cron is already enough for the stated workflow; this is latency improvement only. |
+| **M9** Serverless deployment | The whole thing runs on Lambda; nothing on your laptop except the AnkiWeb agent. | AWS account + SAM stack. | Self-hosted server from M5 still works. |
+
+#### 17.9.3 Within-epic order rationale
+
+##### Epic A — `A1 → A4 → A2 → A3`
+
+- **A1 first** because it lands the §17.0.1 baseline CI gate. Nothing else can be merged safely until that gate is green and protecting `main`.
+- **A4 (errors) before A2 (pipeline split)** because `run_pipeline_from_text` is the natural place to start raising structured exceptions; if A4 lands later, A2 has to be reworked to thread the new error types through. Cheap to do A4 second.
+- **A2 before A3** because the `Exporter` protocol (A3) is most naturally introduced when the caller is already a clean function (`run_pipeline_from_text`), not the legacy `run_pipeline`.
+
+Net result of M1: behavior identical to today, with the CI gate enforcing it forever.
+
+##### Epic B — `B1 → B2 → B4 → C1 → C2 → B3`
+
+- **`B1 → B2 → B4`**: get a working local persistence story first using SQLite. This is the smallest possible change that makes incremental sync feasible.
+- **`C1 → C2` immediately after B4**: incremental sync is what makes persistence actually useful. Land it before adding a second backend.
+- **`B3` (DynamoDB) deferred to M5**: a second backend is dead weight until you actually need it (i.e., until something in the cloud writes to it). Building it earlier risks design drift, because the access patterns become clear only once C2 has run against real data for a few weeks.
+
+The user's local SQLite-backed runs from M2 are forward-compatible: every record carries `schema_version`, and B3's DynamoDB schema is a strict superset of B2's, so cards from M2 are readable by M5 with a one-shot migration.
+
+##### Epic D — `D1 → D2 → D3` first; `D4 → D6 → D7` deferred to M8
+
+- The "ingest from Drive" half (D1–D3) is independently valuable: it gives you the weekly cron use case without any webhook infrastructure.
+- The "react to Drive edits" half (D4–D7) requires a public HTTPS endpoint, custom domain, Search Console verification, debounce table, and SQS queue. None of that is needed for the stated weekly-lesson workflow, where a Friday cron is enough.
+- Deferring D4–D7 to M8 means they are built only after the rest of the system is real, which is when their design choices (debounce window, queue topology) can be validated against actual usage data from M2–M3.
+
+##### Epic E — `E2 → E3` in M4; `E4 → E5 → E6` in M6; `E1` in M7
+
+- **`E2 → E3` first** lands AnkiConnect support that works *locally* with no cloud. This is the smallest possible AnkiWeb integration: you run the pipeline on your laptop, cards appear in Anki, you click Sync. Useful immediately.
+- **`E4 → E5 → E6` deferred to M6** because the pull-agent loop only matters when the pipeline runs somewhere other than your laptop. Once you have a cloud surface (M5), the agent unlocks "pipeline anywhere → AnkiWeb everywhere."
+- **`E1` (XLSX) is `M7` because it has the lowest functional value**. It's a nice-to-have for audit; nobody is blocked on it. Slipping it last keeps focus on the higher-value stories.
+
+##### Epic F — strict `F1 → F2 → F3 → F4`
+
+These are dependency-ordered with no flexibility: image (F1) → IaC (F2) → CI (F3) → smoke test (F4). Don't try to parallelize.
+
+#### 17.9.4 Suggested merge cadence
+
+This is per-story sizing, not calendar time:
+
+| Milestone | Stories | Approximate size |
+|---|---|---|
+| M1 | 4 stories (A1, A4, A2, A3) | A1 is the largest in this set because of baseline + CI gate; the rest are small. |
+| M2 | 5 stories (B1, B2, B4, C1, C2) | C2 is medium; the rest are small. |
+| M3 | 3 stories (D1, D2, D3) | D2 is medium (Drive auth + Google API). |
+| M4 | 2 stories (E2, E3) | E2 is small per-method but broad; E3 has the three-way merge logic. |
+| M5 | 2 stories (D5, B3) | Both medium. |
+| M6 | 3 stories (E4, E5, E6) | E5 (the agent itself + init-system templates) is the biggest single story in the project. |
+| M7 | 1 story (E1) | Small. |
+| M8 | 3 stories (D4, D6, D7) | D7 (debounce) is the trickiest of the three. |
+| M9 | 4 stories (F1, F2, F3, F4) | F2 is the biggest; F4 is operator-run. |
+
+Stories within a milestone are reviewable independently; a milestone is "done" when all its stories have merged and the milestone's user-visible capability has been manually verified end-to-end.
+
+#### 17.9.5 What this order optimizes for, explicitly
+
+- **Continuous CLI usability.** After M1, every subsequent merge keeps `anki-notes-pipeline run` working. After M3, the user has a functional cron-driven workflow. After M4, AnkiWeb is reachable. None of this requires AWS.
+- **AWS dependency deferred to M5+.** Anything that requires an AWS account or paying for cloud resources is in M5 or later. The user can complete M1–M4 entirely on a single laptop.
+- **No dead code.** Each story exists in service of a milestone that delivers something. There are no "build this now because we'll need it later" stories.
+- **Reversibility.** The last 3 milestones (M7, M8, M9) are independently optional: if you decide the weekly-cron + local-AnkiConnect workflow from M3+M4 is enough, you can stop after M6 and still have a complete, supportable system.
+
+#### 17.9.6 Where to deviate from this order (and where not to)
+
+| Reason | Acceptable deviation? |
+|---|---|
+| Build XLSX (E1) earlier because someone wants it | Yes — E1 has no dependencies beyond A3. |
+| Skip M2 and start on D2 | **No.** Drive ingestion without persistence re-LLMs everything every run. |
+| Build the Lambda image (F1) before M5 | **No.** F1's bootstrap consumes `StateStore` and `run_incremental_sync`; both must exist and have been validated locally first. |
+| Build E5 (the agent) before E4 (the endpoints) | No — agent has nothing to talk to. |
+| Build the AnkiWeb session-cookie fallback (Option B from §13.3.3) | **Don't build it at all** unless §16 risk #1 forces the issue. |
+| Land webhooks (D6/D7) before the local cron flow (D3) | No — webhooks change *how* runs are triggered; D3 establishes *what* a run does in the first place. |
+| Switch state backend to DynamoDB (B3) earlier than M5 | Discouraged. DynamoDB Local works but adds dev-environment friction with no payoff until something in the cloud is writing to the table. |
