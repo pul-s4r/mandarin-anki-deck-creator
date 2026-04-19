@@ -20,6 +20,8 @@
 16. [Open Questions & Risks](#16-open-questions--risks)
 17. [Story Breakdown for Implementation](#17-story-breakdown-for-implementation)
 
+(§17 contents: 17.0 conventions; 17.1–17.6 epics A–F; 17.7 dependency graph; 17.8 verification posture; 17.9 recommended implementation order; 17.10 concurrency / DAG / critical path.)
+
 ---
 
 ## 1. Current Architecture Summary
@@ -3336,3 +3338,208 @@ Stories within a milestone are reviewable independently; a milestone is "done" w
 | Build the AnkiWeb session-cookie fallback (Option B from §13.3.3) | **Don't build it at all** unless §16 risk #1 forces the issue. |
 | Land webhooks (D6/D7) before the local cron flow (D3) | No — webhooks change *how* runs are triggered; D3 establishes *what* a run does in the first place. |
 | Switch state backend to DynamoDB (B3) earlier than M5 | Discouraged. DynamoDB Local works but adds dev-environment friction with no payoff until something in the cloud is writing to the table. |
+
+### 17.10 Concurrency: dependency graph and parallelizable work
+
+§17.9 gave a *recommended* sequential order driven by user value. This subsection answers a different question: what does the actual dependency DAG allow you to do in parallel, and where is the critical path?
+
+#### 17.10.1 Story-level DAG
+
+Edges are "must-merge-before". Stories with no incoming edge are roots.
+
+```
+                                ┌──────── A4 ────────┬──────────┬──────────┐
+                                │                    │          │          │
+                  A1 ──► A2 ──► A3 ──► E1            │          │          │
+                  │     │       │                    │          │          │
+                  │     │       └──────────────► (Exporter base for E1) │
+                  │     │                             │          │          │
+                  │     │                             ▼          ▼          ▼
+                  │     │                            B1         D1         E2
+                  │     │                             │          │          │
+                  │     │                             ▼          ▼          │
+                  │     └──────────────► C1 ◄──────  B2         D2 ◄────────┘ (D2 also needs A1)
+                  │                       ▲           │          │
+                  └──────────────────► (D2 ingest) │  ▼          │
+                                                  │ B3          ▼
+                                                  │  │         D4
+                                                  │  ▼          │
+                                                  └ B4          │
+                                                     │          │
+                                              ┌──────┘          │
+                                              ▼                 │
+                                              C1 ──► C2 ──► E3  │
+                                              │       │     │   │
+                                              │       │     │   │
+                                              ├───► D3│     │   │
+                                              │       │     │   │
+                                              ├───► D5┼─────┼───┘
+                                              │       │     │
+                                              │       ▼     ▼
+                                              │       F1 ◄──┘
+                                              │             │
+                                              │       D5+B3 │
+                                              │         │   │
+                                              │         ▼   │
+                                              │       D6   E4
+                                              │        │    │
+                                              │        ▼    ▼
+                                              │       D7    E5
+                                              │        │    │
+                                              │        ▼    ▼
+                                              └──► F2 ◄────┴──► E6
+                                                   │
+                                                   ▼
+                                                   F3
+                                                   │
+                                                   ▼
+                                                   F4 ◄── D7, E5
+```
+
+(The diagram is approximate; the precise edges below are authoritative.)
+
+#### 17.10.2 Authoritative edge list
+
+| Story | Direct prerequisites |
+|---|---|
+| A1 | — |
+| A2 | A1 |
+| A3 | A2 |
+| A4 | — |
+| B1 | A4 |
+| B2 | B1 |
+| B3 | B2 |
+| B4 | B2, B3 |
+| C1 | A2, B4 |
+| C2 | C1 |
+| D1 | A4 |
+| D2 | D1, A1 |
+| D3 | C1, D2 |
+| D4 | D2 |
+| D5 | C1 |
+| D6 | D4, D5, B3 |
+| D7 | D6 |
+| E1 | A3 |
+| E2 | A4 |
+| E3 | E2, C2 |
+| E4 | E3, D5, B3 |
+| E5 | E2, E4 |
+| E6 | E3, E4, E5 |
+| F1 | B3, C2 |
+| F2 | F1, D6, D7, E4 |
+| F3 | F2 |
+| F4 | F2, F3, D7, E5 |
+
+Practical caveat from §17.0.1: even though A4 has no listed prereq, in practice A1 should land first so the CI baseline gate is in place before any other story merges. This is enforced by review, not by the DAG.
+
+#### 17.10.3 Topological concurrency levels
+
+Stories at the same level have no dependencies between them and can be implemented and reviewed in parallel by different people. Each level is "ready to start" once all earlier levels have merged.
+
+| Level | Stories that become unblocked | Width (max parallelism) |
+|---|---|---|
+| **L0** | A1, A4 | 2 |
+| **L1** | A2, B1, D1, E2 | 4 |
+| **L2** | A3, B2, D2 | 3 |
+| **L3** | B3, D4, E1 | 3 |
+| **L4** | B4 | 1 |
+| **L5** | C1 | 1 |
+| **L6** | C2, D3, D5 | 3 |
+| **L7** | E3, F1 | 2 |
+| **L8** | D6, E4 | 2 |
+| **L9** | D7, E5, F2 | 3 |
+| **L10** | E6, F3 | 2 |
+| **L11** | F4 | 1 |
+
+Total: 12 topological levels, 27 stories across the levels (A1 sits alone above L0 in practice — see caveat above).
+
+The DAG depth (12 levels) is the lower bound on serialized work even with unlimited implementers. The maximum width (4 stories at L1) is the upper bound on concurrent work at any single point.
+
+#### 17.10.4 Critical path
+
+The critical path — the longest chain that determines minimum end-to-end depth — has two co-equal variants converging on F4:
+
+**Critical path A (via debounce/IaC):**
+
+```
+A1 → A4 → B1 → B2 → B3 → B4 → C1 → D5 → D6 → D7 → F2 → F3 → F4
+```
+
+**Critical path B (via state→sync→IaC):**
+
+```
+A1 → A4 → B1 → B2 → B3 → B4 → C1 → C2 → F1 → F2 → F3 → F4
+```
+
+Both have length 12 (counting A1 as a soft prereq for A4). The DAG cannot complete in fewer than 12 sequential merge windows regardless of how many implementers are available.
+
+The shared spine `B1 → B2 → B3 → B4 → C1` is the single most serialized stretch — five stories that strictly depend on each other and cannot be parallelized. Any time saved during the project comes from parallelizing *off* this spine, not from changing it.
+
+#### 17.10.5 What can run in parallel with the critical-path spine
+
+While the critical-path spine `B1 → B2 → B3 → B4 → C1` is being implemented serially, these unrelated stories can be running in parallel on other branches without conflict:
+
+| While critical path is at… | …these can be in flight simultaneously |
+|---|---|
+| B1 | A2, A3 (Epic A tail), D1, E2 (started immediately after A4) |
+| B2 | A3, D1→D2, E2 (idle awaiting C2) |
+| B3 | A3, D2, E1 (after A3 lands), D4 (after D2 lands) |
+| B4 | E1, D4 |
+| C1 | E1, D4, D2 (already done) |
+
+This means the practical "dead time" on the spine is much smaller than the spine's length suggests, because Epics A-tail, D-ingest, and E-prep can be chipped away at the same time.
+
+#### 17.10.6 Practical scheduling for N implementers
+
+##### N = 1 (single implementer, the assumed case)
+
+Follow §17.9's recommended order milestone by milestone. The DAG's parallelism does not help a single implementer except as flexibility: within a single milestone you can pick any topologically-valid order and still finish the milestone correctly. Recommendation: stick to §17.9's order as written.
+
+##### N = 2
+
+Have one implementer drive the critical-path spine (`A4 → B1 → B2 → B3 → B4 → C1 → C2`); have the second implementer pick up the parallelizable work in roughly this order:
+
+```
+Implementer 1:  A1 → A4 → B1 → B2 → B3 → B4 → C1 → C2 → E3 → E4 → E5 → E6
+Implementer 2:        A2 → A3 → E1 → D1 → D2 → D4 → D3 → D5 → D6 → D7 → F1 → F2 → F3 → F4
+```
+
+(Implementer 2 picks up F1/F2/F3/F4 at the end because they need outputs from both streams.) End-to-end depth is determined by the critical path; with 2 implementers you save roughly 6–8 merges of wall-clock work compared to a single-implementer schedule.
+
+##### N = 3+
+
+The DAG's max width is 4 (at L1), so the third (and any additional) implementer can only help during specific levels. A reasonable assignment:
+
+```
+Implementer 1: A1, A2, A3, B1, B2, B3, B4, C1, C2, F1, F2, F3, F4   (critical-path heavy)
+Implementer 2: A4, D1, D2, D3, D4, D5, D6, D7                       (Drive end-to-end)
+Implementer 3: E2, E1, E3, E4, E5, E6                               (exports + agent)
+```
+
+Implementer 3 is idle until E2 unblocks (after A4 lands, which is L0/L1). Implementers 2 and 3 frequently block on Implementer 1's outputs (`B3`, `B4`, `C1`, `C2`), so coordination overhead is real. Above 3 implementers there is essentially no further parallelism — the DAG saturates.
+
+#### 17.10.7 Concurrency within each milestone of §17.9
+
+Cross-referencing §17.9's milestones with the DAG, here is what's parallelizable inside each milestone:
+
+| Milestone | Stories | Can run in parallel? |
+|---|---|---|
+| **M1** | A1, A4, A2, A3 | A1 first. Then A2 and A4 parallel. Then A3 (after A2). |
+| **M2** | B1, B2, B4, C1, C2 | Strictly serial spine. No internal parallelism. |
+| **M3** | D1, D2, D3 | D1 → D2 serial. D3 needs C1 + D2; both must be done before starting. |
+| **M4** | E2, E3 | E2 → E3 serial. |
+| **M5** | D5, B3 | Independent: D5 needs C1 (already done in M2), B3 needs B2 (also done in M2). Fully parallel. |
+| **M6** | E4, E5, E6 | E4 → E5 serial; E6 needs both. No parallelism. |
+| **M7** | E1 | Single story. |
+| **M8** | D4, D6, D7 | D4 needs D2 (done in M3); D6 needs D4 + D5 (done in M5) + B3 (done in M5); D7 → D6. Mostly serial after the gating dependencies. |
+| **M9** | F1, F2, F3, F4 | F1 can start once B3 + C2 are done (i.e. anytime from M5 onward). F2/F3/F4 strictly serial. |
+
+The most parallelizable milestone is **M5**, where D5 and B3 are fully independent and can be implemented and merged in either order. The least parallelizable are **M2**, **M6**, and the tail of **M9** — pure serial spines.
+
+#### 17.10.8 What this implies for the §17.9 ordering
+
+§17.9's recommended order honors the DAG; nothing in §17.10 contradicts it. The DAG just makes explicit which milestone-level optimizations are available:
+
+- A team could productively split work along the M2-spine vs. Drive-ingest seams (because Epic D's first half can advance in parallel with Epic B/C).
+- A solo implementer following §17.9's order is already on a near-optimal serial schedule; they don't need to think about the DAG day-to-day.
+- The five-story spine `B1 → B2 → B3 → B4 → C1` is unavoidable and is the right place to focus quality effort, since downstream defects there propagate everywhere.
