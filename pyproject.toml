@@ -22,6 +22,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+server = []
+ankiweb = []
+xlsx = []
+gdrive = []
 
 [project.scripts]
 anki-notes-pipeline = "anki_deck_generator.cli:main"

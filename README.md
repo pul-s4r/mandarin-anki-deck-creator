@@ -35,3 +35,7 @@ The module `anki_deck_generator.debuglog` is kept in the repo as a small NDJSON 
 ```bash
 pytest
 ```
+
+### Script-mode baseline (CI)
+
+Regression tests under `tests/test_script_mode_baseline.py` compare CLI output to checked-in CSVs in `tests/baselines/outputs/` using a deterministic LLM stub. Set `ANKI_PIPELINE_LLM_FIXTURE_PATH` to `tests/baselines/llm_mock.json` (as CI does) so `anki-notes-pipeline run` does not call Bedrock. To refresh fixtures after intentional output changes, run `python tests/baselines/record.py` from the repo root with dev dependencies installed.
