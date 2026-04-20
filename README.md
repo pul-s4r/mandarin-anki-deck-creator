@@ -24,6 +24,8 @@ Download CC-CEDICT (`cedict_ts.u8`) from [MDBG CC-CEDICT](https://www.mdbg.net/c
 anki-notes-pipeline run /path/to/notes.pdf --output out.csv --cedict-path /path/to/cedict_ts.u8
 ```
 
+Recoverable failures (unsupported file type, bad LLM fixture, etc.) print a single `error: …` line on stderr and exit with code 1.
+
 Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, model params via environment (see `anki_deck_generator.config.settings`).
 
 ## Debug logging helper

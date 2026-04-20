@@ -1,4 +1,4 @@
-"""Structured errors for the pipeline (Epic A: base + ingest; expanded in A4)."""
+"""Structured errors for the pipeline."""
 
 
 class AnkiPipelineError(Exception):
@@ -7,4 +7,16 @@ class AnkiPipelineError(Exception):
 
 class IngestError(AnkiPipelineError):
     """Invalid or unsupported input (files, formats, dictionary text)."""
+
+
+class LlmError(AnkiPipelineError):
+    """LLM invocation, parsing, or fixture replay failures."""
+
+
+class IntegrationError(AnkiPipelineError):
+    """Third-party source or integration failures."""
+
+
+class AuthenticationError(IntegrationError):
+    """Authentication or authorization failures for an integration."""
 

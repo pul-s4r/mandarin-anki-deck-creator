@@ -9,6 +9,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 
+from anki_deck_generator.errors import LlmError
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ class FixtureLlmModel:
         raw_cards = self._data.chunks.get(key)
         if raw_cards is None:
             snippet = chunk_text[:120].replace("\n", "\\n")
-            raise ValueError(
+            raise LlmError(
                 f"LLM fixture missing chunk key {key!r} (snippet={snippet!r}). "
                 "Regenerate tests/baselines/llm_mock.json with tests/baselines/record.py."
             )
