@@ -1,0 +1,2 @@
+tests/baselines/outputs/*.csv binary
+tests/baselines/inputs/*.pdf binary

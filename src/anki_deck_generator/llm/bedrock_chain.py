@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
 
 from anki_deck_generator.config.settings import Settings
+from anki_deck_generator.llm.fixture_player import FixtureLlmModel
 from anki_deck_generator.llm.schemas import (
     LlmTranslationBatch,
     LlmVocabularyItem,
@@ -57,7 +58,10 @@ JSON Schema for your response (conform exactly):
 """
 
 
-def build_bedrock_model(settings: Settings) -> ChatBedrockConverse:
+def build_bedrock_model(settings: Settings) -> ChatBedrockConverse | FixtureLlmModel:
+    fp = settings.llm_fixture_path
+    if fp is not None and fp.is_file():
+        return FixtureLlmModel.from_path(fp)
     kwargs: dict[str, Any] = {
         "model_id": settings.bedrock_model_id,
         "temperature": settings.bedrock_temperature,
@@ -70,7 +74,11 @@ def build_bedrock_model(settings: Settings) -> ChatBedrockConverse:
     return ChatBedrockConverse(**kwargs)
 
 
-def extract_vocabulary_from_chunk(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
+def extract_vocabulary_from_chunk(
+    model: ChatBedrockConverse | FixtureLlmModel, chunk_text: str
+) -> list[LlmVocabularyItem]:
+    if isinstance(model, FixtureLlmModel):
+        return model.vocabulary_for_chunk(chunk_text)
     # NOTE: Bedrock structured output can be brittle across models and releases.
     # We always use an explicit JSON-only response contract and validate locally.
     return _fallback_json_invoke(model, chunk_text)
@@ -123,7 +131,9 @@ def _extract_first_json_object(text: str) -> str | None:
     return None
 
 
-def translate_simplified_terms(model: ChatBedrockConverse, terms: list[str]) -> dict[str, str]:
+def translate_simplified_terms(
+    model: ChatBedrockConverse | FixtureLlmModel, terms: list[str]
+) -> dict[str, str]:
     cleaned = [t.strip() for t in terms if t.strip()]
     if not cleaned:
         return {}
@@ -134,6 +144,9 @@ def translate_simplified_terms(model: ChatBedrockConverse, terms: list[str]) -> 
         if t not in seen:
             seen.add(t)
             uniq.append(t)
+
+    if isinstance(model, FixtureLlmModel):
+        return model.translations_for_terms(uniq)
 
     human = _TRANSLATION_USER_TEMPLATE.format(
         terms="\n".join(uniq),
