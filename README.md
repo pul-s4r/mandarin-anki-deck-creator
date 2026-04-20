@@ -26,7 +26,7 @@ anki-notes-pipeline run /path/to/notes.pdf --output out.csv --cedict-path /path/
 
 Recoverable failures (unsupported file type, bad LLM fixture, etc.) print a single `error: …` line on stderr and exit with code 1.
 
-Library callers can invoke `run_pipeline_from_text` (pure text in → `PipelineResult` out) and keep filesystem/HTTP concerns in the caller; the CLI continues to use `run_pipeline` on paths.
+Library callers can invoke `run_pipeline_from_text` (pure text in → `PipelineResult` out) and keep filesystem/HTTP concerns in the caller; the CLI continues to use `run_pipeline` on paths. CSV bytes are produced through the `Exporter` protocol (`export/exporters.py`) so additional targets (XLSX, AnkiConnect, etc.) can follow the same shape later.
 
 Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, model params via environment (see `anki_deck_generator.config.settings`).
 
