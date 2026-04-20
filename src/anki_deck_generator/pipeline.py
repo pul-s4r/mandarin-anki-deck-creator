@@ -15,8 +15,7 @@ from anki_deck_generator.dictionary.enrich import (
 )
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
-from anki_deck_generator.export.csv_writer import write_vocabulary_csv
-from anki_deck_generator.export.sentence_links import SentenceLinkRow, write_sentence_links_csv
+from anki_deck_generator.export.sentence_links import SentenceLinkRow
 from anki_deck_generator.ingest.router import extract_text_from_bytes, extract_text_from_path
 from anki_deck_generator.linking.sentence_assign import choose_winner_key, find_candidate_matches
 from anki_deck_generator.linking.term_index import TermIndex, load_term_index_from_prior_csv
@@ -298,6 +297,8 @@ def run_pipeline(
     output_csv: Path,
     settings: Settings,
 ) -> None:
+    from anki_deck_generator.export.exporters import SentenceLinksCsvExporter, VocabularyCsvExporter
+
     fmt = _suffix_to_format(input_path.suffix)
     if fmt is None:
         # Delegate to extract_text_from_path for consistent IngestError message
@@ -306,7 +307,8 @@ def run_pipeline(
         text = extract_text_from_bytes(input_path.read_bytes(), format=fmt)
     result = run_pipeline_from_text(text, settings)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    write_vocabulary_csv(output_csv, result.rows, bom=settings.csv_bom)
+    output_csv.write_bytes(VocabularyCsvExporter(bom=settings.csv_bom).export(result))
     if result.sentence_links:
         sidecar_path = settings.sentence_links_csv or (output_csv.parent / "sentence_links.csv")
-        write_sentence_links_csv(sidecar_path, result.sentence_links)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_bytes(SentenceLinksCsvExporter().export(result))
