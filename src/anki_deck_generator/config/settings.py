@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def default_state_db_path() -> Path:
+    base = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    return Path(base).expanduser() / "anki-notes-pipeline" / "state.db"
 
 
 class Settings(BaseSettings):
@@ -56,3 +62,10 @@ class Settings(BaseSettings):
     sentence_random_seed: Optional[int] = None
     sentences_per_term: int = 1
     sentences_delimiter: str = " | "
+
+    state_backend: Literal["none", "sqlite"] = "none"
+    state_db_path: Optional[Path] = None
+    source_set_config: Optional[Path] = Field(
+        default=None,
+        description="YAML file defining source_sets (env: ANKI_PIPELINE_SOURCE_SET_CONFIG)",
+    )
