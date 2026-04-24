@@ -108,7 +108,9 @@ def main() -> None:
         chunks_payload[h] = [_CARD.model_dump()]
 
     LLM_MOCK.write_text(
-        json.dumps({"chunks": chunks_payload, "translations": {}}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {"chunks": chunks_payload, "translations": {}}, ensure_ascii=False, indent=2
+        ),
         encoding="utf-8",
     )
 
