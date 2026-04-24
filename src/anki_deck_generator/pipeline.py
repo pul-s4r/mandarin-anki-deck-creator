@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from anki_deck_generator.config.settings import Settings
@@ -13,9 +15,8 @@ from anki_deck_generator.dictionary.enrich import (
 )
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
-from anki_deck_generator.export.csv_writer import write_vocabulary_csv
-from anki_deck_generator.export.sentence_links import SentenceLinkRow, write_sentence_links_csv
-from anki_deck_generator.ingest.router import extract_text_from_path
+from anki_deck_generator.export.sentence_links import SentenceLinkRow
+from anki_deck_generator.ingest.router import extract_text_from_bytes, extract_text_from_path
 from anki_deck_generator.linking.sentence_assign import choose_winner_key, find_candidate_matches
 from anki_deck_generator.linking.term_index import TermIndex, load_term_index_from_prior_csv
 from anki_deck_generator.llm.bedrock_chain import (
@@ -31,6 +32,25 @@ from anki_deck_generator.preprocess.sentences import extract_dialogue_sentences
 from anki_deck_generator.preprocess.tables import parse_table_block
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PipelineStats:
+    block_count: int
+    chunk_count: int
+    raw_card_count: int
+    deduped_card_count: int
+    enriched_count: int
+    llm_translation_fallback_count: int
+    decomposition_fallback_count: int
+    sentence_link_count: int
+
+
+@dataclass
+class PipelineResult:
+    rows: list[VocabularyRow]
+    sentence_links: list[SentenceLinkRow]
+    stats: PipelineStats
 
 
 def _dedupe_cards(cards: list[LlmVocabularyItem]) -> list[LlmVocabularyItem]:
@@ -59,22 +79,61 @@ def _llm_item_to_row(item: LlmVocabularyItem, key: int) -> VocabularyRow:
     )
 
 
-def run_pipeline(
-    input_path: Path,
-    output_csv: Path,
+def _suffix_to_format(suffix: str) -> str | None:
+    s = suffix.lower()
+    if s == ".pdf":
+        return "pdf"
+    if s in {".md", ".markdown"}:
+        return "markdown"
+    if s == ".docx":
+        return "docx"
+    return None
+
+
+def run_pipeline_from_text(
+    text: str,
     settings: Settings,
-) -> None:
-    text = extract_text_from_path(input_path)
+    *,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> PipelineResult:
+    """Core pipeline: normalized note text in → rows (+ optional sentence links) out. No filesystem I/O."""
     text = normalize_unicode(text)
     text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
+    if progress_callback:
+        progress_callback("normalize", 1, 1)
+
     model = build_bedrock_model(settings)
 
     blocks = segment_table_blocks(text)
+    text_chunk_lists: list[list[str]] = []
+    table_llm_fallbacks = 0
+    for block in blocks:
+        if block.kind == "table":
+            parsed = parse_table_block(block.text)
+            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
+            if needs_fallback:
+                table_llm_fallbacks += 1
+            continue
+        text_chunk_lists.append(
+            chunk_text(block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+        )
+
+    total_chunks = sum(len(cl) for cl in text_chunk_lists) + table_llm_fallbacks
+    chunk_cursor = 0
+
+    def _chunk_llm_progress() -> None:
+        nonlocal chunk_cursor
+        if not progress_callback or total_chunks <= 0:
+            return
+        chunk_cursor += 1
+        progress_callback("chunk", chunk_cursor, total_chunks)
+        progress_callback("llm", chunk_cursor, total_chunks)
+
     all_cards: list[LlmVocabularyItem] = []
+    text_block_idx = 0
     for b_idx, block in enumerate(blocks):
         if block.kind == "table":
             parsed = parse_table_block(block.text)
-            # LLM fallback when we fail to extract meaningful rows or there is significant noise.
             needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
             all_cards.extend(parsed.cards)
             if needs_fallback:
@@ -85,14 +144,12 @@ def run_pipeline(
                     len(block.text.splitlines()),
                     len(parsed.cards),
                 )
+                _chunk_llm_progress()
                 all_cards.extend(extract_vocabulary_from_chunk(model, block.text))
             continue
 
-        chunks = chunk_text(
-            block.text,
-            chunk_size=settings.chunk_size,
-            overlap=settings.chunk_overlap,
-        )
+        chunks = text_chunk_lists[text_block_idx]
+        text_block_idx += 1
         for i, chunk in enumerate(chunks):
             logger.info(
                 "Processing text block %s/%s chunk %s/%s (%s chars)",
@@ -102,12 +159,15 @@ def run_pipeline(
                 len(chunks),
                 len(chunk),
             )
-            cards = extract_vocabulary_from_chunk(model, chunk)
-            all_cards.extend(cards)
+            _chunk_llm_progress()
+            all_cards.extend(extract_vocabulary_from_chunk(model, chunk))
+
+    raw_card_count = len(all_cards)
     deduped = _dedupe_cards(all_cards)
     rows = [_llm_item_to_row(c, k + 1) for k, c in enumerate(deduped)]
 
     enricher: EnrichmentService | None = None
+    enriched_count = 0
     if settings.cedict_path and settings.cedict_path.is_file():
         source = FileLineDictionarySource(settings.cedict_path)
         index = DictionaryIndex.from_source(source)
@@ -116,12 +176,16 @@ def run_pipeline(
             force_overwrite=settings.cedict_force_overwrite,
             enable_decomposition_fallback=settings.enable_decomposition_fallback,
         )
-        # Exact headword fill only; fallback order is handled below.
+        before = [(r.meaning, r.pinyin, r.traditional) for r in rows]
         rows = [enricher.enrich_row(r) for r in rows]
+        after = [(r.meaning, r.pinyin, r.traditional) for r in rows]
+        enriched_count = sum(1 for b, a in zip(before, after, strict=True) if b != a)
+        if progress_callback:
+            progress_callback("enrich", 1, 1)
     else:
         logger.warning("No CEDICT path provided or file missing; skipping dictionary enrichment")
 
-    # Default fallback: LLM translation first (more accurate).
+    llm_translation_fallback_count = 0
     if settings.enable_llm_translation_fallback:
         missing_terms: list[str] = []
         for r in rows:
@@ -132,6 +196,8 @@ def run_pipeline(
                 missing_terms.append(t)
         uniq_terms = list(dict.fromkeys(missing_terms))
         if uniq_terms:
+            if progress_callback:
+                progress_callback("llm_translation_fallback", 1, 1)
             try:
                 translations = translate_simplified_terms(model, uniq_terms)
             except Exception:
@@ -146,26 +212,33 @@ def run_pipeline(
                     continue
                 r.meaning = eng
                 append_usage_note(r, LLM_TRANSLATION_SOURCE_NOTE)
+                llm_translation_fallback_count += 1
 
-    # Secondary fallback: CEDICT decomposition for anything still missing.
+    decomposition_fallback_count = 0
     if enricher is not None and settings.enable_decomposition_fallback:
+        if progress_callback:
+            progress_callback("decomposition_fallback", 1, 1)
         for r in rows:
             if not is_unknown_translation(r.meaning):
                 continue
+            before_m = r.meaning
             enricher.apply_decomposition_to_row(r)
+            if r.meaning != before_m and not is_unknown_translation(r.meaning):
+                decomposition_fallback_count += 1
 
+    sentence_links: list[SentenceLinkRow] = []
     if settings.enable_sentences:
+        if progress_callback:
+            progress_callback("sentence_link", 1, 1)
         term_index = TermIndex.from_rows(rows)
         if settings.prior_csv and settings.prior_csv.is_file():
             term_index.merge(load_term_index_from_prior_csv(settings.prior_csv))
 
         all_terms = term_index.all_terms()
-        # Best effort: longer terms first tends to reduce match noise.
         all_terms.sort(key=len, reverse=True)
 
         extracted = extract_dialogue_sentences(text)
         by_key: dict[int, list[str]] = {}
-        sidecar_rows: list[SentenceLinkRow] = []
 
         for s_idx, s in enumerate(extracted, start=1):
             candidates = find_candidate_matches(s.text, all_terms)
@@ -180,7 +253,7 @@ def run_pipeline(
                 continue
             by_key.setdefault(linked_key, []).append(s.text)
             match_debug = ",".join(f"{m.term}@{m.start}" for m in candidates)
-            sidecar_rows.append(
+            sentence_links.append(
                 SentenceLinkRow(
                     sentence_id=str(s_idx),
                     sentence_simplified=s.text,
@@ -193,7 +266,6 @@ def run_pipeline(
                 )
             )
 
-        # Merge into main rows
         max_n = max(0, int(settings.sentences_per_term))
         delim = settings.sentences_delimiter
         if max_n > 0:
@@ -204,8 +276,39 @@ def run_pipeline(
                 chosen = sents[:max_n]
                 r.sentence_simplified = delim.join(chosen)
 
-        # Write sidecar
-        sidecar_path = settings.sentence_links_csv or (output_csv.parent / "sentence_links.csv")
-        write_sentence_links_csv(sidecar_path, sidecar_rows)
+    if progress_callback:
+        progress_callback("export", 1, 1)
 
-    write_vocabulary_csv(output_csv, rows, bom=settings.csv_bom)
+    stats = PipelineStats(
+        block_count=len(blocks),
+        chunk_count=total_chunks,
+        raw_card_count=raw_card_count,
+        deduped_card_count=len(deduped),
+        enriched_count=enriched_count,
+        llm_translation_fallback_count=llm_translation_fallback_count,
+        decomposition_fallback_count=decomposition_fallback_count,
+        sentence_link_count=len(sentence_links),
+    )
+    return PipelineResult(rows=rows, sentence_links=sentence_links, stats=stats)
+
+
+def run_pipeline(
+    input_path: Path,
+    output_csv: Path,
+    settings: Settings,
+) -> None:
+    from anki_deck_generator.export.exporters import SentenceLinksCsvExporter, VocabularyCsvExporter
+
+    fmt = _suffix_to_format(input_path.suffix)
+    if fmt is None:
+        # Delegate to extract_text_from_path for consistent IngestError message
+        text = extract_text_from_path(input_path)
+    else:
+        text = extract_text_from_bytes(input_path.read_bytes(), format=fmt)
+    result = run_pipeline_from_text(text, settings)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    output_csv.write_bytes(VocabularyCsvExporter(bom=settings.csv_bom).export(result))
+    if result.sentence_links:
+        sidecar_path = settings.sentence_links_csv or (output_csv.parent / "sentence_links.csv")
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_bytes(SentenceLinksCsvExporter().export(result))
