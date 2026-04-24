@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     output_csv: Optional[Path] = None
     cedict_path: Optional[Path] = None
 
+    llm_fixture_path: Optional[Path] = Field(
+        default=None,
+        description="If set, load LLM responses from this JSON file instead of calling Bedrock (env: ANKI_PIPELINE_LLM_FIXTURE_PATH)",
+    )
+
     enable_sentences: bool = True
     prior_csv: Optional[Path] = None
     sentence_links_csv: Optional[Path] = None

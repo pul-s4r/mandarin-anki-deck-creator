@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from anki_deck_generator.config.settings import Settings
+from anki_deck_generator.errors import AnkiPipelineError
 from anki_deck_generator.pipeline import run_pipeline
 
 
@@ -114,7 +115,11 @@ def main(argv: list[str] | None = None) -> int:
             settings.cedict_path = args.cedict_path
         if args.cedict_force_overwrite:
             settings.cedict_force_overwrite = True
-        run_pipeline(args.input.resolve(), args.output.resolve(), settings)
+        try:
+            run_pipeline(args.input.resolve(), args.output.resolve(), settings)
+        except AnkiPipelineError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         return 0
     return 1
 
