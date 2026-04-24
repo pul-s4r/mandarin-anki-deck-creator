@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from anki_deck_generator.errors import IngestError
-from anki_deck_generator.ingest.router import extract_text_from_bytes, extract_text_from_path
+from anki_deck_generator.ingest.router import (
+    extract_text_from_bytes,
+    extract_text_from_path,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _BASELINE_INPUTS = _REPO / "tests" / "baselines" / "inputs"
@@ -32,7 +35,9 @@ def test_extract_text_from_bytes_unknown_format() -> None:
         ("sample.pdf", "pdf"),
     ],
 )
-def test_extract_text_from_bytes_matches_path_baseline_inputs(rel: str, fmt: str) -> None:
+def test_extract_text_from_bytes_matches_path_baseline_inputs(
+    rel: str, fmt: str
+) -> None:
     p = _BASELINE_INPUTS / rel
     if not p.is_file():
         pytest.skip(f"missing {p}")

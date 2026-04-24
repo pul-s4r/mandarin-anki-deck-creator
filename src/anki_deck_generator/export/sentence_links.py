@@ -53,4 +53,3 @@ def sentence_links_csv_bytes(rows: list[SentenceLinkRow]) -> bytes:
 def write_sentence_links_csv(path: Path, rows: list[SentenceLinkRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(sentence_links_csv_bytes(rows))
-

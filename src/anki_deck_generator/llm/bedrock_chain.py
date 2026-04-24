@@ -84,7 +84,9 @@ def extract_vocabulary_from_chunk(
     return _fallback_json_invoke(model, chunk_text)
 
 
-def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
+def _fallback_json_invoke(
+    model: ChatBedrockConverse, chunk_text: str
+) -> list[LlmVocabularyItem]:
     human = _USER_TEMPLATE.format(chunk_text=chunk_text)
     human += (
         "\n\nJSON Schema for your response (conform exactly; property descriptions are authoritative):\n"
@@ -105,7 +107,9 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
         try:
             data = json.loads(recovered)
         except json.JSONDecodeError:
-            logger.error("JSON fallback recovery parse failed; snippet=%s", recovered[:200])
+            logger.error(
+                "JSON fallback recovery parse failed; snippet=%s", recovered[:200]
+            )
             return []
     try:
         result = LlmVocabularyResult.model_validate(data)
@@ -152,7 +156,10 @@ def translate_simplified_terms(
         terms="\n".join(uniq),
         schema=llm_translation_batch_json_schema_text(),
     )
-    messages = [SystemMessage(content=_TRANSLATION_SYSTEM_PROMPT), HumanMessage(content=human)]
+    messages = [
+        SystemMessage(content=_TRANSLATION_SYSTEM_PROMPT),
+        HumanMessage(content=human),
+    ]
     raw = model.invoke(messages)
     text = _message_content_to_text(raw.content)
     text = _FENCE.sub("", text).strip()
@@ -166,7 +173,9 @@ def translate_simplified_terms(
         try:
             data = json.loads(recovered)
         except json.JSONDecodeError:
-            logger.error("Translation JSON recovery parse failed; snippet=%s", recovered[:200])
+            logger.error(
+                "Translation JSON recovery parse failed; snippet=%s", recovered[:200]
+            )
             return {}
     try:
         batch = LlmTranslationBatch.model_validate(data)

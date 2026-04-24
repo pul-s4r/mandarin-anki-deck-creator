@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 
 from anki_deck_generator.dictionary.enrich import VocabularyRow
-from anki_deck_generator.export.csv_writer import vocabulary_csv_bytes, write_vocabulary_csv
+from anki_deck_generator.export.csv_writer import (
+    vocabulary_csv_bytes,
+    write_vocabulary_csv,
+)
 
 
 def test_write_csv_headers(tmp_path) -> None:

@@ -29,7 +29,9 @@ class LlmFixtureData:
     def load(cls, path: Path) -> LlmFixtureData:
         raw = json.loads(path.read_text(encoding="utf-8"))
         chunks = {str(k): list(v) for k, v in (raw.get("chunks") or {}).items()}
-        translations = {str(k): str(v) for k, v in (raw.get("translations") or {}).items()}
+        translations = {
+            str(k): str(v) for k, v in (raw.get("translations") or {}).items()
+        }
         return cls(chunks=chunks, translations=translations)
 
 
@@ -73,4 +75,6 @@ class FixtureLlmModel:
 
     def invoke(self, _messages: list[BaseMessage]) -> Any:
         """Not used when fixture path is set; present so accidental use fails loudly."""
-        raise RuntimeError("FixtureLlmModel.invoke should not be called; use vocabulary_for_chunk / translations_for_terms.")
+        raise RuntimeError(
+            "FixtureLlmModel.invoke should not be called; use vocabulary_for_chunk / translations_for_terms."
+        )

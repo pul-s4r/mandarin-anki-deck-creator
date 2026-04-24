@@ -13,14 +13,28 @@ from anki_deck_generator.pipeline import run_pipeline
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="anki-notes-pipeline", description="Chinese notes → Anki vocabulary CSV")
+    p = argparse.ArgumentParser(
+        prog="anki-notes-pipeline", description="Chinese notes → Anki vocabulary CSV"
+    )
     sub = p.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="Run extraction pipeline")
     run.add_argument("input", type=Path, help="Input PDF, Markdown, or DOCX file")
     run.add_argument("--output", "-o", type=Path, required=True, help="Output CSV path")
-    run.add_argument("--cedict-path", type=Path, default=None, help="Path to cedict_ts.u8")
-    run.add_argument("--prior-csv", type=Path, default=None, help="Optional prior exported CSV for term index")
-    run.add_argument("--sentence-links-csv", type=Path, default=None, help="Write sentence_links.csv to this path")
+    run.add_argument(
+        "--cedict-path", type=Path, default=None, help="Path to cedict_ts.u8"
+    )
+    run.add_argument(
+        "--prior-csv",
+        type=Path,
+        default=None,
+        help="Optional prior exported CSV for term index",
+    )
+    run.add_argument(
+        "--sentence-links-csv",
+        type=Path,
+        default=None,
+        help="Write sentence_links.csv to this path",
+    )
     run.add_argument(
         "--enable-sentences",
         dest="enable_sentences",
@@ -39,7 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="When multiple terms match a sentence, pick winner by 'importance' (default) or 'random'",
     )
-    run.add_argument("--sentence-random-seed", type=int, default=None, help="Seed for random sentence assignment")
+    run.add_argument(
+        "--sentence-random-seed",
+        type=int,
+        default=None,
+        help="Seed for random sentence assignment",
+    )
     run.add_argument(
         "--sentences-per-term",
         type=int,
@@ -55,8 +74,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--chunk-size", type=int, default=None)
     run.add_argument("--chunk-overlap", type=int, default=None)
     run.add_argument("--csv-bom", action="store_true", help="Write UTF-8 BOM for Excel")
-    run.add_argument("--no-skip-lines-filter", action="store_true", help="Disable date-only line dropping")
-    run.add_argument("--cedict-force-overwrite", action="store_true", help="Overwrite LLM meaning/pinyin from CEDICT")
+    run.add_argument(
+        "--no-skip-lines-filter",
+        action="store_true",
+        help="Disable date-only line dropping",
+    )
+    run.add_argument(
+        "--cedict-force-overwrite",
+        action="store_true",
+        help="Overwrite LLM meaning/pinyin from CEDICT",
+    )
     run.add_argument(
         "--no-decomposition-fallback",
         dest="enable_decomposition_fallback",
@@ -89,8 +116,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         settings = Settings()
         settings.enable_sentences = bool(args.enable_sentences)
-        settings.enable_decomposition_fallback = bool(args.enable_decomposition_fallback)
-        settings.enable_llm_translation_fallback = bool(args.enable_llm_translation_fallback)
+        settings.enable_decomposition_fallback = bool(
+            args.enable_decomposition_fallback
+        )
+        settings.enable_llm_translation_fallback = bool(
+            args.enable_llm_translation_fallback
+        )
         if args.prior_csv is not None:
             settings.prior_csv = args.prior_csv
         if args.sentence_links_csv is not None:

@@ -55,8 +55,14 @@ def test_bare_venv_install_and_cli_help(tmp_path: Path) -> None:
     py = vdir / "bin" / "python"
     pip = vdir / "bin" / "pip"
     subprocess.run([str(pip), "install", "-q", "."], cwd=REPO_ROOT, check=True)
-    subprocess.run([str(py), "-m", "anki_deck_generator.cli", "--help"], cwd=REPO_ROOT, check=True)
-    subprocess.run([str(py), "-m", "anki_deck_generator.cli", "run", "--help"], cwd=REPO_ROOT, check=True)
+    subprocess.run(
+        [str(py), "-m", "anki_deck_generator.cli", "--help"], cwd=REPO_ROOT, check=True
+    )
+    subprocess.run(
+        [str(py), "-m", "anki_deck_generator.cli", "run", "--help"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
 
 def test_package_import_does_not_resolve_blocked_optional_deps() -> None:

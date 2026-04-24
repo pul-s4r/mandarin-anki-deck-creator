@@ -47,6 +47,8 @@ def vocabulary_csv_bytes(rows: list[VocabularyRow], *, bom: bool = False) -> byt
     return body
 
 
-def write_vocabulary_csv(path: Path, rows: list[VocabularyRow], *, bom: bool = False) -> None:
+def write_vocabulary_csv(
+    path: Path, rows: list[VocabularyRow], *, bom: bool = False
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(vocabulary_csv_bytes(rows, bom=bom))

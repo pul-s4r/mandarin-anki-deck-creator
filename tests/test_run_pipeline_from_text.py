@@ -45,7 +45,9 @@ def test_run_pipeline_from_text_rows_and_progress_order(
     cedict = tmp_path / "cedict.u8"
     cedict.write_text("的 的 [de5] /possessive particle/\n", encoding="utf-8")
     text = "1. 的 de - possessive\n"
-    settings = Settings(cedict_path=cedict, skip_lines_filter=False, enable_sentences=False)
+    settings = Settings(
+        cedict_path=cedict, skip_lines_filter=False, enable_sentences=False
+    )
     result = run_pipeline_from_text(text, settings, progress_callback=cb)
 
     assert len(result.rows) == 1

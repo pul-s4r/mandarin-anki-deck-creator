@@ -16,9 +16,18 @@ from anki_deck_generator.dictionary.enrich import (
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
 from anki_deck_generator.export.sentence_links import SentenceLinkRow
-from anki_deck_generator.ingest.router import extract_text_from_bytes, extract_text_from_path
-from anki_deck_generator.linking.sentence_assign import choose_winner_key, find_candidate_matches
-from anki_deck_generator.linking.term_index import TermIndex, load_term_index_from_prior_csv
+from anki_deck_generator.ingest.router import (
+    extract_text_from_bytes,
+    extract_text_from_path,
+)
+from anki_deck_generator.linking.sentence_assign import (
+    choose_winner_key,
+    find_candidate_matches,
+)
+from anki_deck_generator.linking.term_index import (
+    TermIndex,
+    load_term_index_from_prior_csv,
+)
 from anki_deck_generator.llm.bedrock_chain import (
     build_bedrock_model,
     extract_vocabulary_from_chunk,
@@ -27,7 +36,10 @@ from anki_deck_generator.llm.bedrock_chain import (
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
-from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
+from anki_deck_generator.preprocess.normalize import (
+    normalize_unicode,
+    optional_drop_metadata_lines,
+)
 from anki_deck_generator.preprocess.sentences import extract_dialogue_sentences
 from anki_deck_generator.preprocess.tables import parse_table_block
 
@@ -110,12 +122,18 @@ def run_pipeline_from_text(
     for block in blocks:
         if block.kind == "table":
             parsed = parse_table_block(block.text)
-            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
+            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(
+                3, len(parsed.cards)
+            )
             if needs_fallback:
                 table_llm_fallbacks += 1
             continue
         text_chunk_lists.append(
-            chunk_text(block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+            chunk_text(
+                block.text,
+                chunk_size=settings.chunk_size,
+                overlap=settings.chunk_overlap,
+            )
         )
 
     total_chunks = sum(len(cl) for cl in text_chunk_lists) + table_llm_fallbacks
@@ -134,7 +152,9 @@ def run_pipeline_from_text(
     for b_idx, block in enumerate(blocks):
         if block.kind == "table":
             parsed = parse_table_block(block.text)
-            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
+            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(
+                3, len(parsed.cards)
+            )
             all_cards.extend(parsed.cards)
             if needs_fallback:
                 logger.info(
@@ -183,7 +203,9 @@ def run_pipeline_from_text(
         if progress_callback:
             progress_callback("enrich", 1, 1)
     else:
-        logger.warning("No CEDICT path provided or file missing; skipping dictionary enrichment")
+        logger.warning(
+            "No CEDICT path provided or file missing; skipping dictionary enrichment"
+        )
 
     llm_translation_fallback_count = 0
     if settings.enable_llm_translation_fallback:
@@ -297,7 +319,10 @@ def run_pipeline(
     output_csv: Path,
     settings: Settings,
 ) -> None:
-    from anki_deck_generator.export.exporters import SentenceLinksCsvExporter, VocabularyCsvExporter
+    from anki_deck_generator.export.exporters import (
+        SentenceLinksCsvExporter,
+        VocabularyCsvExporter,
+    )
 
     fmt = _suffix_to_format(input_path.suffix)
     if fmt is None:
@@ -309,6 +334,8 @@ def run_pipeline(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     output_csv.write_bytes(VocabularyCsvExporter(bom=settings.csv_bom).export(result))
     if result.sentence_links:
-        sidecar_path = settings.sentence_links_csv or (output_csv.parent / "sentence_links.csv")
+        sidecar_path = settings.sentence_links_csv or (
+            output_csv.parent / "sentence_links.csv"
+        )
         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         sidecar_path.write_bytes(SentenceLinksCsvExporter().export(result))

@@ -19,4 +19,3 @@ class IntegrationError(AnkiPipelineError):
 
 class AuthenticationError(IntegrationError):
     """Authentication or authorization failures for an integration."""
-
