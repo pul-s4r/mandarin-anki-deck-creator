@@ -21,7 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyyaml>=6"]
+sync = ["pyyaml>=6"]
 server = []
 ankiweb = []
 xlsx = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -75,7 +76,54 @@ def _build_parser() -> argparse.ArgumentParser:
         enable_llm_translation_fallback=True,
     )
     run.add_argument("-v", "--verbose", action="store_true")
+
+    st = sub.add_parser("state", help="Manage local SQLite state database")
+    st_sub = st.add_subparsers(dest="state_command", required=True)
+    st_init = st_sub.add_parser("init", help="Create state database and schema")
+    st_init.add_argument("--db-path", type=Path, required=True)
+    st_list = st_sub.add_parser("list-cards", help="List vocabulary cards in state")
+    st_list.add_argument("--db-path", type=Path, required=True)
+    st_runs = st_sub.add_parser("list-runs", help="List recent sync runs")
+    st_runs.add_argument("--db-path", type=Path, required=True)
+
+    sched = sub.add_parser("schedule", help="Run incremental sync for a configured source set")
+    sched.add_argument("--source-set", type=str, required=True, help="Name of the source set in the YAML config")
+    sched.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+    sched.add_argument(
+        "--source-set-config",
+        type=Path,
+        default=None,
+        help="YAML file (default: ANKI_PIPELINE_SOURCE_SET_CONFIG)",
+    )
+    sched.add_argument("--output", "-o", type=Path, required=True, help="Export vocabulary CSV path")
+    sched.add_argument("--cedict-path", type=Path, default=None)
+    sched.add_argument("--llm-fixture-path", type=Path, default=None, help="Deterministic LLM fixture JSON (tests)")
+    sched.add_argument("--chunk-size", type=int, default=None)
+    sched.add_argument("--chunk-overlap", type=int, default=None)
+    sched.add_argument("--csv-bom", action="store_true")
+    sched.add_argument("--no-skip-lines-filter", action="store_true")
+    sched.add_argument("--disable-sentences", dest="enable_sentences", action="store_false")
+    sched.set_defaults(enable_sentences=False)
+    sched.add_argument("-v", "--verbose", action="store_true")
+
     return p
+
+
+def _apply_run_like_settings(settings: Settings, args: argparse.Namespace) -> None:
+    if getattr(args, "cedict_path", None) is not None:
+        settings.cedict_path = args.cedict_path
+    if getattr(args, "chunk_size", None) is not None:
+        settings.chunk_size = args.chunk_size
+    if getattr(args, "chunk_overlap", None) is not None:
+        settings.chunk_overlap = args.chunk_overlap
+    if getattr(args, "csv_bom", False):
+        settings.csv_bom = True
+    if getattr(args, "no_skip_lines_filter", False):
+        settings.skip_lines_filter = False
+    if getattr(args, "llm_fixture_path", None) is not None:
+        settings.llm_fixture_path = args.llm_fixture_path
+    if hasattr(args, "enable_sentences"):
+        settings.enable_sentences = bool(args.enable_sentences)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
     if args.command == "run":
@@ -103,24 +151,92 @@ def main(argv: list[str] | None = None) -> int:
             settings.sentences_per_term = args.sentences_per_term
         if args.sentences_delimiter is not None:
             settings.sentences_delimiter = args.sentences_delimiter
-        if args.chunk_size is not None:
-            settings.chunk_size = args.chunk_size
-        if args.chunk_overlap is not None:
-            settings.chunk_overlap = args.chunk_overlap
-        if args.csv_bom:
-            settings.csv_bom = True
-        if args.no_skip_lines_filter:
-            settings.skip_lines_filter = False
-        if args.cedict_path is not None:
-            settings.cedict_path = args.cedict_path
+        _apply_run_like_settings(settings, args)
         if args.cedict_force_overwrite:
             settings.cedict_force_overwrite = True
+        if not args.enable_decomposition_fallback:
+            settings.enable_decomposition_fallback = False
+        if not args.enable_llm_translation_fallback:
+            settings.enable_llm_translation_fallback = False
         try:
             run_pipeline(args.input.resolve(), args.output.resolve(), settings)
         except AnkiPipelineError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         return 0
+
+    if args.command == "state":
+        from anki_deck_generator.state.sqlite_store import SqliteStateStore
+
+        db = Path(args.db_path).resolve()
+        if args.state_command == "init":
+            store = SqliteStateStore(db)
+            store.init_schema()
+            store.close()
+            print(f"initialized state database at {db}")
+            return 0
+        if args.state_command == "list-cards":
+            store = SqliteStateStore(db)
+            try:
+                rows = list(store.iter_all_cards())
+            finally:
+                store.close()
+            if not rows:
+                print("(no cards)")
+                return 0
+            for r in rows:
+                m = (r.meaning or "")[:48]
+                print(f"{r.simplified}\t{r.card_id[:8]}…\t{m}")
+            return 0
+        if args.state_command == "list-runs":
+            store = SqliteStateStore(db)
+            try:
+                runs = list(store.iter_runs(limit=50))
+            finally:
+                store.close()
+            if not runs:
+                print("(no runs)")
+                return 0
+            for rr in runs:
+                print(f"{rr.run_id}\t{rr.trigger}\t{rr.started_at}\tjson_bytes={len(rr.sync_report_json)}")
+            return 0
+
+    if args.command == "schedule":
+        from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
+        from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
+        from anki_deck_generator.state.sqlite_store import SqliteStateStore
+        from anki_deck_generator.sync.orchestrator import run_incremental_sync
+
+        settings = Settings()
+        if args.source_set_config is not None:
+            settings.source_set_config = args.source_set_config
+        cfg_path = settings.source_set_config
+        if cfg_path is None:
+            print("error: pass --source-set-config or set ANKI_PIPELINE_SOURCE_SET_CONFIG", file=sys.stderr)
+            return 1
+        _apply_run_like_settings(settings, args)
+        settings.state_backend = "sqlite"
+        settings.state_db_path = Path(args.state_db).resolve()
+
+        store = SqliteStateStore(settings.state_db_path)
+        store.init_schema()
+        try:
+            sets = load_source_sets_yaml(Path(cfg_path).resolve())
+            sset = pick_source_set(sets, args.source_set)
+            report = run_incremental_sync(
+                sset,
+                settings=settings,
+                state_store=store,
+                exporters=[VocabularyCsvFileExporter(output_path=Path(args.output).resolve(), bom=settings.csv_bom)],
+            )
+        except AnkiPipelineError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            store.close()
+        print(json.dumps(report.to_jsonable(), indent=2))
+        return 0
+
     return 1
 
 

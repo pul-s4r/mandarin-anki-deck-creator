@@ -27,6 +27,7 @@ from anki_deck_generator.llm.bedrock_chain import (
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
+from anki_deck_generator.preprocess.fingerprints import sha256_utf8
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
 from anki_deck_generator.preprocess.sentences import extract_dialogue_sentences
 from anki_deck_generator.preprocess.tables import parse_table_block
@@ -67,6 +68,11 @@ def _dedupe_cards(cards: list[LlmVocabularyItem]) -> list[LlmVocabularyItem]:
     return list(by.values())
 
 
+def dedupe_llm_items(cards: list[LlmVocabularyItem]) -> list[LlmVocabularyItem]:
+    """Deduplicate LLM vocabulary items by simplified form (longest meaning wins)."""
+    return _dedupe_cards(cards)
+
+
 def _llm_item_to_row(item: LlmVocabularyItem, key: int) -> VocabularyRow:
     return VocabularyRow(
         key=key,
@@ -90,20 +96,27 @@ def _suffix_to_format(suffix: str) -> str | None:
     return None
 
 
-def run_pipeline_from_text(
+def extract_llm_vocabulary_items(
     text: str,
     settings: Settings,
     *,
+    model: object,
     progress_callback: Callable[[str, int, int], None] | None = None,
-) -> PipelineResult:
-    """Core pipeline: normalized note text in → rows (+ optional sentence links) out. No filesystem I/O."""
-    text = normalize_unicode(text)
-    text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
-    if progress_callback:
-        progress_callback("normalize", 1, 1)
+    should_run_llm: Callable[[int, str], bool] | None = None,
+    load_cached_chunk_cards: Callable[[int], list[LlmVocabularyItem]] | None = None,
+    on_chunk_processed: Callable[[int, str, list[LlmVocabularyItem]], None] | None = None,
+) -> tuple[list[LlmVocabularyItem], int, int, int]:
+    """
+    Run LLM extraction over segmented/chunked text.
 
-    model = build_bedrock_model(settings)
+    ``text`` must already be Unicode-normalized and optionally metadata-filtered.
 
+    ``chunk_seq`` counts each LLM-eligible unit in document order (text chunks + table fallbacks).
+
+    When ``should_run_llm`` is None, every chunk is processed (same behavior as a full pipeline run).
+
+    Returns ``(all_cards, total_llm_chunks, chunks_processed, chunks_skipped)``.
+    """
     blocks = segment_table_blocks(text)
     text_chunk_lists: list[list[str]] = []
     table_llm_fallbacks = 0
@@ -131,36 +144,91 @@ def run_pipeline_from_text(
 
     all_cards: list[LlmVocabularyItem] = []
     text_block_idx = 0
+    chunk_seq = 0
+    chunks_processed = 0
+    chunks_skipped = 0
+
     for b_idx, block in enumerate(blocks):
         if block.kind == "table":
             parsed = parse_table_block(block.text)
             needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
             all_cards.extend(parsed.cards)
             if needs_fallback:
+                sha = sha256_utf8(block.text)
+                run_llm = should_run_llm is None or should_run_llm(chunk_seq, sha)
                 logger.info(
-                    "Table block %s/%s ambiguous; running LLM fallback (%s lines, %s parsed rows)",
+                    "Processing table block %s/%s LLM fallback (%s chars) seq=%s run_llm=%s",
                     b_idx + 1,
                     len(blocks),
-                    len(block.text.splitlines()),
-                    len(parsed.cards),
+                    len(block.text),
+                    chunk_seq,
+                    run_llm,
                 )
-                _chunk_llm_progress()
-                all_cards.extend(extract_vocabulary_from_chunk(model, block.text))
+                if run_llm:
+                    _chunk_llm_progress()
+                    items = extract_vocabulary_from_chunk(model, block.text)
+                    all_cards.extend(items)
+                    chunks_processed += 1
+                    if on_chunk_processed is not None:
+                        on_chunk_processed(chunk_seq, sha, items)
+                else:
+                    if load_cached_chunk_cards is None:
+                        raise ValueError("load_cached_chunk_cards required when skipping LLM")
+                    cached = load_cached_chunk_cards(chunk_seq)
+                    all_cards.extend(cached)
+                    chunks_skipped += 1
+                    if on_chunk_processed is not None:
+                        on_chunk_processed(chunk_seq, sha, cached)
+                chunk_seq += 1
             continue
 
         chunks = text_chunk_lists[text_block_idx]
         text_block_idx += 1
         for i, chunk in enumerate(chunks):
+            sha = sha256_utf8(chunk)
+            run_llm = should_run_llm is None or should_run_llm(chunk_seq, sha)
             logger.info(
-                "Processing text block %s/%s chunk %s/%s (%s chars)",
+                "Processing text block %s/%s chunk %s/%s (%s chars) seq=%s run_llm=%s",
                 b_idx + 1,
                 len(blocks),
                 i + 1,
                 len(chunks),
                 len(chunk),
+                chunk_seq,
+                run_llm,
             )
-            _chunk_llm_progress()
-            all_cards.extend(extract_vocabulary_from_chunk(model, chunk))
+            if run_llm:
+                _chunk_llm_progress()
+                items = extract_vocabulary_from_chunk(model, chunk)
+                all_cards.extend(items)
+                chunks_processed += 1
+                if on_chunk_processed is not None:
+                    on_chunk_processed(chunk_seq, sha, items)
+            else:
+                if load_cached_chunk_cards is None:
+                    raise ValueError("load_cached_chunk_cards required when skipping LLM")
+                cached = load_cached_chunk_cards(chunk_seq)
+                all_cards.extend(cached)
+                chunks_skipped += 1
+                if on_chunk_processed is not None:
+                    on_chunk_processed(chunk_seq, sha, cached)
+            chunk_seq += 1
+
+    return all_cards, total_chunks, chunks_processed, chunks_skipped
+
+
+def finish_pipeline_after_llm(
+    all_cards: list[LlmVocabularyItem],
+    text: str,
+    settings: Settings,
+    *,
+    model: object,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    total_llm_chunks: int,
+) -> PipelineResult:
+    """Dedupe, enrich, optional sentence linking — shared by full and incremental runs."""
+    blocks = segment_table_blocks(text)
+    block_count = len(blocks)
 
     raw_card_count = len(all_cards)
     deduped = _dedupe_cards(all_cards)
@@ -280,8 +348,8 @@ def run_pipeline_from_text(
         progress_callback("export", 1, 1)
 
     stats = PipelineStats(
-        block_count=len(blocks),
-        chunk_count=total_chunks,
+        block_count=block_count,
+        chunk_count=total_llm_chunks,
         raw_card_count=raw_card_count,
         deduped_card_count=len(deduped),
         enriched_count=enriched_count,
@@ -290,6 +358,37 @@ def run_pipeline_from_text(
         sentence_link_count=len(sentence_links),
     )
     return PipelineResult(rows=rows, sentence_links=sentence_links, stats=stats)
+
+
+def run_pipeline_from_text(
+    text: str,
+    settings: Settings,
+    *,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> PipelineResult:
+    """Core pipeline: normalized note text in → rows (+ optional sentence links) out. No filesystem I/O."""
+    text = normalize_unicode(text)
+    text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
+    if progress_callback:
+        progress_callback("normalize", 1, 1)
+
+    model = build_bedrock_model(settings)
+
+    all_cards, total_chunks, _processed, _skipped = extract_llm_vocabulary_items(
+        text,
+        settings,
+        model=model,
+        progress_callback=progress_callback,
+    )
+
+    return finish_pipeline_after_llm(
+        all_cards,
+        text,
+        settings,
+        model=model,
+        progress_callback=progress_callback,
+        total_llm_chunks=total_chunks,
+    )
 
 
 def run_pipeline(

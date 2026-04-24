@@ -30,6 +30,25 @@ Library callers can invoke `run_pipeline_from_text` (pure text in → `PipelineR
 
 Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, model params via environment (see `anki_deck_generator.config.settings`).
 
+### Local state and incremental sync (optional)
+
+Install the sync extra if you use YAML source sets: `pip install -e ".[sync]"` (PyYAML is also included in `[dev]`).
+
+```bash
+anki-notes-pipeline state init --db-path ~/.local/share/anki-notes-pipeline/state.db
+anki-notes-pipeline state list-cards --db-path ~/.local/share/anki-notes-pipeline/state.db
+anki-notes-pipeline state list-runs --db-path ~/.local/share/anki-notes-pipeline/state.db
+```
+
+Define `source_sets` in a YAML file (see `ANKI_PIPELINE_SOURCE_SET_CONFIG` or pass `--source-set-config`), then:
+
+```bash
+anki-notes-pipeline schedule --source-set myset --state-db /path/to/state.db \
+  --source-set-config sources.yaml --output deck.csv --cedict-path /path/to/cedict_ts.u8
+```
+
+Re-running `schedule` on unchanged files skips ingest/LLM at the document level; edits reuse cached chunks when only part of a document changes.
+
 ## Debug logging helper
 
 The module `anki_deck_generator.debuglog` is kept in the repo as a small NDJSON logger you can use when diagnosing pipeline issues. By default, the pipeline does **not** emit debug logs; add temporary calls to `debug_log(...)` where needed and remove them after verification.
