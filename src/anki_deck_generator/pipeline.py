@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 from anki_deck_generator.config.settings import Settings
@@ -15,6 +14,10 @@ from anki_deck_generator.dictionary.enrich import (
 )
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
+from anki_deck_generator.export.exporters import (
+    SentenceLinksCsvExporter,
+    VocabularyCsvExporter,
+)
 from anki_deck_generator.export.sentence_links import SentenceLinkRow
 from anki_deck_generator.ingest.router import extract_text_from_bytes, extract_text_from_path
 from anki_deck_generator.linking.sentence_assign import choose_winner_key, find_candidate_matches
@@ -25,6 +28,7 @@ from anki_deck_generator.llm.bedrock_chain import (
     translate_simplified_terms,
 )
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
+from anki_deck_generator.pipeline_types import PipelineResult, PipelineStats
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
@@ -32,25 +36,6 @@ from anki_deck_generator.preprocess.sentences import extract_dialogue_sentences
 from anki_deck_generator.preprocess.tables import parse_table_block
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PipelineStats:
-    block_count: int
-    chunk_count: int
-    raw_card_count: int
-    deduped_card_count: int
-    enriched_count: int
-    llm_translation_fallback_count: int
-    decomposition_fallback_count: int
-    sentence_link_count: int
-
-
-@dataclass
-class PipelineResult:
-    rows: list[VocabularyRow]
-    sentence_links: list[SentenceLinkRow]
-    stats: PipelineStats
 
 
 def _dedupe_cards(cards: list[LlmVocabularyItem]) -> list[LlmVocabularyItem]:
@@ -297,8 +282,6 @@ def run_pipeline(
     output_csv: Path,
     settings: Settings,
 ) -> None:
-    from anki_deck_generator.export.exporters import SentenceLinksCsvExporter, VocabularyCsvExporter
-
     fmt = _suffix_to_format(input_path.suffix)
     if fmt is None:
         # Delegate to extract_text_from_path for consistent IngestError message
