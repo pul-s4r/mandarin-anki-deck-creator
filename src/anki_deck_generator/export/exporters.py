@@ -5,7 +5,7 @@ from pathlib import Path
 
 from anki_deck_generator.export.csv_writer import vocabulary_csv_bytes
 from anki_deck_generator.export.sentence_links import sentence_links_csv_bytes
-from anki_deck_generator.pipeline import PipelineResult
+from anki_deck_generator.pipeline_types import PipelineResult
 
 
 @dataclass
