@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from anki_deck_generator.pipeline import PipelineResult
+    from anki_deck_generator.pipeline_types import PipelineResult
 
 
 class Exporter(Protocol):
