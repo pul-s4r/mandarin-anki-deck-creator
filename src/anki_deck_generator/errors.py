@@ -20,3 +20,7 @@ class IntegrationError(AnkiPipelineError):
 class AuthenticationError(IntegrationError):
     """Authentication or authorization failures for an integration."""
 
+
+class StateError(AnkiPipelineError):
+    """SQLite / StateStore failures (schema mismatch, corrupt DB, etc.)."""
+
