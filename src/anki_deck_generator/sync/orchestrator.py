@@ -148,7 +148,10 @@ def run_incremental_sync(
 
         outcome = SyncRunOutcome(source_id=sid, external_id=src.external_id, skipped_document=False)
         for row in result.rows:
-            rec = vocabulary_row_to_card_record(row, source_id=sid, state_store=state_store, user_id=user_id)
+            existing = state_store.get_card_by_key(row.simplified.strip(), user_id=user_id)
+            rec = vocabulary_row_to_card_record(
+                row, source_id=sid, user_id=user_id, existing=existing
+            )
             res = state_store.upsert_card(rec)
             if res is CardUpsertResult.CREATED:
                 outcome.cards_created += 1

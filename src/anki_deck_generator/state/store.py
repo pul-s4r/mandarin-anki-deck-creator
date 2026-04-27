@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from anki_deck_generator.state.records import (
@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     )
 
 
-@runtime_checkable
 class StateStore(Protocol):
     def get_source_record(self, provider: str, external_id: str, *, user_id: str = "default") -> SourceRecord | None: ...
 
