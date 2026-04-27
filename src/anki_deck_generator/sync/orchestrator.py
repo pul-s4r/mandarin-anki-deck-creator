@@ -9,31 +9,18 @@ from typing import TYPE_CHECKING
 
 from anki_deck_generator.config.source_sets import LocalFileSource, SourceSet
 from anki_deck_generator.export.base import Exporter
-from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
 from anki_deck_generator.pipeline import dedupe_llm_items, extract_llm_vocabulary_items, finish_pipeline_after_llm
-from anki_deck_generator.preprocess.fingerprints import sha256_bytes
 from anki_deck_generator.preprocess.llm_units import list_llm_text_units
-from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
 from anki_deck_generator.state.records import CardUpsertResult, ChunkRecord, RunReportRecord, SourceRecord
 from anki_deck_generator.state.store import StateStore
 from anki_deck_generator.sync.cards_bridge import card_record_to_llm_item, card_records_to_pipeline_rows, vocabulary_row_to_card_record
+from anki_deck_generator.sync.change_detection import chunk_needs_llm
 from anki_deck_generator.sync.report import SyncReport, SyncReportStats, SyncRunOutcome
-from anki_deck_generator.sync.source_ids import make_source_id
+from anki_deck_generator.sync.source_resolution import resolve_local_file_source
 
 if TYPE_CHECKING:
     from anki_deck_generator.config.settings import Settings
-
-
-def _suffix_to_format(suffix: str) -> str | None:
-    s = suffix.lower()
-    if s == ".pdf":
-        return "pdf"
-    if s in {".md", ".markdown"}:
-        return "markdown"
-    if s == ".docx":
-        return "docx"
-    return None
 
 
 def _persist_chunk_records(
@@ -102,11 +89,9 @@ def run_incremental_sync(
         if only_file_ids is not None and src.external_id not in only_file_ids:
             continue
 
-        sid = make_source_id(user_id=user_id, provider=src.provider, external_id=src.external_id)
-        raw = src.path.read_bytes()
-        file_hash = sha256_bytes(raw)
-        prev = state_store.get_source_record(src.provider, src.external_id, user_id=user_id)
-        if prev is not None and prev.content_sha256 == file_hash:
+        resolved = resolve_local_file_source(src, settings=settings, state_store=state_store, user_id=user_id)
+        sid = resolved.source_id
+        if resolved.skipped_document:
             report.outcomes.append(
                 SyncRunOutcome(
                     source_id=sid,
@@ -117,21 +102,13 @@ def run_incremental_sync(
             report.stats.documents_skipped += 1
             continue
 
-        fmt = _suffix_to_format(src.path.suffix)
-        if fmt is None:
-            raise ValueError(f"Unsupported file type for incremental sync: {src.path}")
-
-        text = extract_text_from_bytes(raw, format=fmt)
-        text = normalize_unicode(text)
-        text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
+        text = resolved.normalized_text
 
         chunk_cards[sid] = {}
 
         def _should_run_llm(seq: int, sha: str) -> bool:
             rec = state_store.get_processed_chunk(sid, seq)
-            if rec is None:
-                return True
-            return rec.chunk_sha256 != sha
+            return chunk_needs_llm(rec, sha)
 
         def _load_cached(seq: int):
             rec = state_store.get_processed_chunk(sid, seq)
@@ -182,15 +159,14 @@ def run_incremental_sync(
         report.outcomes.append(outcome)
 
         now = datetime.now(UTC)
-        mtime = str(src.path.stat().st_mtime_ns)
         state_store.upsert_source_record(
             SourceRecord(
                 source_id=sid,
                 provider=src.provider,
                 external_id=src.external_id,
-                revision_id=mtime,
+                revision_id=resolved.revision_id,
                 etag="",
-                content_sha256=file_hash,
+                content_sha256=resolved.raw_bytes_sha256,
                 last_ingested_at=now,
                 user_id=user_id,
             )
