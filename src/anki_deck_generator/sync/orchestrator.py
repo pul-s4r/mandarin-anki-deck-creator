@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anki_deck_generator.config.source_sets import LocalFileSource, SourceSet
 from anki_deck_generator.export.base import Exporter
+from anki_deck_generator.export.file_target import FileTargetExporter
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
 from anki_deck_generator.pipeline import dedupe_llm_items, extract_llm_vocabulary_items, finish_pipeline_after_llm
 from anki_deck_generator.preprocess.llm_units import list_llm_text_units
@@ -181,15 +181,22 @@ def run_incremental_sync(
             per_source=chunk_cards[sid],
         )
 
+    chunk_units_this_run = report.stats.chunks_processed + report.stats.chunks_skipped
     for exp in exporters:
+        if not isinstance(exp, FileTargetExporter):
+            raise TypeError(
+                "run_incremental_sync requires FileTargetExporter (with output_path); "
+                f"got {type(exp).__name__}"
+            )
         rows = list(state_store.iter_all_cards(user_id=user_id))
         vrows = card_records_to_pipeline_rows(rows)
+        # Store-derived export: stats reflect this sync run's LLM unit counts, not a full pipeline parse.
         pr = PipelineResult(
             rows=vrows,
             sentence_links=[],
             stats=PipelineStats(
                 block_count=0,
-                chunk_count=0,
+                chunk_count=chunk_units_this_run,
                 raw_card_count=len(vrows),
                 deduped_card_count=len(vrows),
                 enriched_count=0,
@@ -199,11 +206,10 @@ def run_incremental_sync(
             ),
         )
         data = exp.export(pr)
-        dest = getattr(exp, "output_path", None)
-        if isinstance(dest, Path):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            report.export_paths.append(str(dest))
+        dest = exp.output_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        report.export_paths.append(str(dest))
 
     finished = datetime.now(UTC)
     report.run_finished_at = finished
