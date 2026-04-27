@@ -39,6 +39,12 @@ class CardUpsertResult(StrEnum):
 
 @dataclass
 class SourceRecord:
+    """Source sync metadata.
+
+    ``content_sha256`` for ``provider: local-filesystem`` is the SHA-256 hex digest of **raw file bytes**
+    on disk (before ingest), not of extracted/normalized text.
+    """
+
     source_id: str
     provider: str
     external_id: str
