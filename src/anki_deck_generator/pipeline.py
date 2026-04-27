@@ -31,7 +31,7 @@ from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.pipeline_types import PipelineResult, PipelineStats
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
-from anki_deck_generator.preprocess.fingerprints import sha256_utf8
+from anki_deck_generator.preprocess.llm_units import list_llm_text_units
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
 from anki_deck_generator.preprocess.sentences import extract_dialogue_sentences
 from anki_deck_generator.preprocess.tables import parse_table_block
@@ -103,20 +103,8 @@ def extract_llm_vocabulary_items(
     Returns ``(all_cards, total_llm_chunks, chunks_processed, chunks_skipped)``.
     """
     blocks = segment_table_blocks(text)
-    text_chunk_lists: list[list[str]] = []
-    table_llm_fallbacks = 0
-    for block in blocks:
-        if block.kind == "table":
-            parsed = parse_table_block(block.text)
-            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
-            if needs_fallback:
-                table_llm_fallbacks += 1
-            continue
-        text_chunk_lists.append(
-            chunk_text(block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
-        )
-
-    total_chunks = sum(len(cl) for cl in text_chunk_lists) + table_llm_fallbacks
+    llm_units = list_llm_text_units(text, settings)
+    total_chunks = len(llm_units)
     chunk_cursor = 0
 
     def _chunk_llm_progress() -> None:
@@ -128,8 +116,7 @@ def extract_llm_vocabulary_items(
         progress_callback("llm", chunk_cursor, total_chunks)
 
     all_cards: list[LlmVocabularyItem] = []
-    text_block_idx = 0
-    chunk_seq = 0
+    unit_idx = 0
     chunks_processed = 0
     chunks_skipped = 0
 
@@ -139,7 +126,9 @@ def extract_llm_vocabulary_items(
             needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
             all_cards.extend(parsed.cards)
             if needs_fallback:
-                sha = sha256_utf8(block.text)
+                u = llm_units[unit_idx]
+                chunk_seq = unit_idx
+                sha = u.chunk_sha256
                 run_llm = should_run_llm is None or should_run_llm(chunk_seq, sha)
                 logger.info(
                     "Processing table block %s/%s LLM fallback (%s chars) seq=%s run_llm=%s",
@@ -151,7 +140,7 @@ def extract_llm_vocabulary_items(
                 )
                 if run_llm:
                     _chunk_llm_progress()
-                    items = extract_vocabulary_from_chunk(model, block.text)
+                    items = extract_vocabulary_from_chunk(model, u.text)
                     all_cards.extend(items)
                     chunks_processed += 1
                     if on_chunk_processed is not None:
@@ -164,27 +153,30 @@ def extract_llm_vocabulary_items(
                     chunks_skipped += 1
                     if on_chunk_processed is not None:
                         on_chunk_processed(chunk_seq, sha, cached)
-                chunk_seq += 1
+                unit_idx += 1
             continue
 
-        chunks = text_chunk_lists[text_block_idx]
-        text_block_idx += 1
-        for i, chunk in enumerate(chunks):
-            sha = sha256_utf8(chunk)
+        text_block_chunks = chunk_text(
+            block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap
+        )
+        for i, chunk in enumerate(text_block_chunks):
+            u = llm_units[unit_idx]
+            chunk_seq = unit_idx
+            sha = u.chunk_sha256
             run_llm = should_run_llm is None or should_run_llm(chunk_seq, sha)
             logger.info(
                 "Processing text block %s/%s chunk %s/%s (%s chars) seq=%s run_llm=%s",
                 b_idx + 1,
                 len(blocks),
                 i + 1,
-                len(chunks),
+                len(text_block_chunks),
                 len(chunk),
                 chunk_seq,
                 run_llm,
             )
             if run_llm:
                 _chunk_llm_progress()
-                items = extract_vocabulary_from_chunk(model, chunk)
+                items = extract_vocabulary_from_chunk(model, u.text)
                 all_cards.extend(items)
                 chunks_processed += 1
                 if on_chunk_processed is not None:
@@ -197,8 +189,9 @@ def extract_llm_vocabulary_items(
                 chunks_skipped += 1
                 if on_chunk_processed is not None:
                     on_chunk_processed(chunk_seq, sha, cached)
-            chunk_seq += 1
+            unit_idx += 1
 
+    assert unit_idx == len(llm_units)
     return all_cards, total_chunks, chunks_processed, chunks_skipped
 
 
