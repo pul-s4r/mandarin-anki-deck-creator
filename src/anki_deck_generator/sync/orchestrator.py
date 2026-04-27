@@ -11,7 +11,13 @@ from anki_deck_generator.config.source_sets import LocalFileSource, SourceSet
 from anki_deck_generator.export.base import Exporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
-from anki_deck_generator.pipeline import dedupe_llm_items, extract_llm_vocabulary_items, finish_pipeline_after_llm
+from anki_deck_generator.pipeline import (
+    PipelineResult,
+    PipelineStats,
+    dedupe_llm_items,
+    extract_llm_vocabulary_items,
+    finish_pipeline_after_llm,
+)
 from anki_deck_generator.preprocess.blocks import segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
 from anki_deck_generator.preprocess.fingerprints import sha256_bytes, sha256_utf8
@@ -122,8 +128,6 @@ def run_incremental_sync(
     Document-level skip: unchanged raw file bytes (SHA-256) short-circuit before ingest.
     Chunk-level skip: unchanged chunk text SHA-256 reuses cached per-chunk card IDs.
     """
-    from anki_deck_generator.pipeline import PipelineResult, PipelineStats
-
     run_id = str(uuid.uuid4())
     started = datetime.now(UTC)
     report = SyncReport(

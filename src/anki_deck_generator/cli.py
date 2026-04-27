@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from anki_deck_generator.config.settings import Settings
-from anki_deck_generator.errors import AnkiPipelineError
+from anki_deck_generator.errors import AnkiPipelineError, IntegrationError
 from anki_deck_generator.pipeline import run_pipeline
 
 
@@ -106,7 +106,124 @@ def _build_parser() -> argparse.ArgumentParser:
     sched.set_defaults(enable_sentences=False)
     sched.add_argument("-v", "--verbose", action="store_true")
 
+    imp = sub.add_parser("import", help="Import from an external source provider (optional integrations)")
+    imp.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="List registered provider names and exit",
+    )
+    imp.add_argument(
+        "provider",
+        nargs="?",
+        help="Provider name (e.g. echo); omit with --list-providers",
+    )
+
     return p
+
+
+def _run_state_command(args: argparse.Namespace) -> int:
+    from anki_deck_generator.state.sqlite_store import SqliteStateStore
+
+    db = Path(args.db_path).resolve()
+    if args.state_command == "init":
+        store = SqliteStateStore(db)
+        store.init_schema()
+        store.close()
+        print(f"initialized state database at {db}")
+        return 0
+    if args.state_command == "list-cards":
+        store = SqliteStateStore(db)
+        try:
+            rows = list(store.iter_all_cards())
+        finally:
+            store.close()
+        if not rows:
+            print("(no cards)")
+            return 0
+        for r in rows:
+            m = (r.meaning or "")[:48]
+            print(f"{r.simplified}\t{r.card_id[:8]}…\t{m}")
+        return 0
+    if args.state_command == "list-runs":
+        store = SqliteStateStore(db)
+        try:
+            runs = list(store.iter_runs(limit=50))
+        finally:
+            store.close()
+        if not runs:
+            print("(no runs)")
+            return 0
+        for rr in runs:
+            print(f"{rr.run_id}\t{rr.trigger}\t{rr.started_at}\tjson_bytes={len(rr.sync_report_json)}")
+        return 0
+    return 1
+
+
+def _run_schedule_command(args: argparse.Namespace) -> int:
+    from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
+    from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
+    from anki_deck_generator.state.sqlite_store import SqliteStateStore
+    from anki_deck_generator.sync.orchestrator import run_incremental_sync
+
+    settings = Settings()
+    if args.source_set_config is not None:
+        settings.source_set_config = args.source_set_config
+    cfg_path = settings.source_set_config
+    if cfg_path is None:
+        print("error: pass --source-set-config or set ANKI_PIPELINE_SOURCE_SET_CONFIG", file=sys.stderr)
+        return 1
+    _apply_run_like_settings(settings, args)
+    settings.state_backend = "sqlite"
+    settings.state_db_path = Path(args.state_db).resolve()
+
+    store = SqliteStateStore(settings.state_db_path)
+    store.init_schema()
+    try:
+        sets = load_source_sets_yaml(Path(cfg_path).resolve())
+        sset = pick_source_set(sets, args.source_set)
+        report = run_incremental_sync(
+            sset,
+            settings=settings,
+            state_store=store,
+            exporters=[VocabularyCsvFileExporter(output_path=Path(args.output).resolve(), bom=settings.csv_bom)],
+        )
+    except AnkiPipelineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    print(json.dumps(report.to_jsonable(), indent=2))
+    return 0
+
+
+def _run_import_command(args: argparse.Namespace) -> int:
+    import importlib
+
+    from anki_deck_generator.integrations.registry import available_providers, get_provider
+
+    importlib.import_module("anki_deck_generator.integrations.echo")
+    if args.list_providers:
+        for name in available_providers():
+            print(name)
+        return 0
+    if not args.provider:
+        print("error: pass a provider name or --list-providers", file=sys.stderr)
+        return 1
+    try:
+        provider = get_provider(args.provider)
+    except IntegrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        provider.authenticate({})
+        result = provider.import_documents()
+    except AnkiPipelineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(result.source_description)
+    for doc in result.documents:
+        print(f"  {doc.filename}\t{doc.format}\t{len(doc.data)} bytes\tid={doc.external_id}")
+    return 0
 
 
 def _apply_run_like_settings(settings: Settings, args: argparse.Namespace) -> None:
@@ -166,76 +283,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "state":
-        from anki_deck_generator.state.sqlite_store import SqliteStateStore
-
-        db = Path(args.db_path).resolve()
-        if args.state_command == "init":
-            store = SqliteStateStore(db)
-            store.init_schema()
-            store.close()
-            print(f"initialized state database at {db}")
-            return 0
-        if args.state_command == "list-cards":
-            store = SqliteStateStore(db)
-            try:
-                rows = list(store.iter_all_cards())
-            finally:
-                store.close()
-            if not rows:
-                print("(no cards)")
-                return 0
-            for r in rows:
-                m = (r.meaning or "")[:48]
-                print(f"{r.simplified}\t{r.card_id[:8]}…\t{m}")
-            return 0
-        if args.state_command == "list-runs":
-            store = SqliteStateStore(db)
-            try:
-                runs = list(store.iter_runs(limit=50))
-            finally:
-                store.close()
-            if not runs:
-                print("(no runs)")
-                return 0
-            for rr in runs:
-                print(f"{rr.run_id}\t{rr.trigger}\t{rr.started_at}\tjson_bytes={len(rr.sync_report_json)}")
-            return 0
+        return _run_state_command(args)
 
     if args.command == "schedule":
-        from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
-        from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
-        from anki_deck_generator.state.sqlite_store import SqliteStateStore
-        from anki_deck_generator.sync.orchestrator import run_incremental_sync
+        return _run_schedule_command(args)
 
-        settings = Settings()
-        if args.source_set_config is not None:
-            settings.source_set_config = args.source_set_config
-        cfg_path = settings.source_set_config
-        if cfg_path is None:
-            print("error: pass --source-set-config or set ANKI_PIPELINE_SOURCE_SET_CONFIG", file=sys.stderr)
-            return 1
-        _apply_run_like_settings(settings, args)
-        settings.state_backend = "sqlite"
-        settings.state_db_path = Path(args.state_db).resolve()
-
-        store = SqliteStateStore(settings.state_db_path)
-        store.init_schema()
-        try:
-            sets = load_source_sets_yaml(Path(cfg_path).resolve())
-            sset = pick_source_set(sets, args.source_set)
-            report = run_incremental_sync(
-                sset,
-                settings=settings,
-                state_store=store,
-                exporters=[VocabularyCsvFileExporter(output_path=Path(args.output).resolve(), bom=settings.csv_bom)],
-            )
-        except AnkiPipelineError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        finally:
-            store.close()
-        print(json.dumps(report.to_jsonable(), indent=2))
-        return 0
+    if args.command == "import":
+        return _run_import_command(args)
 
     return 1
 
