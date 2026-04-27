@@ -12,11 +12,9 @@ from anki_deck_generator.export.base import Exporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
 from anki_deck_generator.pipeline import dedupe_llm_items, extract_llm_vocabulary_items, finish_pipeline_after_llm
-from anki_deck_generator.preprocess.blocks import segment_table_blocks
-from anki_deck_generator.preprocess.chunk import chunk_text
-from anki_deck_generator.preprocess.fingerprints import sha256_bytes, sha256_utf8
+from anki_deck_generator.preprocess.fingerprints import sha256_bytes
+from anki_deck_generator.preprocess.llm_units import list_llm_text_units
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
-from anki_deck_generator.preprocess.tables import parse_table_block
 from anki_deck_generator.state.records import CardUpsertResult, ChunkRecord, RunReportRecord, SourceRecord
 from anki_deck_generator.state.store import StateStore
 from anki_deck_generator.sync.cards_bridge import card_record_to_llm_item, card_records_to_pipeline_rows, vocabulary_row_to_card_record
@@ -47,64 +45,25 @@ def _persist_chunk_records(
     user_id: str,
     per_source: dict[int, list],
 ) -> None:
-    """Write ChunkRecord rows with SHA-256 matching extract_llm_vocabulary_items."""
+    """Write ChunkRecord rows using the same LLM unit sequence as extract_llm_vocabulary_items."""
     now = datetime.now(UTC)
-    blocks = segment_table_blocks(text)
-    text_chunk_lists: list[list[str]] = []
-    for block in blocks:
-        if block.kind == "table":
-            continue
-        text_chunk_lists.append(
-            chunk_text(block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
-        )
-
-    seq = 0
-    t_idx = 0
-    for block in blocks:
-        if block.kind == "table":
-            parsed = parse_table_block(block.text)
-            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
-            if needs_fallback:
-                sha = sha256_utf8(block.text)
-                ids: list[str] = []
-                for it in per_source.get(seq, []):
-                    cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
-                    if cr:
-                        ids.append(cr.card_id)
-                state_store.upsert_processed_chunk(
-                    ChunkRecord(
-                        source_id=sid,
-                        chunk_index=seq,
-                        chunk_sha256=sha,
-                        processed_at=now,
-                        model_id=settings.bedrock_model_id,
-                        llm_output_card_ids=ids,
-                        user_id=user_id,
-                    )
-                )
-                seq += 1
-            continue
-        chunks = text_chunk_lists[t_idx]
-        t_idx += 1
-        for chunk in chunks:
-            sha = sha256_utf8(chunk)
-            ids = []
-            for it in per_source.get(seq, []):
-                cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
-                if cr:
-                    ids.append(cr.card_id)
-            state_store.upsert_processed_chunk(
-                ChunkRecord(
-                    source_id=sid,
-                    chunk_index=seq,
-                    chunk_sha256=sha,
-                    processed_at=now,
-                    model_id=settings.bedrock_model_id,
-                    llm_output_card_ids=ids,
-                    user_id=user_id,
-                )
+    for seq, unit in enumerate(list_llm_text_units(text, settings)):
+        ids: list[str] = []
+        for it in per_source.get(seq, []):
+            cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
+            if cr:
+                ids.append(cr.card_id)
+        state_store.upsert_processed_chunk(
+            ChunkRecord(
+                source_id=sid,
+                chunk_index=seq,
+                chunk_sha256=unit.chunk_sha256,
+                processed_at=now,
+                model_id=settings.bedrock_model_id,
+                llm_output_card_ids=ids,
+                user_id=user_id,
             )
-            seq += 1
+        )
 
 
 def run_incremental_sync(

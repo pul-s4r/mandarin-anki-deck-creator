@@ -9,10 +9,12 @@ from anki_deck_generator.config.source_sets import SourceSet, LocalFileSource
 from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.pipeline import run_pipeline_from_text
+from anki_deck_generator.preprocess.llm_units import list_llm_text_units
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
 from anki_deck_generator.state.sqlite_store import SqliteStateStore
 import anki_deck_generator.pipeline as pipeline_module
 from anki_deck_generator.sync.orchestrator import run_incremental_sync
+from anki_deck_generator.sync.source_ids import make_source_id
 
 
 def _row_sig(simplified: str, meaning: str, pinyin: str) -> tuple[str, str, str]:
@@ -111,6 +113,16 @@ def test_chunk_level_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     run_incremental_sync(sset, settings=settings, state_store=store, exporters=[exp_path])
     first_calls = len(calls)
     assert first_calls >= 2
+
+    raw = md.read_bytes()
+    norm_text = normalize_unicode(extract_text_from_bytes(raw, format="markdown"))
+    norm_text = optional_drop_metadata_lines(norm_text, enabled=settings.skip_lines_filter)
+    sid = make_source_id(user_id="default", provider="local-filesystem", external_id=ext_id)
+    expected_units = list_llm_text_units(norm_text, settings)
+    for seq, u in enumerate(expected_units):
+        ch = store.get_processed_chunk(sid, seq)
+        assert ch is not None, seq
+        assert ch.chunk_sha256 == u.chunk_sha256, seq
 
     calls.clear()
     rep_skip = run_incremental_sync(sset, settings=settings, state_store=store, exporters=[exp_path])
