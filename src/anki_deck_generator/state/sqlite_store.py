@@ -144,11 +144,11 @@ class SqliteStateStore:
             conn.rollback()
             raise StateError(str(exc)) from exc
 
-    def get_source_record(self, provider: str, external_id: str) -> SourceRecord | None:
+    def get_source_record(self, provider: str, external_id: str, *, user_id: str = "default") -> SourceRecord | None:
         conn = self._conn()
         row = conn.execute(
-            "SELECT * FROM sources WHERE provider = ? AND external_id = ? AND user_id = 'default'",
-            (provider, external_id),
+            "SELECT * FROM sources WHERE provider = ? AND external_id = ? AND user_id = ?",
+            (provider, external_id, user_id),
         ).fetchone()
         if row is None:
             return None

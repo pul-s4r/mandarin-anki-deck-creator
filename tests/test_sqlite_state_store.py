@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 
 from anki_deck_generator.state.records import CardRecord, CardUpsertResult, ChunkRecord, RunReportRecord, SourceRecord
 from anki_deck_generator.state.sqlite_store import SqliteStateStore
+from anki_deck_generator.state.store import StateStore
 
 
 @pytest.fixture
@@ -16,6 +18,41 @@ def store(tmp_path: Path) -> SqliteStateStore:
     s = SqliteStateStore(p)
     s.init_schema()
     return s
+
+
+def test_get_source_record_respects_user_id(store: SqliteStateStore) -> None:
+    now = datetime.now(UTC)
+    store.upsert_source_record(
+        SourceRecord(
+            source_id="sid-alice",
+            provider="local-filesystem",
+            external_id="/same/path.md",
+            content_sha256="hash_alice",
+            last_ingested_at=now,
+            user_id="alice",
+        )
+    )
+    store.upsert_source_record(
+        SourceRecord(
+            source_id="sid-bob",
+            provider="local-filesystem",
+            external_id="/same/path.md",
+            content_sha256="hash_bob",
+            last_ingested_at=now,
+            user_id="bob",
+        )
+    )
+    ga = store.get_source_record("local-filesystem", "/same/path.md", user_id="alice")
+    gb = store.get_source_record("local-filesystem", "/same/path.md", user_id="bob")
+    assert ga is not None and ga.content_sha256 == "hash_alice"
+    assert gb is not None and gb.content_sha256 == "hash_bob"
+
+
+def test_get_source_record_signature_matches_protocol() -> None:
+    proto_sig = inspect.signature(StateStore.get_source_record)
+    sqlite_sig = inspect.signature(SqliteStateStore.get_source_record)
+    assert proto_sig == sqlite_sig
+    assert "user_id" in proto_sig.parameters
 
 
 def test_roundtrip_source_chunk_card_run(store: SqliteStateStore) -> None:
