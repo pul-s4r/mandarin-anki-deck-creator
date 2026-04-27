@@ -140,7 +140,7 @@ class SqliteStateStore:
         except StateError:
             conn.rollback()
             raise
-        except Exception as exc:
+        except sqlite3.Error as exc:
             conn.rollback()
             raise StateError(str(exc)) from exc
 
