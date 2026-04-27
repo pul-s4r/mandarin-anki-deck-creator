@@ -105,7 +105,7 @@ def run_incremental_sync(
         sid = make_source_id(user_id=user_id, provider=src.provider, external_id=src.external_id)
         raw = src.path.read_bytes()
         file_hash = sha256_bytes(raw)
-        prev = state_store.get_source_record(src.provider, src.external_id)
+        prev = state_store.get_source_record(src.provider, src.external_id, user_id=user_id)
         if prev is not None and prev.content_sha256 == file_hash:
             report.outcomes.append(
                 SyncRunOutcome(
