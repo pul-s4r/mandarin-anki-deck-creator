@@ -26,7 +26,11 @@ sync = ["pyyaml>=6"]
 server = []
 ankiweb = []
 xlsx = []
-gdrive = []
+google-drive = [
+    "google-api-python-client>=2",
+    "google-auth>=2",
+    "google-auth-oauthlib>=1",
+]
 
 [project.scripts]
 anki-notes-pipeline = "anki_deck_generator.cli:main"

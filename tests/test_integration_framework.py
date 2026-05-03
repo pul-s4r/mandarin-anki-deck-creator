@@ -11,6 +11,7 @@ from anki_deck_generator.errors import IntegrationError
 from anki_deck_generator.integrations.registry import available_providers, get_provider
 
 importlib.import_module("anki_deck_generator.integrations.echo")
+importlib.import_module("anki_deck_generator.integrations.google_drive")
 
 
 def test_get_provider_unknown_raises_integration_error() -> None:
@@ -35,7 +36,7 @@ def test_main_import_list_providers() -> None:
         code = main(["import", "--list-providers"])
     assert code == 0
     names = {line.strip() for line in buf.getvalue().splitlines() if line.strip()}
-    assert names == {"echo"}
+    assert names == {"echo", "google-drive"}
 
 
 def test_main_import_echo() -> None:
