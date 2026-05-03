@@ -8,8 +8,12 @@ import sys
 from pathlib import Path
 
 from anki_deck_generator.config.settings import Settings
+from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
 from anki_deck_generator.errors import AnkiPipelineError
+from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
 from anki_deck_generator.pipeline import run_pipeline
+from anki_deck_generator.state.sqlite_store import SqliteStateStore
+from anki_deck_generator.sync.orchestrator import run_incremental_sync
 
 
 def apply_run_like_settings(settings: Settings, args: argparse.Namespace) -> None:
@@ -62,8 +66,6 @@ def run_run_command(args: argparse.Namespace) -> int:
 
 
 def run_state_command(args: argparse.Namespace) -> int:
-    from anki_deck_generator.state.sqlite_store import SqliteStateStore
-
     db = Path(args.db_path).resolve()
     if args.state_command == "init":
         store = SqliteStateStore(db)
@@ -100,11 +102,6 @@ def run_state_command(args: argparse.Namespace) -> int:
 
 
 def run_schedule_command(args: argparse.Namespace) -> int:
-    from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
-    from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
-    from anki_deck_generator.state.sqlite_store import SqliteStateStore
-    from anki_deck_generator.sync.orchestrator import run_incremental_sync
-
     settings = Settings()
     if args.source_set_config is not None:
         settings.source_set_config = args.source_set_config
