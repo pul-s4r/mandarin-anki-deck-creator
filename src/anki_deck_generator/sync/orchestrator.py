@@ -4,38 +4,23 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anki_deck_generator.config.source_sets import LocalFileSource, SourceSet
 from anki_deck_generator.export.base import Exporter
-from anki_deck_generator.ingest.router import extract_text_from_bytes
+from anki_deck_generator.export.file_target import FileTargetExporter
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
 from anki_deck_generator.pipeline import dedupe_llm_items, extract_llm_vocabulary_items, finish_pipeline_after_llm
-from anki_deck_generator.preprocess.blocks import segment_table_blocks
-from anki_deck_generator.preprocess.chunk import chunk_text
-from anki_deck_generator.preprocess.fingerprints import sha256_bytes, sha256_utf8
-from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
-from anki_deck_generator.preprocess.tables import parse_table_block
+from anki_deck_generator.preprocess.llm_units import list_llm_text_units
 from anki_deck_generator.state.records import CardUpsertResult, ChunkRecord, RunReportRecord, SourceRecord
 from anki_deck_generator.state.store import StateStore
 from anki_deck_generator.sync.cards_bridge import card_record_to_llm_item, card_records_to_pipeline_rows, vocabulary_row_to_card_record
+from anki_deck_generator.sync.change_detection import chunk_needs_llm
 from anki_deck_generator.sync.report import SyncReport, SyncReportStats, SyncRunOutcome
-from anki_deck_generator.sync.source_ids import make_source_id
+from anki_deck_generator.sync.source_resolution import resolve_local_file_source
 
 if TYPE_CHECKING:
     from anki_deck_generator.config.settings import Settings
-
-
-def _suffix_to_format(suffix: str) -> str | None:
-    s = suffix.lower()
-    if s == ".pdf":
-        return "pdf"
-    if s in {".md", ".markdown"}:
-        return "markdown"
-    if s == ".docx":
-        return "docx"
-    return None
 
 
 def _persist_chunk_records(
@@ -47,64 +32,25 @@ def _persist_chunk_records(
     user_id: str,
     per_source: dict[int, list],
 ) -> None:
-    """Write ChunkRecord rows with SHA-256 matching extract_llm_vocabulary_items."""
+    """Write ChunkRecord rows using the same LLM unit sequence as extract_llm_vocabulary_items."""
     now = datetime.now(UTC)
-    blocks = segment_table_blocks(text)
-    text_chunk_lists: list[list[str]] = []
-    for block in blocks:
-        if block.kind == "table":
-            continue
-        text_chunk_lists.append(
-            chunk_text(block.text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
-        )
-
-    seq = 0
-    t_idx = 0
-    for block in blocks:
-        if block.kind == "table":
-            parsed = parse_table_block(block.text)
-            needs_fallback = len(parsed.cards) < 2 or len(parsed.unparsed_lines) >= max(3, len(parsed.cards))
-            if needs_fallback:
-                sha = sha256_utf8(block.text)
-                ids: list[str] = []
-                for it in per_source.get(seq, []):
-                    cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
-                    if cr:
-                        ids.append(cr.card_id)
-                state_store.upsert_processed_chunk(
-                    ChunkRecord(
-                        source_id=sid,
-                        chunk_index=seq,
-                        chunk_sha256=sha,
-                        processed_at=now,
-                        model_id=settings.bedrock_model_id,
-                        llm_output_card_ids=ids,
-                        user_id=user_id,
-                    )
-                )
-                seq += 1
-            continue
-        chunks = text_chunk_lists[t_idx]
-        t_idx += 1
-        for chunk in chunks:
-            sha = sha256_utf8(chunk)
-            ids = []
-            for it in per_source.get(seq, []):
-                cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
-                if cr:
-                    ids.append(cr.card_id)
-            state_store.upsert_processed_chunk(
-                ChunkRecord(
-                    source_id=sid,
-                    chunk_index=seq,
-                    chunk_sha256=sha,
-                    processed_at=now,
-                    model_id=settings.bedrock_model_id,
-                    llm_output_card_ids=ids,
-                    user_id=user_id,
-                )
+    for seq, unit in enumerate(list_llm_text_units(text, settings)):
+        ids: list[str] = []
+        for it in per_source.get(seq, []):
+            cr = state_store.get_card_by_key(it.simplified.strip(), user_id=user_id)
+            if cr:
+                ids.append(cr.card_id)
+        state_store.upsert_processed_chunk(
+            ChunkRecord(
+                source_id=sid,
+                chunk_index=seq,
+                chunk_sha256=unit.chunk_sha256,
+                processed_at=now,
+                model_id=settings.bedrock_model_id,
+                llm_output_card_ids=ids,
+                user_id=user_id,
             )
-            seq += 1
+        )
 
 
 def run_incremental_sync(
@@ -143,11 +89,9 @@ def run_incremental_sync(
         if only_file_ids is not None and src.external_id not in only_file_ids:
             continue
 
-        sid = make_source_id(user_id=user_id, provider=src.provider, external_id=src.external_id)
-        raw = src.path.read_bytes()
-        file_hash = sha256_bytes(raw)
-        prev = state_store.get_source_record(src.provider, src.external_id)
-        if prev is not None and prev.content_sha256 == file_hash:
+        resolved = resolve_local_file_source(src, settings=settings, state_store=state_store, user_id=user_id)
+        sid = resolved.source_id
+        if resolved.skipped_document:
             report.outcomes.append(
                 SyncRunOutcome(
                     source_id=sid,
@@ -158,21 +102,13 @@ def run_incremental_sync(
             report.stats.documents_skipped += 1
             continue
 
-        fmt = _suffix_to_format(src.path.suffix)
-        if fmt is None:
-            raise ValueError(f"Unsupported file type for incremental sync: {src.path}")
-
-        text = extract_text_from_bytes(raw, format=fmt)
-        text = normalize_unicode(text)
-        text = optional_drop_metadata_lines(text, enabled=settings.skip_lines_filter)
+        text = resolved.normalized_text
 
         chunk_cards[sid] = {}
 
         def _should_run_llm(seq: int, sha: str) -> bool:
             rec = state_store.get_processed_chunk(sid, seq)
-            if rec is None:
-                return True
-            return rec.chunk_sha256 != sha
+            return chunk_needs_llm(rec, sha)
 
         def _load_cached(seq: int):
             rec = state_store.get_processed_chunk(sid, seq)
@@ -212,7 +148,10 @@ def run_incremental_sync(
 
         outcome = SyncRunOutcome(source_id=sid, external_id=src.external_id, skipped_document=False)
         for row in result.rows:
-            rec = vocabulary_row_to_card_record(row, source_id=sid, state_store=state_store, user_id=user_id)
+            existing = state_store.get_card_by_key(row.simplified.strip(), user_id=user_id)
+            rec = vocabulary_row_to_card_record(
+                row, source_id=sid, user_id=user_id, existing=existing
+            )
             res = state_store.upsert_card(rec)
             if res is CardUpsertResult.CREATED:
                 outcome.cards_created += 1
@@ -223,15 +162,14 @@ def run_incremental_sync(
         report.outcomes.append(outcome)
 
         now = datetime.now(UTC)
-        mtime = str(src.path.stat().st_mtime_ns)
         state_store.upsert_source_record(
             SourceRecord(
                 source_id=sid,
                 provider=src.provider,
                 external_id=src.external_id,
-                revision_id=mtime,
+                revision_id=resolved.revision_id,
                 etag="",
-                content_sha256=file_hash,
+                content_sha256=resolved.raw_bytes_sha256,
                 last_ingested_at=now,
                 user_id=user_id,
             )
@@ -246,15 +184,22 @@ def run_incremental_sync(
             per_source=chunk_cards[sid],
         )
 
+    chunk_units_this_run = report.stats.chunks_processed + report.stats.chunks_skipped
     for exp in exporters:
+        if not isinstance(exp, FileTargetExporter):
+            raise TypeError(
+                "run_incremental_sync requires FileTargetExporter (with output_path); "
+                f"got {type(exp).__name__}"
+            )
         rows = list(state_store.iter_all_cards(user_id=user_id))
         vrows = card_records_to_pipeline_rows(rows)
+        # Store-derived export: stats reflect this sync run's LLM unit counts, not a full pipeline parse.
         pr = PipelineResult(
             rows=vrows,
             sentence_links=[],
             stats=PipelineStats(
                 block_count=0,
-                chunk_count=0,
+                chunk_count=chunk_units_this_run,
                 raw_card_count=len(vrows),
                 deduped_card_count=len(vrows),
                 enriched_count=0,
@@ -264,11 +209,10 @@ def run_incremental_sync(
             ),
         )
         data = exp.export(pr)
-        dest = getattr(exp, "output_path", None)
-        if isinstance(dest, Path):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-            report.export_paths.append(str(dest))
+        dest = exp.output_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        report.export_paths.append(str(dest))
 
     finished = datetime.now(UTC)
     report.run_finished_at = finished
