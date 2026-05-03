@@ -108,6 +108,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sched.add_argument("--no-skip-lines-filter", action="store_true")
     sched.add_argument("--disable-sentences", dest="enable_sentences", action="store_false")
     sched.set_defaults(enable_sentences=False)
+    sched.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would change (metadata only for Drive); no LLM, DB writes, or export",
+    )
     sched.add_argument("-v", "--verbose", action="store_true")
 
     auth = sub.add_parser("auth", help="Authenticate an integration (e.g. OAuth for Google Drive)")

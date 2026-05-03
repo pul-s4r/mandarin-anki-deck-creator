@@ -221,6 +221,10 @@ class GoogleDriveProvider(IntegrationProvider):
             _map_http_error(exc, context=f"Drive file get for {file_id!r}")
         return _normalize_file_record(raw)
 
+    def fetch_file_metadata(self, file_id: str) -> dict[str, Any]:
+        """Return Drive file metadata (same shape as ``list_sources`` rows)."""
+        return self._fetch_one_meta(file_id)
+
     def _download_native_bytes(self, file_id: str) -> bytes:
         svc = self._svc()
         try:

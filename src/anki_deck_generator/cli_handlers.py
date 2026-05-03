@@ -126,6 +126,7 @@ def run_schedule_command(args: argparse.Namespace) -> int:
             settings=settings,
             state_store=store,
             exporters=[VocabularyCsvFileExporter(output_path=Path(args.output).resolve(), bom=settings.csv_bom)],
+            dry_run=bool(args.dry_run),
         )
     except AnkiPipelineError as exc:
         print(f"error: {exc}", file=sys.stderr)
