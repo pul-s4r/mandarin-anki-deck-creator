@@ -8,17 +8,15 @@ from datetime import UTC, datetime
 from anki_deck_generator.dictionary.enrich import VocabularyRow
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.state.records import CardRecord, compute_card_content_hash
-from anki_deck_generator.state.store import StateStore
 
 
 def vocabulary_row_to_card_record(
     row: VocabularyRow,
     *,
     source_id: str,
-    state_store: StateStore,
     user_id: str = "default",
+    existing: CardRecord | None = None,
 ) -> CardRecord:
-    existing = state_store.get_card_by_key(row.simplified.strip(), user_id=user_id)
     cid = existing.card_id if existing else str(uuid.uuid4())
     first_seen = (
         existing.first_seen_source_id
