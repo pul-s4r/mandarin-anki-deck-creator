@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import yaml
+
 
 @dataclass(frozen=True)
 class LocalFileSource:
@@ -25,13 +27,6 @@ class SourceSet:
 
 
 def load_source_sets_yaml(path: Path) -> dict[str, SourceSet]:
-    try:
-        import yaml
-    except ImportError as exc:  # pragma: no cover - exercised when extra missing
-        raise ImportError(
-            "PyYAML is required for source set configs. Install with: pip install 'anki-deck-generator[sync]'"
-        ) from exc
-
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("source set YAML root must be a mapping")

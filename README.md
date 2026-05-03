@@ -32,7 +32,7 @@ Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, 
 
 ### Local state and incremental sync (optional)
 
-Install the sync extra if you use YAML source sets: `pip install -e ".[sync]"` (PyYAML is also included in `[dev]`).
+PyYAML is included in the default install so YAML source sets load without an extra. The `[sync]` extra remains for compatibility and currently mirrors PyYAML in `[project.optional-dependencies]`.
 
 ```bash
 anki-notes-pipeline state init --db-path ~/.local/share/anki-notes-pipeline/state.db

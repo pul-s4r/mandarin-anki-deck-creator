@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import fitz  # PyMuPDF
+
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
-    import fitz  # PyMuPDF
-
     doc = fitz.open(stream=data, filetype="pdf")
     try:
         parts: list[str] = []
