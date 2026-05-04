@@ -72,10 +72,66 @@ class Blocker(importlib.abc.MetaPathFinder):
             raise ImportError("blocked", name)
         if name == "googleapiclient" or name.startswith("googleapiclient."):
             raise ImportError("blocked", name)
+        if name == "yaml" or name.startswith("yaml."):
+            raise ImportError("blocked", name)
         return None
 
 sys.meta_path.insert(0, Blocker())
 import anki_deck_generator  # noqa: F401
+print("ok")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+
+
+def test_cli_parse_run_does_not_import_state_sync_or_yaml(tmp_path: Path) -> None:
+    """
+    Lazy-loading boundary: importing CLI + parsing ``run`` args must not load state/sync stacks or PyYAML.
+
+    Run in a subprocess so ``sys.modules`` is clean (pytest may have imported them already).
+    """
+    probe_out = tmp_path / "out.csv"
+    code = f"""
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path({str(REPO_ROOT)!r})
+PROBE_OUT = Path({str(probe_out)!r})
+
+import importlib.abc
+
+class Blocker(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "yaml" or name.startswith("yaml."):
+            raise ImportError("blocked", name)
+        return None
+
+sys.meta_path.insert(0, Blocker())
+
+import anki_deck_generator.cli as cli_mod
+
+p = cli_mod._build_parser()
+p.parse_args(
+    [
+        "run",
+        str(REPO_ROOT / "tests" / "baselines" / "inputs" / "sample.md"),
+        "-o",
+        str(PROBE_OUT),
+        "--cedict-path",
+        str(REPO_ROOT / "tests" / "baselines" / "cedict_sample.u8"),
+        "--disable-sentences",
+        "--no-skip-lines-filter",
+    ]
+)
+
+for name in ("yaml", "anki_deck_generator.state", "anki_deck_generator.sync"):
+    if name in sys.modules:
+        raise SystemExit(f"unexpectedly loaded: {{name}}")
 print("ok")
 """
     proc = subprocess.run(
