@@ -4,24 +4,24 @@ from pathlib import Path
 
 import pytest
 
+import anki_deck_generator.pipeline as pipeline_module
 from anki_deck_generator.config.settings import Settings
-from anki_deck_generator.config.source_sets import SourceSet, LocalFileSource
+from anki_deck_generator.config.source_sets import LocalFileSource, SourceSet
+from anki_deck_generator.dictionary.enrich import VocabularyRow
 from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
+from anki_deck_generator.llm.schemas import LlmVocabularyItem
 from anki_deck_generator.pipeline import run_pipeline_from_text
 from anki_deck_generator.preprocess.llm_units import list_llm_text_units
 from anki_deck_generator.preprocess.normalize import normalize_unicode, optional_drop_metadata_lines
-from anki_deck_generator.state.records import compute_card_content_hash
+from anki_deck_generator.state.records import CardRecord, compute_card_content_hash
 from anki_deck_generator.state.sqlite_store import SqliteStateStore
-import anki_deck_generator.pipeline as pipeline_module
 from anki_deck_generator.sync.orchestrator import run_incremental_sync
 from anki_deck_generator.sync.source_ids import make_source_id
 
 
 def _card_semantic_sig_from_row(r: object) -> tuple[object, ...]:
     """Match CardRecord semantic fields + content_hash (sentence included)."""
-    from anki_deck_generator.dictionary.enrich import VocabularyRow
-
     assert isinstance(r, VocabularyRow)
     h = compute_card_content_hash(
         simplified=r.simplified,
@@ -44,8 +44,6 @@ def _card_semantic_sig_from_row(r: object) -> tuple[object, ...]:
 
 
 def _card_semantic_sig_from_record(c: object) -> tuple[object, ...]:
-    from anki_deck_generator.state.records import CardRecord
-
     assert isinstance(c, CardRecord)
     return (
         c.simplified.strip(),
@@ -117,8 +115,6 @@ def test_chunk_level_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     def spy(model: object, chunk: str) -> list:
         calls.append(chunk)
-        from anki_deck_generator.llm.schemas import LlmVocabularyItem
-
         label = "A" if chunk.startswith("A") else "B"
         return [LlmVocabularyItem(simplified=label, meaning=label.lower(), traditional="", pinyin="", part_of_speech="", usage_notes="")]
 
