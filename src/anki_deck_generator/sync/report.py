@@ -33,6 +33,7 @@ class SyncReport:
     outcomes: list[SyncRunOutcome] = field(default_factory=list)
     stats: SyncReportStats = field(default_factory=SyncReportStats)
     export_paths: list[str] = field(default_factory=list)
+    dry_run: bool = False
 
     def to_jsonable(self) -> dict:
         def _dt(o: object) -> object:

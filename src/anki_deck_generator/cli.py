@@ -101,7 +101,64 @@ def _build_parser() -> argparse.ArgumentParser:
     sched.add_argument("--no-skip-lines-filter", action="store_true")
     sched.add_argument("--disable-sentences", dest="enable_sentences", action="store_false")
     sched.set_defaults(enable_sentences=False)
+    sched.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would change (metadata only for Drive); no LLM, DB writes, or export",
+    )
     sched.add_argument("-v", "--verbose", action="store_true")
+
+    auth = sub.add_parser("auth", help="Authenticate an integration (e.g. OAuth for Google Drive)")
+    auth_sub = auth.add_subparsers(dest="auth_provider", required=True)
+    auth_gd = auth_sub.add_parser(
+        "google-drive",
+        help="Browser OAuth flow (drive.readonly); saves token JSON for schedule/import",
+    )
+    auth_gd.add_argument(
+        "--client-secrets",
+        type=Path,
+        required=True,
+        help="Google OAuth client secrets JSON (Desktop app)",
+    )
+    auth_gd.add_argument(
+        "--token-file",
+        type=Path,
+        default=None,
+        help="Where to write credentials JSON (default: XDG config path)",
+    )
+
+    imp = sub.add_parser("import", help="Import from an external source provider (optional integrations)")
+    imp.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="List registered provider names and exit",
+    )
+    imp.add_argument(
+        "provider",
+        nargs="?",
+        help="Provider name (e.g. echo, google-drive); omit with --list-providers",
+    )
+    imp.add_argument("--folder-id", default=None, help="Google Drive folder id (google-drive)")
+    imp.add_argument(
+        "--file-id",
+        dest="file_ids",
+        action="append",
+        default=None,
+        help="Google Drive file id (repeatable; google-drive)",
+    )
+    imp.add_argument(
+        "--credentials-file",
+        type=Path,
+        default=None,
+        help="OAuth token JSON or service-account key (google-drive)",
+    )
+    imp.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=None,
+        help="Output directory for downloaded files (google-drive)",
+    )
 
     return p
 
@@ -122,6 +179,10 @@ def main(argv: list[str] | None = None) -> int:
         from anki_deck_generator.cli_handlers.run import run_run_command
 
         return run_run_command(args)
+    if args.command == "auth":
+        from anki_deck_generator.cli_handlers.auth import run_auth_command
+
+        return run_auth_command(args)
     if args.command == "state":
         from anki_deck_generator.cli_handlers.state import run_state_command
 
@@ -130,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
         from anki_deck_generator.cli_handlers.schedule import run_schedule_command
 
         return run_schedule_command(args)
+    if args.command == "import":
+        from anki_deck_generator.cli_handlers.import_command import run_import_command
+
+        return run_import_command(args)
     return 1
 
 
