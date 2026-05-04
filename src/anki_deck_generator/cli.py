@@ -7,12 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from anki_deck_generator.cli_handlers import (
-    apply_run_like_settings,
-    run_run_command,
-    run_schedule_command,
-    run_state_command,
-)
+from anki_deck_generator.cli_handlers.common import apply_run_like_settings
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -124,10 +119,16 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     if args.command == "run":
+        from anki_deck_generator.cli_handlers.run import run_run_command
+
         return run_run_command(args)
     if args.command == "state":
+        from anki_deck_generator.cli_handlers.state import run_state_command
+
         return run_state_command(args)
     if args.command == "schedule":
+        from anki_deck_generator.cli_handlers.schedule import run_schedule_command
+
         return run_schedule_command(args)
     return 1
 
