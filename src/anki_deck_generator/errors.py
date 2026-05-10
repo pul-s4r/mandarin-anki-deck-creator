@@ -21,6 +21,10 @@ class AuthenticationError(IntegrationError):
     """Authentication or authorization failures for an integration."""
 
 
+class AnkiConnectError(IntegrationError):
+    """AnkiConnect JSON-RPC request failed or Anki is unreachable."""
+
+
 class StateError(AnkiPipelineError):
     """SQLite / StateStore failures (schema mismatch, corrupt DB, etc.)."""
 
