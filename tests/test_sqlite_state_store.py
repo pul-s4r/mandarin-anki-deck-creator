@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -188,3 +189,25 @@ def test_concurrent_upserts(store: SqliteStateStore) -> None:
         t.join()
     assert not errors
     assert len(list(store.iter_all_cards())) == 3
+
+
+def test_upsert_updates_ankiweb_when_vocab_unchanged(store: SqliteStateStore) -> None:
+    now = datetime.now(UTC)
+    cr = CardRecord(
+        card_id="c1",
+        simplified="词",
+        meaning="same",
+        last_updated_at=now,
+        first_seen_source_id="s",
+        content_hash="",
+    )
+    assert store.upsert_card(cr) is CardUpsertResult.CREATED
+    synced = replace(
+        cr,
+        ankiweb_note_id=42,
+        ankiweb_last_synced_at=now,
+        ankiweb_last_synced_fields={"Meaning": "same"},
+    )
+    assert store.upsert_card(synced) is CardUpsertResult.UPDATED
+    got = store.get_card_by_key("词")
+    assert got is not None and got.ankiweb_note_id == 42
