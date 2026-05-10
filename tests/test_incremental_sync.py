@@ -119,6 +119,10 @@ def test_chunk_level_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         return [LlmVocabularyItem(simplified=label, meaning=label.lower(), traditional="", pinyin="", part_of_speech="", usage_notes="")]
 
     monkeypatch.setattr(pipeline_module, "extract_vocabulary_from_chunk", spy)
+    monkeypatch.setattr(
+        "anki_deck_generator.sync.orchestrator.build_bedrock_model",
+        lambda _settings: object(),
+    )
 
     md = tmp_path / "notes.md"
     # Two chunks with chunk_size=4 overlap=0 after normalize: "AAAA\n" is len 5 -> one chunk? 
