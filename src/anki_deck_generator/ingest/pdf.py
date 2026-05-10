@@ -3,16 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def extract_text_from_pdf(path: Path) -> str:
+def extract_text_from_pdf_bytes(data: bytes) -> str:
     import fitz  # PyMuPDF
 
-    doc = fitz.open(path)
+    doc = fitz.open(stream=data, filetype="pdf")
     try:
         parts: list[str] = []
-        for idx, page in enumerate(doc):
+        for page in doc:
             page_text = page.get_text()
             parts.append(page_text)
-        out = "\n".join(parts)
-        return out
+        return "\n".join(parts)
     finally:
         doc.close()
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    return extract_text_from_pdf_bytes(path.read_bytes())
