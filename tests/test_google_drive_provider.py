@@ -23,8 +23,8 @@ def drive_provider() -> gd.GoogleDriveProvider:
 
 def test_get_revision_returns_tuple(drive_provider: gd.GoogleDriveProvider) -> None:
     files_api = drive_provider._service.files.return_value
-    files_api.get.return_value.execute.return_value = {"headRevisionId": "revA", "etag": "et1"}
-    assert drive_provider.get_revision("fileX") == ("revA", "et1")
+    files_api.get.return_value.execute.return_value = {"headRevisionId": "revA"}
+    assert drive_provider.get_revision("fileX") == ("revA", "")
     files_api.get.assert_called_once()
     _, kwargs = files_api.get.call_args
     assert kwargs["fileId"] == "fileX"
@@ -173,3 +173,30 @@ def test_oauth_writes_token_json(tmp_path: Path) -> None:
 
     flow_cls.from_client_secrets_file.assert_called_once()
     assert json.loads(token_out.read_text(encoding="utf-8")) == {"token": "abc"}
+
+
+def test_load_credentials_rejects_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "empty.json"
+    path.write_text("", encoding="utf-8")
+    with pytest.raises(IntegrationError, match="empty"):
+        gd.load_credentials_from_file(path)
+
+
+def test_load_credentials_rejects_client_secrets_json(tmp_path: Path) -> None:
+    path = tmp_path / "client_secret.json"
+    path.write_text(
+        json.dumps({"installed": {"client_id": "x", "client_secret": "y"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(IntegrationError, match="client secrets"):
+        gd.load_credentials_from_file(path)
+
+
+def test_load_credentials_rejects_incomplete_user_json(tmp_path: Path) -> None:
+    path = tmp_path / "bad_user.json"
+    path.write_text(
+        json.dumps({"client_id": "a", "client_secret": "b", "token": "t"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(IntegrationError, match="refresh_token"):
+        gd.load_credentials_from_file(path)

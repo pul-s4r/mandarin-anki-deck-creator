@@ -65,11 +65,47 @@ def load_credentials_from_file(path: Path, *, scopes: tuple[str, ...] | None = N
     """Load OAuth user credentials JSON or a service-account key file."""
     service_account, Credentials, _build = _optional_google_imports()
     sc = list(scopes or (READONLY_DRIVE_SCOPE,))
-    raw_text = path.read_text(encoding="utf-8")
-    data = json.loads(raw_text)
+    raw_text = path.read_text(encoding="utf-8").strip()
+    if not raw_text:
+        raise IntegrationError(
+            f"Google credentials file is empty: {path}. "
+            "For OAuth, run: anki-notes-pipeline auth google-drive --client-secrets PATH/to/client_secret*.json"
+        )
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise IntegrationError(f"Google credentials file is not valid JSON: {path}") from exc
+
     if data.get("type") == "service_account":
         return service_account.Credentials.from_service_account_file(str(path), scopes=sc)
-    return Credentials.from_authorized_user_file(str(path), scopes=sc)
+
+    if "installed" in data or "web" in data:
+        raise IntegrationError(
+            f"{path} looks like OAuth *client* secrets (desktop/API console JSON), not a saved user token. "
+            "Run once: anki-notes-pipeline auth google-drive --client-secrets <that client_secrets.json file>. "
+            "Then set credentials_file in YAML (or --credentials-file) to the *token* path written by that command "
+            "(default ~/.config/anki-notes-pipeline/google-drive-token.json), not the client secrets file."
+        )
+
+    if not isinstance(data, dict):
+        raise IntegrationError(f"Google OAuth token JSON must be a JSON object: {path}")
+
+    required = ("refresh_token", "client_id", "client_secret")
+    missing = [k for k in required if not data.get(k)]
+    if missing:
+        raise IntegrationError(
+            f"OAuth token file {path} is missing required field(s): {', '.join(missing)}. "
+            "Complete the browser login with: anki-notes-pipeline auth google-drive --client-secrets <client_secrets.json>. "
+            "Use the generated token file as credentials_file — not client_secrets.json and not an empty placeholder."
+        )
+
+    try:
+        return Credentials.from_authorized_user_file(str(path), scopes=sc)
+    except ValueError as exc:
+        raise IntegrationError(
+            f"Could not load OAuth credentials from {path}: {exc}. "
+            "Re-run auth google-drive or confirm the file is the JSON saved after the browser flow."
+        ) from exc
 
 
 def run_google_drive_oauth_and_save_token(*, client_secrets: Path, token_file: Path) -> None:
@@ -182,7 +218,7 @@ class GoogleDriveProvider(IntegrationProvider):
                 req = svc.files().list(
                     q=q,
                     spaces="drive",
-                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, headRevisionId, etag, trashed)",
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, headRevisionId, trashed)",
                     pageToken=page_token,
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
@@ -202,19 +238,20 @@ class GoogleDriveProvider(IntegrationProvider):
         try:
             body = svc.files().get(
                 fileId=file_id,
-                fields="headRevisionId,etag",
+                fields="headRevisionId",
                 supportsAllDrives=True,
             ).execute()
         except Exception as exc:
             _map_http_error(exc, context=f"Drive metadata get for {file_id!r}")
-        return (body.get("headRevisionId") or "", body.get("etag") or "")
+        # Drive API v3 does not expose File.etag in field masks; revision id is enough for skip logic.
+        return (body.get("headRevisionId") or "", "")
 
     def _fetch_one_meta(self, file_id: str) -> dict[str, Any]:
         svc = self._svc()
         try:
             raw = svc.files().get(
                 fileId=file_id,
-                fields="id, name, mimeType, modifiedTime, headRevisionId, etag, trashed",
+                fields="id, name, mimeType, modifiedTime, headRevisionId, trashed",
                 supportsAllDrives=True,
             ).execute()
         except Exception as exc:
