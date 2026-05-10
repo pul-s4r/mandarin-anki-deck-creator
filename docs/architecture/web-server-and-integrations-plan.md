@@ -3543,3 +3543,160 @@ The most parallelizable milestone is **M5**, where D5 and B3 are fully independe
 - A team could productively split work along the M2-spine vs. Drive-ingest seams (because Epic D's first half can advance in parallel with Epic B/C).
 - A solo implementer following §17.9's order is already on a near-optimal serial schedule; they don't need to think about the DAG day-to-day.
 - The five-story spine `B1 → B2 → B3 → B4 → C1` is unavoidable and is the right place to focus quality effort, since downstream defects there propagate everywhere.
+
+---
+
+## 18. Simplified Sync Architecture (supersedes §11.3.8 / §11.6.2 three-tier Lambda design)
+
+This section describes a simplification of the runtime architecture from §§11.3.8 and 11.6.2. The goal is to reduce the number of independently deployed Lambda functions and dedupe layers while preserving all correctness invariants from §12 and the debounce behavior from §11.6.
+
+### 18.1 Motivation
+
+The original design (§11.3.8 + §11.6.2) specifies three Lambda functions:
+
+- **Lambda A** — webhook receiver (verify + enqueue)
+- **Lambda B** — worker (run_sync + advance pageToken)
+- **Lambda C** — debouncer (upsert PendingEdits + advance pageToken)
+
+Plus additional dedupe layers: webhook message-number replay logic, SQS FIFO content-based dedup, and the PendingEdits table itself.
+
+The simplified design collapses Lambda B and C into a single "sync" Lambda with two invocation modes, and uses PendingEdits as the **canonical** dedupe layer — removing overlapping replay-detection logic at the webhook tier.
+
+### 18.2 Simplified runtime components
+
+```
+Drive ──► API Gateway ──► Webhook Receiver Lambda
+                              │   (verifies headers, enqueues channel_id, returns 200)
+                              ▼
+                          SQS queue (FIFO, MessageGroupId = channel_id)
+                              │
+                              ▼
+                    ┌─────────────────────────┐
+                    │  Unified Sync Lambda     │
+                    │                         │
+                    │  Mode A: pull_changes   │
+                    │    • changes.list        │
+                    │    • upsert PendingEdits │
+                    │    • advance pageToken   │
+                    │                         │
+                    │  Mode B: process_pending│
+                    │    • poll ready edits    │
+                    │    • run_sync            │
+                    │    • clear processed     │
+                    └─────────────────────────┘
+                              │
+              Mode A: invoked by SQS messages
+              Mode B: invoked by EventBridge (1-min tick)
+```
+
+Only **two** Lambda deployables:
+1. Webhook Receiver — thin, fast, near-trivial.
+2. Sync Lambda — handles both changes-pull and pending-processing, selected by invocation source.
+
+### 18.3 Single cursor-owner rule
+
+**Invariant: only Mode A (the changes-pull path) may advance `DriveChannel.page_token`.** Mode B (the pending-edits processor) never reads or writes the page token.
+
+This means:
+- `page_token` reflects "Drive changes we have **observed**" (not necessarily processed).
+- `PendingEdits` represents the gap: "observed but not yet processed."
+- The cursor advances **after** PendingEdits rows are durably written, not after processing completes.
+
+Atomic advance uses a conditional write: `UPDATE ... SET page_token = :new WHERE page_token = :expected`. This protects against concurrent Mode A invocations racing on the same channel.
+
+### 18.4 PendingEdits as the canonical dedupe layer
+
+`PendingEdits` keyed on `(source_set, file_id)` is the **sole** deduplication mechanism:
+
+- Repeated webhook pings for the same file simply extend `ready_at` on the existing row — no duplicate rows, no duplicate downstream work.
+- The webhook message-number replay check from §11.3.7 step 4 is **removed**. Duplicate Drive pings are harmless: they upsert the same PendingEdits row idempotently.
+- SQS FIFO `MessageGroupId = channel_id` still serializes per-channel processing for cursor safety, but the content-based dedup window is no longer load-bearing.
+
+Trade-off: more duplicate SQS messages and Mode A invocations may occur. These are cheap (a few ms of Lambda time + one DynamoDB/SQLite upsert each). The expensive work (LLM processing in Mode B) is unchanged because PendingEdits coalesces everything.
+
+### 18.5 Debounce semantics (preserved)
+
+The debounce behavior from §11.6 is fully preserved:
+
+- `quiet_minutes`, `max_delay_minutes`, and `force` override work identically.
+- Mode A upserts PendingEdits with `ready_at = now + quiet_minutes` on each event.
+- Mode B polls for `ready_at <= now OR hard_deadline_at <= now OR force = true`.
+- Race-safe clear: `clear_pending_edit(... if_last_seen_before=run_started_at)` ensures new events that arrive during processing keep the row alive for the next cycle.
+
+### 18.6 Core correctness invariants
+
+All invariants from the original design are maintained:
+
+| # | Invariant | How maintained |
+|---|-----------|----------------|
+| 1 | Single cursor owner | Only `pull_changes` (Mode A) calls `advance_drive_channel_token`. |
+| 2 | Cursor advances only after durable enqueue-to-state | Mode A upserts PendingEdits **before** advancing pageToken. |
+| 3 | Monotonic cursor progression | Conditional write: `page_token = :new WHERE page_token = :expected`. |
+| 4 | One logical pending row per file/session key | `PendingEdits` primary key: `(source_set, file_id)`. |
+| 5 | Debounce upsert is idempotent | ON CONFLICT updates timestamps/counters; never creates duplicates. |
+| 6 | Processor idempotency | `run_sync` uses content/revision hashing; same input = same output. |
+| 7 | Document/chunk no-op short-circuit | Unchanged from §12.4 layered change detection. |
+| 8 | Atomic completion semantics | PendingEdit cleared only after successful `run_sync`; row retained on failure. |
+| 9 | No lost changes during races | `clear_pending_edit(if_last_seen_before=run_started_at)` preserves new arrivals. |
+| 10 | Retry safety | Duplicate webhooks → idempotent upsert. Duplicate Mode B → `run_sync` is idempotent. |
+
+### 18.7 NFR impact summary
+
+| NFR | Impact | Why |
+|-----|--------|-----|
+| Intermittent compute / scale-to-zero | Improved | Fewer Lambdas to configure and monitor; still event/schedule driven. |
+| Idempotency | Maintained | Content/revision hashing, idempotent upserts, atomic pageToken. |
+| Durability across runs | Maintained | PendingEdits + StateStore remain durable; no in-memory dedupe. |
+| Safety (retry/failure behavior) | Mostly maintained | Fewer moving parts reduces failure modes; slightly noisier duplicate retries (safe but not silent). |
+| Observability | Slightly degraded | Fewer distinct stages = less fine-grained suppression telemetry. |
+| Operational complexity | Improved | Smaller IaC footprint, fewer handlers, simpler ownership boundaries. |
+
+### 18.8 Lost / degraded functionality (explicit)
+
+1. **Weaker duplicate-event suppression at ingress.** More duplicate SQS messages / Mode A wakeups may occur. Cost/latency noise only, not incorrect results.
+2. **Less granular diagnostics.** Harder to distinguish transport-layer vs. state-layer duplicate absorption.
+3. **Reduced stage isolation.** Combining debouncer + processor responsibilities in one Lambda reduces blast-radius isolation (mitigated by clear mode separation within the handler).
+
+### 18.9 Production guardrails / alerts
+
+| # | Alert | Condition |
+|---|-------|-----------|
+| 1 | Stuck pending edits | PendingEdits row age > 2× max_delay_minutes. |
+| 2 | Cursor stagnation | Webhook traffic exists but page_token hasn't advanced for X hours. |
+| 3 | Duplicate-work spike | `worker_runs / distinct_file_ids_processed` exceeds baseline. |
+| 4 | Idempotency breach sentinel | `cards_created` spikes when revision/hash unchanged. |
+| 5 | Retry storm | Repeated Lambda retries / DLQ depth > 0. |
+| 6 | Pending-clear mismatch | Processed success but pending row still present (or inverse). |
+
+### 18.10 Acceptance criterion
+
+After any combination of duplicate/reordered/retried events, final card state equals exactly one clean processing of the latest document revisions, with no lost changes.
+
+### 18.11 Module layout
+
+```
+src/anki_deck_generator/
+├── lambda_handlers/
+│   ├── __init__.py
+│   ├── handler_webhook.py      # Webhook Receiver Lambda
+│   └── handler_sync.py         # Unified Sync Lambda (Mode A + Mode B)
+├── state/
+│   ├── records.py              # + PendingEditRecord
+│   ├── store.py                # + advance_drive_channel_token, pending-edit methods
+│   └── sqlite_store.py         # + pending_edits table implementation
+└── sync/
+    └── orchestrator.py          # run_incremental_sync (unchanged)
+```
+
+### 18.12 Minimum test suite
+
+| # | Test | Assertion |
+|---|------|-----------|
+| 1 | Duplicate webhook replay | Same event N times → exactly one pending row per file key; stable final state. |
+| 2 | Duplicate queue delivery | Same queue message twice → no duplicate cards, no cursor corruption. |
+| 3 | Crash-point tests | Crash before pending write / before token advance / after token advance / before pending clear → no lost changes, eventual recovery. |
+| 4 | Concurrent worker | Two workers on same source-set → cursor monotonicity, no duplicate net writes. |
+| 5 | No-op reprocess | Re-run with unchanged revision/hash → zero new cards/updates, zero LLM calls. |
+| 6 | In-flight update race | New event during processing → pending row remains for next cycle. |
+| 7 | End-to-end idempotency | Same logical edit session replayed multiple times → identical final deck. |
+| 8 | Property test (optional) | Randomized event reorder/duplication → convergence to same final state. |

@@ -17,6 +17,7 @@ from anki_deck_generator.state.records import (
     CardUpsertResult,
     ChunkRecord,
     DriveChannelRecord,
+    PendingEditRecord,
     RunReportRecord,
     SourceRecord,
     compute_card_content_hash,
@@ -115,6 +116,20 @@ class SqliteStateStore:
                 finished_at TEXT,
                 sync_report_json TEXT NOT NULL DEFAULT '{}',
                 schema_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS pending_edits (
+                source_set TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                provider TEXT NOT NULL DEFAULT 'google-drive',
+                first_seen_at TEXT,
+                last_seen_at TEXT,
+                ready_at TEXT,
+                hard_deadline_at TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                force INTEGER NOT NULL DEFAULT 0,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (source_set, file_id)
             );
             """
         )
@@ -429,6 +444,140 @@ class SqliteStateStore:
             )
 
         self._write(op)
+
+    def advance_drive_channel_token(
+        self,
+        channel_id: str,
+        *,
+        expected_prev_token: str,
+        new_token: str,
+    ) -> bool:
+        def op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                """
+                UPDATE drive_channels
+                   SET page_token = ?
+                 WHERE channel_id = ? AND page_token = ?
+                """,
+                (new_token, channel_id, expected_prev_token),
+            )
+            return cur.rowcount > 0
+
+        return self._write(op)
+
+    # -- PendingEdits -----------------------------------------------------------
+
+    def upsert_pending_edit(self, rec: PendingEditRecord) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO pending_edits (
+                    source_set, file_id, user_id, provider,
+                    first_seen_at, last_seen_at, ready_at, hard_deadline_at,
+                    message_count, force, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_set, file_id) DO UPDATE SET
+                    last_seen_at    = excluded.last_seen_at,
+                    ready_at        = excluded.ready_at,
+                    message_count   = pending_edits.message_count + 1,
+                    force           = CASE WHEN pending_edits.force THEN pending_edits.force
+                                           ELSE excluded.force END,
+                    schema_version  = excluded.schema_version
+                """,
+                (
+                    rec.source_set,
+                    rec.file_id,
+                    rec.user_id,
+                    rec.provider,
+                    _dt_iso(rec.first_seen_at),
+                    _dt_iso(rec.last_seen_at),
+                    _dt_iso(rec.ready_at),
+                    _dt_iso(rec.hard_deadline_at),
+                    rec.message_count,
+                    int(rec.force),
+                    rec.schema_version,
+                ),
+            )
+
+        self._write(op)
+
+    def get_pending_edit(self, source_set: str, file_id: str) -> PendingEditRecord | None:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM pending_edits WHERE source_set = ? AND file_id = ?",
+            (source_set, file_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_pending(row)
+
+    def iter_ready_pending_edits(
+        self,
+        as_of: datetime,
+        *,
+        source_set: str | None = None,
+    ) -> Iterable[PendingEditRecord]:
+        conn = self._conn()
+        iso = _dt_iso(as_of)
+        if source_set is not None:
+            rows = conn.execute(
+                """
+                SELECT * FROM pending_edits
+                 WHERE source_set = ?
+                   AND (ready_at <= ? OR hard_deadline_at <= ? OR force = 1)
+                 ORDER BY ready_at
+                """,
+                (source_set, iso, iso),
+            )
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM pending_edits
+                 WHERE ready_at <= ? OR hard_deadline_at <= ? OR force = 1
+                 ORDER BY ready_at
+                """,
+                (iso, iso),
+            )
+        for row in rows:
+            yield self._row_to_pending(row)
+
+    def clear_pending_edit(
+        self,
+        source_set: str,
+        file_id: str,
+        *,
+        if_last_seen_before: datetime | None = None,
+    ) -> bool:
+        def op(conn: sqlite3.Connection) -> bool:
+            if if_last_seen_before is not None:
+                iso = _dt_iso(if_last_seen_before)
+                cur = conn.execute(
+                    "DELETE FROM pending_edits WHERE source_set = ? AND file_id = ? AND last_seen_at <= ?",
+                    (source_set, file_id, iso),
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM pending_edits WHERE source_set = ? AND file_id = ?",
+                    (source_set, file_id),
+                )
+            return cur.rowcount > 0
+
+        return self._write(op)
+
+    def _row_to_pending(self, row: sqlite3.Row) -> PendingEditRecord:
+        return PendingEditRecord(
+            source_set=row["source_set"],
+            file_id=row["file_id"],
+            provider=row["provider"] or "google-drive",
+            first_seen_at=_parse_dt(row["first_seen_at"]),
+            last_seen_at=_parse_dt(row["last_seen_at"]),
+            ready_at=_parse_dt(row["ready_at"]),
+            hard_deadline_at=_parse_dt(row["hard_deadline_at"]),
+            message_count=int(row["message_count"]),
+            force=bool(row["force"]),
+            user_id=row["user_id"] or "default",
+            schema_version=int(row["schema_version"]),
+        )
 
     def record_run(self, rec: RunReportRecord) -> None:
         def op(conn: sqlite3.Connection) -> None:

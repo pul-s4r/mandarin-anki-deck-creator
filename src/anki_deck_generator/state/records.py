@@ -99,6 +99,27 @@ class DriveChannelRecord:
 
 
 @dataclass
+class PendingEditRecord:
+    """A file edit that is cooling off before processing (debounce layer).
+
+    Keyed by ``(source_set, file_id)``; repeated events for the same file
+    update the existing row rather than creating duplicates.
+    """
+
+    source_set: str
+    file_id: str
+    provider: str = "google-drive"
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    ready_at: datetime | None = None
+    hard_deadline_at: datetime | None = None
+    message_count: int = 0
+    force: bool = False
+    user_id: str = "default"
+    schema_version: int = 1
+
+
+@dataclass
 class RunReportRecord:
     run_id: str
     trigger: str = "manual"
