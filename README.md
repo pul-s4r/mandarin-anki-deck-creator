@@ -24,7 +24,30 @@ Download CC-CEDICT (`cedict_ts.u8`) from [MDBG CC-CEDICT](https://www.mdbg.net/c
 anki-notes-pipeline run /path/to/notes.pdf --output out.csv --cedict-path /path/to/cedict_ts.u8
 ```
 
+Recoverable failures (unsupported file type, bad LLM fixture, etc.) print a single `error: …` line on stderr and exit with code 1.
+
+Library callers can invoke `run_pipeline_from_text` (pure text in → `PipelineResult` out) and keep filesystem/HTTP concerns in the caller; the CLI continues to use `run_pipeline` on paths. CSV bytes are produced through the `Exporter` protocol (`export/exporters.py`) so additional targets (XLSX, AnkiConnect, etc.) can follow the same shape later.
+
 Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, model params via environment (see `anki_deck_generator.config.settings`).
+
+### Local state and incremental sync (optional)
+
+Install the sync extra if you use YAML source sets: `pip install -e ".[sync]"` (PyYAML is also included in `[dev]`).
+
+```bash
+anki-notes-pipeline state init --db-path ~/.local/share/anki-notes-pipeline/state.db
+anki-notes-pipeline state list-cards --db-path ~/.local/share/anki-notes-pipeline/state.db
+anki-notes-pipeline state list-runs --db-path ~/.local/share/anki-notes-pipeline/state.db
+```
+
+Define `source_sets` in a YAML file (see `ANKI_PIPELINE_SOURCE_SET_CONFIG` or pass `--source-set-config`), then:
+
+```bash
+anki-notes-pipeline schedule --source-set myset --state-db /path/to/state.db \
+  --source-set-config sources.yaml --output deck.csv --cedict-path /path/to/cedict_ts.u8
+```
+
+Re-running `schedule` on unchanged files skips ingest/LLM at the document level; edits reuse cached chunks when only part of a document changes.
 
 ## Debug logging helper
 
@@ -35,3 +58,7 @@ The module `anki_deck_generator.debuglog` is kept in the repo as a small NDJSON 
 ```bash
 pytest
 ```
+
+### Script-mode baseline (CI)
+
+Regression tests under `tests/test_script_mode_baseline.py` compare CLI output to checked-in CSVs in `tests/baselines/outputs/` using a deterministic LLM stub. Set `ANKI_PIPELINE_LLM_FIXTURE_PATH` to `tests/baselines/llm_mock.json` (as CI does) so `anki-notes-pipeline run` does not call Bedrock. To refresh fixtures after intentional output changes, run `python tests/baselines/record.py` from the repo root with dev dependencies installed.

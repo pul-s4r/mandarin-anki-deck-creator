@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 
-def extract_text_from_docx(path: Path) -> str:
-    from docx import Document
-
-    document = Document(path)
+def _docx_document_to_text(document: object) -> str:
     blocks: list[str] = []
     for paragraph in document.paragraphs:
         text = paragraph.text.strip()
@@ -18,3 +16,16 @@ def extract_text_from_docx(path: Path) -> str:
             if cells:
                 blocks.append("\t".join(cells))
     return "\n".join(blocks)
+
+
+def extract_text_from_docx_bytes(data: bytes) -> str:
+    from docx import Document
+
+    document = Document(io.BytesIO(data))
+    return _docx_document_to_text(document)
+
+
+def extract_text_from_docx(path: Path) -> str:
+    from docx import Document
+
+    return _docx_document_to_text(Document(path))
