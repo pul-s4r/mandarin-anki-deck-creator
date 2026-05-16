@@ -65,6 +65,24 @@ def _ankiweb_meta_matches_row(row: sqlite3.Row, rec: CardRecord) -> bool:
     return _normalize_stored_anki_fields(row["ankiweb_last_synced_fields"]) == dict(rec.ankiweb_last_synced_fields or {})
 
 
+def _ensure_cards_ankiweb_columns(conn: sqlite3.Connection) -> None:
+    """Add ankiweb_* columns when upgrading pre-M4 databases (idempotent)."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cards' LIMIT 1"
+        ).fetchone()
+        is None
+    ):
+        return
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(cards)")}
+    if "ankiweb_note_id" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_note_id INTEGER")
+    if "ankiweb_last_synced_at" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_last_synced_at TEXT")
+    if "ankiweb_last_synced_fields" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_last_synced_fields TEXT")
+
+
 class SqliteStateStore:
     """One SQLite file per deployment; thread-safe writes via BEGIN IMMEDIATE."""
 
@@ -147,6 +165,7 @@ class SqliteStateStore:
             );
             """
         )
+        _ensure_cards_ankiweb_columns(conn)
         conn.commit()
 
     def init_schema(self) -> None:
