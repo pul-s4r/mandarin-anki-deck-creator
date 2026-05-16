@@ -29,6 +29,8 @@ ANKI_MODEL_FIELDS: tuple[str, ...] = (
     "ExtId",
 )
 
+_VALID_CONFLICT_POLICIES: frozenset[str] = frozenset({"prefer-remote", "prefer-local", "tag-and-skip"})
+
 _MANAGED_TAG_PREFIXES: tuple[str, ...] = ("ext_id:", "req:", "run:", "src:", "enr:", "conflict:")
 
 
@@ -225,7 +227,11 @@ def _persist_card_sync(
 def _chosen_side(conflict_policy: str) -> str:
     if conflict_policy == "prefer-local":
         return "local"
-    return "remote"
+    if conflict_policy in ("prefer-remote", "tag-and-skip"):
+        return "remote"
+    raise ValueError(
+        f"conflict_policy must be one of {sorted(_VALID_CONFLICT_POLICIES)}, got {conflict_policy!r}"
+    )
 
 
 def _process_existing_note(
@@ -371,6 +377,10 @@ def export_to_ankiweb(
     sequentially for correctness with duplicate and merge fallbacks.
     """
     _ = batch_size
+    if conflict_policy not in _VALID_CONFLICT_POLICIES:
+        raise ValueError(
+            f"conflict_policy must be one of {sorted(_VALID_CONFLICT_POLICIES)}, got {conflict_policy!r}"
+        )
     rd = run_date.strip() or date.today().isoformat()
     req_id = str(uuid.uuid4())
     result = AnkiWebExportResult()

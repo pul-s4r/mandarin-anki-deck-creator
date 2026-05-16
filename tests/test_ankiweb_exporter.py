@@ -92,6 +92,20 @@ def test_preflight_model_field_mismatch() -> None:
         )
 
 
+def test_invalid_conflict_policy_raises() -> None:
+    client = _base_client()
+    store = MagicMock()
+    with pytest.raises(ValueError, match="conflict_policy"):
+        export_to_ankiweb(
+            cards=[_mk_card()],
+            state_store=store,
+            client=client,
+            deck_name="D",
+            model_name="Chinese vocabulary",
+            conflict_policy="prefer_remote",
+        )
+
+
 def test_create_new_note_persists_state(tmp_path: Path) -> None:
     db = tmp_path / "s.db"
     store = SqliteStateStore(db)
