@@ -372,6 +372,7 @@ def export_to_ankiweb(
     """
     _ = batch_size
     rd = run_date.strip() or date.today().isoformat()
+    req_id = str(uuid.uuid4())
     result = AnkiWebExportResult()
     cards_list = [c for c in cards if c.user_id == user_id]
     _preflight(
@@ -390,7 +391,6 @@ def export_to_ankiweb(
         if nid is None:
             pending_create.append(card)
             continue
-        req_id = str(uuid.uuid4())
         try:
             if _process_existing_note(
                 client=client,
@@ -407,7 +407,6 @@ def export_to_ankiweb(
             result.errors.append(str(exc))
 
     for card in pending_create:
-        req_id = str(uuid.uuid4())
         payload = build_note_payload(
             card,
             deck_name=deck_name,
