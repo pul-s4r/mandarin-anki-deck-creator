@@ -370,11 +370,15 @@ def export_to_ankiweb(
     batch_size: int = 50,
     run_date: str = "",
     user_id: str = "default",
+    auto_sync: bool = True,
 ) -> AnkiWebExportResult:
     """Push vocabulary cards to desktop Anki via AnkiConnect (§13.3).
 
     ``batch_size`` is reserved for future batched ``addNotes``; exports are applied
     sequentially for correctness with duplicate and merge fallbacks.
+
+    When ``auto_sync`` is false, mutations are not pushed to AnkiWeb via
+    ``client.sync()``; the caller may sync manually.
     """
     _ = batch_size
     if conflict_policy not in _VALID_CONFLICT_POLICIES:
@@ -441,6 +445,8 @@ def export_to_ankiweb(
 
     if needs_sync:
         result.sync_requested = True
+        if not auto_sync:
+            return result
         try:
             client.sync()
             result.sync_status = "ok"

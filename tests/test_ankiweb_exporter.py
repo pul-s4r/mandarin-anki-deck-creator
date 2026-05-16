@@ -132,6 +132,30 @@ def test_create_new_note_persists_state(tmp_path: Path) -> None:
     assert loaded.ankiweb_last_synced_fields is not None
 
 
+def test_auto_sync_false_skips_client_sync(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    store = SqliteStateStore(db)
+    store.init_schema()
+    card = _mk_card()
+    client = _base_client()
+    client.find_notes.return_value = []
+    client.can_add_notes_with_error_detail.return_value = [{"canAdd": True}]
+    client.add_notes.return_value = [909090]
+
+    r = export_to_ankiweb(
+        cards=[card],
+        state_store=store,
+        client=client,
+        deck_name="D",
+        model_name="Chinese vocabulary",
+        auto_sync=False,
+    )
+    assert r.created == 1
+    assert r.sync_requested is True
+    assert r.sync_status == ""
+    client.sync.assert_not_called()
+
+
 def test_cached_note_id_short_circuits_find_notes(tmp_path: Path) -> None:
     db = tmp_path / "s.db"
     store = SqliteStateStore(db)
