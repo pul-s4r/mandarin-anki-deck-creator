@@ -73,15 +73,90 @@ vocab-review-agent/          ← new package (depends on core)
 4. Both apps share a single SQLite state database (same `StateStore` protocol, different tables for app-specific state)
 5. No breaking changes to the existing CLI; the extraction pipeline continues to work identically
 
-### Shared database strategy
+### Shared state strategy
 
-The SQLite database gains new tables for the review agent but keeps the existing schema intact:
+#### The DynamoDB migration context
 
-- **Existing tables** (owned by extraction pipeline): `sources`, `chunks`, `cards`, `runs`, `drive_channels`
-- **New shared tables** (owned by core): `term_tags`, `tag_dimensions`
-- **New review tables** (owned by review agent): `review_sessions`, `review_schedule`, `generated_content`, `notification_log`
+The extraction pipeline is on a trajectory from SQLite (local, single-user) to DynamoDB (cloud, multi-device). Once that migration lands, SQLite is deprecated for card state in the generator. This raises the question: does the review agent also target DynamoDB, or does it maintain its own local store?
 
-Both apps open the same DB file. Schema migrations are versioned per-owner (core, extraction, review) to allow independent deployment.
+#### Decision: separate state ownership, shared data contract
+
+The two apps should **not** share a single DynamoDB table or database instance directly. Instead:
+
+| Concern | Extraction pipeline (generator) | Review agent |
+|---------|-------------------------------|--------------|
+| Card state (canonical terms) | DynamoDB (primary, post-migration) | **Reads from** generator's DynamoDB via core's read protocol |
+| Tags / categorisation | DynamoDB (shared tables, owned by core) | Reads + writes tags via same core protocol |
+| Review-specific state | N/A | **Own store** (local SQLite or own DynamoDB table) |
+| Sync metadata (sources, chunks) | DynamoDB (owned by generator) | No access needed |
+
+#### Why not a single shared DynamoDB instance for everything?
+
+1. **Coupling**: If both apps write to the same tables, schema changes in one app risk breaking the other. The generator's card table has fields (`ankiweb_note_id`, `content_hash`, chunk linkage) that are irrelevant to the review agent, and the review agent has state (session progress, confidence ratings, generated content cache) that would pollute the generator's data model.
+
+2. **Operational independence**: The review agent should work offline (e.g., on a plane, on a phone in airplane mode). If it depends on DynamoDB for its core loop (serve a drill, record confidence), it can't function without network. The generator can afford to require network — it's a batch pipeline that runs at a desk.
+
+3. **Cost and latency**: Review sessions are interactive (sub-100ms response expected). Reading a few terms from DynamoDB is fine; writing every confidence rating and session tick to DynamoDB adds latency and cost for no benefit to the generator.
+
+4. **Blast radius**: A bug in the review agent's write path shouldn't be able to corrupt the canonical card data that the generator owns.
+
+#### What IS shared
+
+- **The `StateStore` protocol in `anki-pipeline-core`** gains a DynamoDB implementation (alongside the existing SQLite one). Both apps use this protocol to read canonical term data and tags.
+- **Tags / categorisation data** lives in DynamoDB tables owned by core, writable by both apps (the generator assigns tags during extraction; the review agent can add user-confirmed tags during review).
+- **The data contract** (term schema, tag schema) is defined in core and versioned. Both apps depend on core's models, not on each other's tables.
+
+#### Resulting architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  DynamoDB (cloud)                    │
+│                                                     │
+│  ┌──────────────┐  ┌──────────────┐                │
+│  │ cards table  │  │  tags table  │                │
+│  │ (generator   │  │  (core owns, │                │
+│  │  owns)       │  │   both r/w)  │                │
+│  └──────┬───────┘  └──────┬───────┘                │
+│         │                  │                        │
+└─────────┼──────────────────┼────────────────────────┘
+          │                  │
+          │  reads           │  reads + writes
+          ▼                  ▼
+┌──────────────────────────────────────┐
+│         anki-pipeline-core           │
+│  StateStore protocol (DynamoDB impl) │
+│  TagStore protocol (DynamoDB impl)   │
+└──────────┬───────────────┬───────────┘
+           │               │
+    ┌──────┘               └──────┐
+    ▼                              ▼
+┌────────────────┐      ┌──────────────────┐
+│ anki-deck-     │      │ vocab-review-    │
+│ generator      │      │ agent            │
+│                │      │                  │
+│ writes cards   │      │ reads cards/tags │
+│ writes tags    │      │ writes tags      │
+│                │      │ owns review state│
+└────────────────┘      └────────┬─────────┘
+                                 │
+                        ┌────────▼─────────┐
+                        │ Local SQLite     │
+                        │ (review-only)    │
+                        │                  │
+                        │ sessions         │
+                        │ schedule         │
+                        │ confidence       │
+                        │ content cache    │
+                        └──────────────────┘
+```
+
+#### Migration timeline considerations
+
+- **Phase 1 (now)**: Both apps use SQLite via `StateStore` protocol. The review agent has its own DB file for review state; it reads term/tag data from the generator's DB file (or a shared one).
+- **Phase 2 (DynamoDB migration)**: The generator moves card state to DynamoDB. Core gains a `DynamoStateStore` implementation. The review agent switches its term/tag reads to the DynamoDB-backed protocol — **no code change in the review agent itself**, just a config change (backend = "dynamodb" instead of "sqlite").
+- **Phase 3 (SQLite deprecated)**: The generator drops its local SQLite. The review agent **keeps its own local SQLite** for session/schedule/content state (this is inherently local, interactive, latency-sensitive data). Only the shared reads go through DynamoDB.
+
+This means the review agent is never blocked by the DynamoDB migration — it works with SQLite in Phase 1 and gains cloud-backed term data for free in Phase 2 without architectural changes.
 
 ---
 
@@ -331,7 +406,8 @@ Option C (reading passages) is a good "bonus" format that can be generated in ba
 ## Open Questions for Next Iteration
 
 1. **Notification delivery**: Is CLI stdout sufficient for reminders, or do we need Telegram/Discord/email from day one?
-2. **Multi-device**: Will the user only review from their development machine, or also mobile? (This affects whether a CLI-only approach is viable long-term.)
+2. **Multi-device**: Will the user only review from their development machine, or also mobile? (This affects whether a CLI-only approach is viable long-term, and whether review state should eventually move to DynamoDB too.)
 3. **Confidence model**: Simple interval-based (like SM-2) or something lighter? How much should it overlap/conflict with Anki's own SRS state?
 4. **Content caching**: Pre-generate drills during extraction (batch, cheaper) or generate on-demand during sessions (fresher, more adaptive)?
 5. **Relationship to Anki**: Should review sessions mark terms as "reviewed" in a way that Anki can see (e.g., tagging), or are the two systems intentionally independent?
+6. **DynamoDB table design**: When the generator migrates to DynamoDB, what's the partition key strategy for cards and tags? Single-table design vs separate tables? This affects how efficiently the review agent can query "all terms for topic X".
