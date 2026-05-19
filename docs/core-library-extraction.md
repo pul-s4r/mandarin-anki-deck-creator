@@ -409,10 +409,98 @@ Entity types:
 | Record review session | `review_state` | Review Agent | PutItem |
 | Get schedule for all topics | `review_state` | Review Agent | Query PK=`user_id`, SK begins_with `SCHEDULE#` |
 
+### Consistency model
+
+#### `vocab_cards` — eventually consistent reads are sufficient
+
+| Property | Detail |
+|----------|--------|
+| Writer | Generator only (single writer) |
+| Reader | Review agent (read-only) |
+| Read mode | Eventually consistent (default, half-cost RCUs) |
+| Staleness risk | Generator runs as a batch job (daily/weekly). Review agent reads at session start. These workflows don't overlap in time. |
+
+The review agent does **not** require strongly consistent reads from `vocab_cards`. The argument:
+
+1. **Temporal separation**: The generator finishes extraction → writes cards → exits. Minutes/hours/days later, the review agent loads terms for a session. By that point, eventual consistency has long since converged (DynamoDB typically propagates within milliseconds; worst case is single-digit seconds).
+
+2. **Idempotent operation**: If the review agent loads a slightly stale term list (missing 1-2 terms from a just-completed extraction run), the consequence is: those terms don't appear in *this* session. They appear in the next one. No duplicates are created because:
+   - Sessions are keyed by `term_id` + `session_id` (timestamp)
+   - Schedule state tracks topics, not individual term-session pairs
+   - The digest/reminder calculates "due" based on last-reviewed timestamps — a missed term doesn't corrupt the schedule
+
+3. **No read-after-write dependency across apps**: The review agent never writes to `vocab_cards` and then reads its own write. It only reads what the generator wrote at some earlier point.
+
+**Bottom line**: Eventually consistent reads. No transactions needed. The review agent is tolerant of being one extraction run behind.
+
+#### `vocab_tags` — application-level consistency (no DynamoDB transactions needed)
+
+| Property | Detail |
+|----------|--------|
+| Writers | Generator (during extraction) + Review agent (during user confirmation) |
+| Conflict type | Semantic, not temporal — "generator re-infers what user already corrected" |
+| Resolution | `confirmed` flag acts as a write guard |
+
+**Why DynamoDB-level consistency mechanisms (transactions, conditional writes) are largely unnecessary:**
+
+1. **No concurrent writes in practice**: Generator runs as a batch job. Review agent runs interactively. Single user. These don't execute simultaneously. There's no real race condition on the same item.
+
+2. **The actual risk is semantic, not temporal**: The generator might re-run extraction on updated notes and re-infer a topic tag for a term that the user already confirmed or corrected. This isn't a DynamoDB consistency problem — it's a "who wins?" business rule.
+
+**Resolution rule — `confirmed` flag as write guard:**
+
+```
+Generator write logic for tags:
+  1. Check: does a tag with this (term_id, dimension, value) already exist?
+  2. If yes AND confirmed == true → skip (user has spoken, don't overwrite)
+  3. If yes AND confirmed == false → update (re-inference, maybe new value)
+  4. If no → create (new tag, source="inferred", confirmed=false)
+```
+
+This can be implemented as a conditional write for safety:
+
+```
+UpdateItem:
+  Key: { user_id, tag_id }
+  ConditionExpression: "confirmed <> :true"
+  UpdateExpression: "SET #value = :new_value, source = :src, updated_at = :now"
+```
+
+If the condition fails (tag was already confirmed), the generator silently skips. No error, no conflict — the user's decision is authoritative.
+
+**Review agent write logic:**
+- Confirming a tag: `UpdateItem SET confirmed=true, source="user", updated_at=now` — no condition needed (confirming is always safe, regardless of current state)
+- Correcting a tag value: `UpdateItem SET value=:new, confirmed=true, source="user"` — user correction is always authoritative
+- Adding a new tag: `PutItem` — no conflict possible (new UUID, new item)
+
+**Summary**: One conditional write on the generator side (don't clobber confirmed tags). Everything else is unconditional. No transactions, no locking, no read-modify-write cycles.
+
+#### `review_state` — no consistency concerns
+
+Single writer (review agent), single reader (review agent). No shared access. Standard DynamoDB writes are sufficient. Strongly consistent reads can be used here cheaply since it's low-volume and the review agent is the only consumer.
+
+#### Does the review agent need the latest `vocab_cards` to operate correctly?
+
+**No.** The review agent is idempotent and tolerant of lag.
+
+| Scenario | Consequence | Recovery |
+|----------|-------------|----------|
+| Generator adds 3 new terms to "Housing" after last review session | Terms don't appear in current session | They appear in the next session or next digest |
+| Generator updates a term's meaning after review agent cached it | Review agent shows slightly stale meaning during session | Next session loads fresh data; no state corruption |
+| Generator deletes/replaces a term | Review agent might show a term that no longer exists in cards | Session still completes; term drops out of future sessions when next tag query doesn't resolve it |
+| Generator adds a new topic | Topic doesn't appear in this run's digest | Appears in next digest/schedule calculation |
+
+The review agent's contract is: **"at session start, load whatever terms exist for this topic right now."** If the data is one extraction run behind, the user simply reviews what was available. Next run picks up the delta. No double-creation of reviews because:
+- Sessions are uniquely identified (UUID + timestamp)
+- Schedule advances are keyed by topic + last_reviewed_at (not by which specific terms were reviewed)
+- Confidence ratings are per-(term_id, timestamp) — duplicate term_ids in different sessions are fine, they just add more data points
+
+This means the review agent can even **cache term data locally** (in its SQLite) and refresh periodically rather than hitting DynamoDB on every session start — useful for offline mode.
+
 ### Cost and throughput considerations
 
-- **`vocab_cards`**: Low write volume (batch extraction runs, maybe daily/weekly). Read volume from review agent is also low (load N terms at session start).
-- **`vocab_tags`**: Low volume both directions. Tag creation happens during extraction; tag confirmation happens during review. Neither is high-frequency.
+- **`vocab_cards`**: Low write volume (batch extraction runs, maybe daily/weekly). Read volume from review agent is also low (load N terms at session start). Eventually consistent reads = half the RCU cost.
+- **`vocab_tags`**: Low volume both directions. Tag creation happens during extraction; tag confirmation happens during review. Neither is high-frequency. One conditional write per tag during extraction (cheap).
 - **On-demand capacity** is appropriate for all tables — no need for provisioned throughput at single-user scale.
 - **Total cost at single-user scale**: effectively free tier (< 25 WCU/RCU sustained, < 25GB storage).
 
@@ -470,4 +558,4 @@ Entity types:
 2. **Versioning**: Does core follow its own semver, or is it versioned in lockstep with the generator?
 3. ~~**DynamoDB table design**~~ → Resolved: hybrid approach. Separate tables for shared data (`vocab_cards`, `vocab_tags`) with GSIs for cross-app query patterns. Single-table design for app-specific state (`generator_sync`, `review_state`) where access patterns are simpler.
 4. **Generator backwards compatibility**: During extraction, does the generator keep a copy of `VocabularyRow` locally (thin adapter over `core.models.VocabularyTerm`) or fully adopt the core model? Adapter is lower-risk.
-5. **Tag conflict resolution**: If the generator re-infers a topic tag that the user already confirmed differently via the review agent, who wins? Options: last-write-wins, user-confirmed always wins, or surface as a conflict for manual resolution.
+5. ~~**Tag conflict resolution**~~ → Resolved: `confirmed` flag as write guard. Generator uses conditional writes to skip confirmed tags. User-confirmed always wins. No transactions needed.
