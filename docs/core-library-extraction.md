@@ -218,6 +218,206 @@ Downstream consumers should **not** share a single DynamoDB table or database in
 
 ---
 
+## DynamoDB table design
+
+Both packages write to the **same DynamoDB instance** but with clear table ownership. Three tables in the shared instance, one table per app for app-specific data.
+
+### Table overview
+
+| Table | Owner | Generator | Review Agent |
+|-------|-------|-----------|-------------|
+| `vocab_cards` | Generator | Read/Write | Read-only |
+| `vocab_tags` | Core | Read/Write | Read/Write |
+| `generator_sync` | Generator | Read/Write | No access |
+| `review_state` | Review Agent | No access | Read/Write |
+
+### `vocab_cards` — canonical term data
+
+Owned by the generator. The review agent reads from this to know what terms exist and what their definitions are.
+
+```
+Table: vocab_cards
+Partition key: user_id (String)
+Sort key:      term_id (String, UUID)
+
+Attributes:
+├── simplified        (String)     "房租"
+├── traditional       (String)     "房租"
+├── pinyin            (String)     "fángzū"
+├── meaning           (String)     "rent (for housing)"
+├── part_of_speech    (String)     "noun"
+├── usage_notes       (String)     "Often used with 交 (pay) or 涨 (increase)"
+├── content_hash      (String)     SHA-256 of semantic fields
+├── first_seen_source (String)     source_id that introduced this term
+├── created_at        (String)     ISO-8601
+├── updated_at        (String)     ISO-8601
+└── ankiweb_note_id   (Number)     [generator-specific, ignored by review agent]
+
+GSI-1: cards_by_simplified
+  Partition key: user_id
+  Sort key:      simplified
+  Purpose:       Deduplication lookup during extraction
+
+GSI-2: cards_by_updated
+  Partition key: user_id
+  Sort key:      updated_at
+  Purpose:       "Give me all cards changed since last sync"
+```
+
+**Example item:**
+```json
+{
+  "user_id": "default",
+  "term_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "simplified": "房租",
+  "traditional": "房租",
+  "pinyin": "fángzū",
+  "meaning": "rent (for housing)",
+  "part_of_speech": "noun",
+  "usage_notes": "Often used with 交 (pay) or 涨 (increase)",
+  "content_hash": "8f14e45f...",
+  "first_seen_source": "src_abc123",
+  "created_at": "2026-03-15T10:00:00Z",
+  "updated_at": "2026-05-01T14:30:00Z",
+  "ankiweb_note_id": 1698234567
+}
+```
+
+### `vocab_tags` — shared categorisation data
+
+Owned by core. Both apps read and write. The generator writes tags during extraction (lesson dates from note headers, topics from LLM inference). The review agent writes tags when the user confirms or adds labels during review sessions.
+
+```
+Table: vocab_tags
+Partition key: user_id (String)
+Sort key:      tag_id (String, UUID)
+
+Attributes:
+├── term_id       (String)     FK → vocab_cards.term_id
+├── dimension     (String)     "lesson_date" | "topic" | "custom"
+├── value         (String)     "2026-05-15" or "Housing & Rent" or user-defined
+├── source        (String)     "explicit" | "inferred" | "user"
+├── confirmed     (Boolean)    true/false
+├── created_at    (String)     ISO-8601
+├── created_by    (String)     "generator" | "review-agent" | "user"
+└── updated_at    (String)     ISO-8601
+
+GSI-1: tags_by_term
+  Partition key: user_id#term_id (String, composite)
+  Sort key:      dimension#value (String, composite)
+  Purpose:       "Get all tags for a specific term"
+
+GSI-2: tags_by_dimension_value
+  Partition key: user_id#dimension (String, composite)
+  Sort key:      value
+  Purpose:       "Get all terms tagged with topic 'Housing & Rent'"
+                 This is the critical query for the review agent —
+                 "give me all terms in this topic for a review session"
+```
+
+**Example items:**
+```json
+[
+  {
+    "user_id": "default",
+    "tag_id": "tag-001",
+    "term_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "dimension": "lesson_date",
+    "value": "2026-05-15",
+    "source": "explicit",
+    "confirmed": true,
+    "created_at": "2026-05-15T10:00:00Z",
+    "created_by": "generator",
+    "updated_at": "2026-05-15T10:00:00Z"
+  },
+  {
+    "user_id": "default",
+    "tag_id": "tag-002",
+    "term_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "dimension": "topic",
+    "value": "Housing & Rent",
+    "source": "inferred",
+    "confirmed": false,
+    "created_at": "2026-05-15T10:00:00Z",
+    "created_by": "generator",
+    "updated_at": "2026-05-15T10:00:00Z"
+  },
+  {
+    "user_id": "default",
+    "tag_id": "tag-003",
+    "term_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "dimension": "topic",
+    "value": "Housing & Rent",
+    "source": "user",
+    "confirmed": true,
+    "created_at": "2026-05-19T12:00:00Z",
+    "created_by": "review-agent",
+    "updated_at": "2026-05-19T12:00:00Z"
+  }
+]
+```
+
+Note: item 3 shows the review agent confirming the inferred tag — in practice this would update item 2 (set `confirmed: true`, `source: "user"`, `updated_at`) rather than create a duplicate. Shown separately for clarity.
+
+### `generator_sync` — generator-only extraction state
+
+Owned exclusively by the generator. The review agent never touches this.
+
+```
+Table: generator_sync
+Partition key: user_id (String)
+Sort key:      entity_key (String, composite: "type#id")
+
+Entity types stored here (discriminated by sort key prefix):
+├── SOURCE#<source_id>     → provider, external_id, content_sha256, revision_id, etag
+├── CHUNK#<source_id>#<idx> → chunk_sha256, model_id, llm_output_card_ids[]
+├── RUN#<run_id>           → trigger, started_at, finished_at, report_json
+└── CHANNEL#<channel_id>   → resource_id, page_token, expiration (Drive push)
+```
+
+Single-table design here makes sense because these entities are only ever queried by the generator, always scoped to a user, and the access patterns are simple (get by key, list by prefix).
+
+### `review_state` — review agent-only state
+
+Owned exclusively by the review agent. The generator never touches this. **This table only exists if the review agent opts into DynamoDB for its state** (e.g., for multi-device sync). In Phase 1, this data lives in local SQLite instead.
+
+```
+Table: review_state
+Partition key: user_id (String)
+Sort key:      entity_key (String, composite: "type#id")
+
+Entity types:
+├── SCHEDULE#<topic_hash>       → topic, last_reviewed_at, interval_days, next_due
+├── SESSION#<session_id>        → topic, started_at, ended_at, terms_covered, terms_total
+├── CONFIDENCE#<term_id>#<ts>   → rating (1-4), session_id
+├── CONTENT#<term_id>#<type>    → drill_type, generated_text, generated_at, model_id
+└── NOTIFICATION#<notif_id>     → sent_at, channel, topics_included, actioned
+```
+
+### Access patterns by app
+
+| Query | Table | Used by | How |
+|-------|-------|---------|-----|
+| Get term by simplified (dedup) | `vocab_cards` | Generator | GSI-1: `user_id` + `simplified` |
+| Get all terms (export) | `vocab_cards` | Generator | Query PK = `user_id` |
+| Get terms changed since timestamp | `vocab_cards` | Review Agent | GSI-2: `user_id` + `updated_at > X` |
+| Get all tags for a term | `vocab_tags` | Both | GSI-1: `user_id#term_id` |
+| Get all terms for a topic | `vocab_tags` | Review Agent | GSI-2: `user_id#topic` + value = "Housing & Rent" → returns `term_id`s → batch-get from `vocab_cards` |
+| Get all topics (list) | `vocab_tags` | Review Agent | GSI-2: `user_id#topic`, scan sort keys for distinct values |
+| Write a new tag | `vocab_tags` | Both | PutItem |
+| Confirm a tag | `vocab_tags` | Review Agent | UpdateItem (set `confirmed=true`) |
+| Record review session | `review_state` | Review Agent | PutItem |
+| Get schedule for all topics | `review_state` | Review Agent | Query PK=`user_id`, SK begins_with `SCHEDULE#` |
+
+### Cost and throughput considerations
+
+- **`vocab_cards`**: Low write volume (batch extraction runs, maybe daily/weekly). Read volume from review agent is also low (load N terms at session start).
+- **`vocab_tags`**: Low volume both directions. Tag creation happens during extraction; tag confirmation happens during review. Neither is high-frequency.
+- **On-demand capacity** is appropriate for all tables — no need for provisioned throughput at single-user scale.
+- **Total cost at single-user scale**: effectively free tier (< 25 WCU/RCU sustained, < 25GB storage).
+
+---
+
 ## Extraction boundaries — detailed module mapping
 
 ### `core.models`
@@ -266,7 +466,8 @@ Downstream consumers should **not** share a single DynamoDB table or database in
 
 ## Open questions
 
-1. **Monorepo vs multi-repo**: Should core, generator, and review agent live in one repo (simpler CI, atomic cross-package changes) or separate repos (independent versioning, cleaner ownership)?
+1. ~~**Monorepo vs multi-repo**~~ → Resolved: monorepo, multiple packages (Option B).
 2. **Versioning**: Does core follow its own semver, or is it versioned in lockstep with the generator?
-3. **DynamoDB table design**: Single-table design (PK=`user_id`, SK=`entity#id`) or separate tables per entity? Affects query patterns for "all terms for topic X".
+3. ~~**DynamoDB table design**~~ → Resolved: hybrid approach. Separate tables for shared data (`vocab_cards`, `vocab_tags`) with GSIs for cross-app query patterns. Single-table design for app-specific state (`generator_sync`, `review_state`) where access patterns are simpler.
 4. **Generator backwards compatibility**: During extraction, does the generator keep a copy of `VocabularyRow` locally (thin adapter over `core.models.VocabularyTerm`) or fully adopt the core model? Adapter is lower-risk.
+5. **Tag conflict resolution**: If the generator re-infers a topic tag that the user already confirmed differently via the review agent, who wins? Options: last-write-wins, user-confirmed always wins, or surface as a conflict for manual resolution.
