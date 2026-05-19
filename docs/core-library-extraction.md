@@ -42,41 +42,95 @@ The vocabulary review agent needs access to the same data model, normalisation l
 
 ---
 
-## Package topology
+## Package topology — monorepo with multiple packages (Option B)
+
+### Decision
+
+Single repository, three packages, each with its own `pyproject.toml`. During development all three are editable-installed into one virtual environment. The separation exists at the packaging level (independent install, independent dependency declarations) not at the environment level.
+
+### Repository layout
 
 ```
-anki-pipeline-core/          ← shared library (no CLI)
-├── models/                  ← VocabularyTerm, Tag, CardRecord
-├── state/                   ← StateStore protocol + SQLite impl + DynamoDB impl
-├── normalise/               ← unicode, fingerprints
-├── llm/                     ← LLM client protocol + Bedrock impl + fixture stub
-├── categorise/              ← TagStore protocol, tag models
-└── config/                  ← shared settings (AWS, model ID, DB path)
-
-anki-deck-generator/         ← extraction pipeline (depends on core)
-├── ingest/
-├── preprocess/
-├── dictionary/
-├── export/
-├── sync/
-└── cli/
-
-vocab-review-agent/          ← new package (depends on core)
-├── scheduling/
-├── content/
-├── notifications/
-├── sessions/
-└── cli/
+mandarin-vocab-tools/              ← monorepo root
+├── packages/
+│   ├── core/                      ← shared library (no CLI)
+│   │   ├── pyproject.toml         ← name: anki-pipeline-core
+│   │   └── src/anki_pipeline_core/
+│   │       ├── models/            ← VocabularyTerm, Tag, CardRecord
+│   │       ├── state/             ← StateStore protocol + SQLite impl + DynamoDB impl
+│   │       ├── normalise/         ← unicode, fingerprints
+│   │       ├── llm/              ← LLM client protocol + Bedrock impl + fixture stub
+│   │       ├── categorise/        ← TagStore protocol, tag models
+│   │       └── config/            ← shared settings (AWS, model ID, DB path)
+│   │
+│   ├── generator/                 ← extraction pipeline (depends on core)
+│   │   ├── pyproject.toml         ← name: anki-deck-generator; deps: [anki-pipeline-core]
+│   │   └── src/anki_deck_generator/
+│   │       ├── ingest/
+│   │       ├── preprocess/
+│   │       ├── dictionary/
+│   │       ├── export/
+│   │       ├── sync/
+│   │       └── cli/
+│   │
+│   └── review-agent/              ← review & learning agent (depends on core)
+│       ├── pyproject.toml         ← name: vocab-review-agent; deps: [anki-pipeline-core]
+│       └── src/vocab_review_agent/
+│           ├── scheduling/
+│           ├── content/
+│           ├── notifications/
+│           ├── sessions/
+│           └── cli/
+│
+├── tests/                         ← shared test infrastructure (or per-package tests/)
+├── pyproject.toml                 ← workspace root (optional: dev tooling config)
+└── README.md
 ```
+
+### Development environment
+
+One venv, all packages editable-installed:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e "packages/core[dev]"
+pip install -e "packages/generator[dev]"
+pip install -e "packages/review-agent[dev]"
+```
+
+Changes to core are immediately visible to both apps without reinstalling. No separate environments needed day-to-day.
+
+### Dependency declarations (per-package pyproject.toml)
+
+| Package | Runtime deps | Path dep on core |
+|---------|-------------|-----------------|
+| `core` | pydantic, boto3, langchain-core | — |
+| `generator` | pymupdf, python-docx, pyyaml | `anki-pipeline-core` (path: `../core`) |
+| `review-agent` | (TBD — likely minimal beyond core) | `anki-pipeline-core` (path: `../core`) |
+
+Path dependencies resolve locally during development. For distribution (if ever published), they'd become version-pinned PyPI deps.
+
+### CI / testing
+
+- Single GitHub Actions workflow that installs all three packages and runs `pytest` across the whole repo
+- Can be split into per-package jobs later if test suites grow large (overkill for now)
+
+### When environments ARE separate
+
+Only when apps are deployed to different targets:
+- Generator runs as a cron job / CI pipeline on a server → its own Docker image or venv with `pip install anki-deck-generator`
+- Review agent runs on your laptop interactively → installed in your local dev venv
+- But during development, both run from the same workspace
 
 ---
 
 ## Migration approach
 
-1. Extract `anki-pipeline-core` as a separate package within a monorepo (or adjacent repo) with its own `pyproject.toml`
-2. `anki-deck-generator` depends on `anki-pipeline-core` — initially as a path dependency during development
-3. Downstream consumers (review agent, future tools) depend on `anki-pipeline-core`
-4. No breaking changes to the existing CLI; the extraction pipeline continues to work identically
+1. Restructure the current repo into `packages/core` + `packages/generator` (move files, update imports)
+2. Create `packages/review-agent` as a new package depending on core
+3. All three share the monorepo — atomic commits across packages when core's contract changes
+4. No breaking changes to the existing CLI; `anki-notes-pipeline` entry point stays in generator
+5. Existing tests continue to pass after restructure (import paths update from `anki_deck_generator.state` → `anki_pipeline_core.state`, etc.)
 
 ---
 
