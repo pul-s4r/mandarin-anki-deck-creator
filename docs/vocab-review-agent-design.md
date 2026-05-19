@@ -1,168 +1,22 @@
-# Vocabulary Review Agent — Design Strategy
+# Vocabulary Review & Learning Prompt Agent — Design Strategy
 
 ## Status: Draft (iteration 1)
 
----
-
-## Part 1: Component Split — `anki-pipeline-core`
-
-### Rationale
-
-The vocabulary review agent needs access to the same data model, normalisation logic, state protocol, and LLM client that `anki-deck-generator` uses. Building it as a second consumer of those abstractions is the trigger for extracting shared code into a standalone package.
-
-### What moves into `anki-pipeline-core`
-
-| Component | Current location | Why shared |
-|-----------|-----------------|------------|
-| Data model | `dictionary/enrich.py` (`VocabularyRow`), `state/records.py` (`CardRecord`, etc.) | Both apps need the canonical term representation |
-| Normalisation | `preprocess/normalize.py`, `preprocess/fingerprints.py` | Consistent text handling across ingest and review content generation |
-| State protocol | `state/store.py` (`StateStore`), `state/sqlite_store.py` | Review agent needs read/write access to the same term database |
-| LLM client abstraction | `llm/bedrock_chain.py` (extraction interface), `llm/fixture_player.py` | Review agent uses LLM for content generation; same provider config |
-| Categorisation (new) | `categorize/` (tag store protocol, models) | Tags drive review scheduling and content selection |
-| Config base | `config/settings.py` (AWS/Bedrock settings subset) | Shared credentials and model configuration |
-
-### What stays in `anki-deck-generator`
-
-- Ingest layer (PDF/DOCX/Markdown parsing)
-- Preprocessing beyond normalisation (chunking, table detection, section splitting)
-- CC-CEDICT dictionary and enrichment
-- Export formats (CSV, Anki-specific output)
-- Google Drive integration
-- The `run` / `schedule` / `import` CLI handlers
-
-### What lives in the new review agent package
-
-- Review scheduling engine
-- Practice content generation (sentences, dialogues)
-- Notification/reminder delivery
-- Its own CLI surface and eventual UI
-- Review session state (separate from extraction state)
-
-### Package topology
-
-```
-anki-pipeline-core/          ← shared library (no CLI)
-├── models/                  ← VocabularyTerm, Tag, CardRecord
-├── state/                   ← StateStore protocol + SQLite impl
-├── normalise/               ← unicode, fingerprints
-├── llm/                     ← LLM client protocol + Bedrock impl + fixture stub
-├── categorise/              ← TagStore protocol, tag models
-└── config/                  ← shared settings (AWS, model ID, DB path)
-
-anki-deck-generator/         ← extraction pipeline (depends on core)
-├── ingest/
-├── preprocess/
-├── dictionary/
-├── export/
-├── sync/
-└── cli/
-
-vocab-review-agent/          ← new package (depends on core)
-├── scheduling/
-├── content/
-├── notifications/
-├── sessions/
-└── cli/
-```
-
-### Migration approach
-
-1. Extract `anki-pipeline-core` as a separate package within a monorepo (or adjacent repo) with its own `pyproject.toml`
-2. `anki-deck-generator` depends on `anki-pipeline-core` — initially as a path dependency during development
-3. `vocab-review-agent` depends on `anki-pipeline-core`
-4. Both apps share a single SQLite state database (same `StateStore` protocol, different tables for app-specific state)
-5. No breaking changes to the existing CLI; the extraction pipeline continues to work identically
-
-### Shared state strategy
-
-#### The DynamoDB migration context
-
-The extraction pipeline is on a trajectory from SQLite (local, single-user) to DynamoDB (cloud, multi-device). Once that migration lands, SQLite is deprecated for card state in the generator. This raises the question: does the review agent also target DynamoDB, or does it maintain its own local store?
-
-#### Decision: separate state ownership, shared data contract
-
-The two apps should **not** share a single DynamoDB table or database instance directly. Instead:
-
-| Concern | Extraction pipeline (generator) | Review agent |
-|---------|-------------------------------|--------------|
-| Card state (canonical terms) | DynamoDB (primary, post-migration) | **Reads from** generator's DynamoDB via core's read protocol |
-| Tags / categorisation | DynamoDB (shared tables, owned by core) | Reads + writes tags via same core protocol |
-| Review-specific state | N/A | **Own store** (local SQLite or own DynamoDB table) |
-| Sync metadata (sources, chunks) | DynamoDB (owned by generator) | No access needed |
-
-#### Why not a single shared DynamoDB instance for everything?
-
-1. **Coupling**: If both apps write to the same tables, schema changes in one app risk breaking the other. The generator's card table has fields (`ankiweb_note_id`, `content_hash`, chunk linkage) that are irrelevant to the review agent, and the review agent has state (session progress, confidence ratings, generated content cache) that would pollute the generator's data model.
-
-2. **Operational independence**: The review agent should work offline (e.g., on a plane, on a phone in airplane mode). If it depends on DynamoDB for its core loop (serve a drill, record confidence), it can't function without network. The generator can afford to require network — it's a batch pipeline that runs at a desk.
-
-3. **Cost and latency**: Review sessions are interactive (sub-100ms response expected). Reading a few terms from DynamoDB is fine; writing every confidence rating and session tick to DynamoDB adds latency and cost for no benefit to the generator.
-
-4. **Blast radius**: A bug in the review agent's write path shouldn't be able to corrupt the canonical card data that the generator owns.
-
-#### What IS shared
-
-- **The `StateStore` protocol in `anki-pipeline-core`** gains a DynamoDB implementation (alongside the existing SQLite one). Both apps use this protocol to read canonical term data and tags.
-- **Tags / categorisation data** lives in DynamoDB tables owned by core, writable by both apps (the generator assigns tags during extraction; the review agent can add user-confirmed tags during review).
-- **The data contract** (term schema, tag schema) is defined in core and versioned. Both apps depend on core's models, not on each other's tables.
-
-#### Resulting architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  DynamoDB (cloud)                    │
-│                                                     │
-│  ┌──────────────┐  ┌──────────────┐                │
-│  │ cards table  │  │  tags table  │                │
-│  │ (generator   │  │  (core owns, │                │
-│  │  owns)       │  │   both r/w)  │                │
-│  └──────┬───────┘  └──────┬───────┘                │
-│         │                  │                        │
-└─────────┼──────────────────┼────────────────────────┘
-          │                  │
-          │  reads           │  reads + writes
-          ▼                  ▼
-┌──────────────────────────────────────┐
-│         anki-pipeline-core           │
-│  StateStore protocol (DynamoDB impl) │
-│  TagStore protocol (DynamoDB impl)   │
-└──────────┬───────────────┬───────────┘
-           │               │
-    ┌──────┘               └──────┐
-    ▼                              ▼
-┌────────────────┐      ┌──────────────────┐
-│ anki-deck-     │      │ vocab-review-    │
-│ generator      │      │ agent            │
-│                │      │                  │
-│ writes cards   │      │ reads cards/tags │
-│ writes tags    │      │ writes tags      │
-│                │      │ owns review state│
-└────────────────┘      └────────┬─────────┘
-                                 │
-                        ┌────────▼─────────┐
-                        │ Local SQLite     │
-                        │ (review-only)    │
-                        │                  │
-                        │ sessions         │
-                        │ schedule         │
-                        │ confidence       │
-                        │ content cache    │
-                        └──────────────────┘
-```
-
-#### Migration timeline considerations
-
-- **Phase 1 (now)**: Both apps use SQLite via `StateStore` protocol. The review agent has its own DB file for review state; it reads term/tag data from the generator's DB file (or a shared one).
-- **Phase 2 (DynamoDB migration)**: The generator moves card state to DynamoDB. Core gains a `DynamoStateStore` implementation. The review agent switches its term/tag reads to the DynamoDB-backed protocol — **no code change in the review agent itself**, just a config change (backend = "dynamodb" instead of "sqlite").
-- **Phase 3 (SQLite deprecated)**: The generator drops its local SQLite. The review agent **keeps its own local SQLite** for session/schedule/content state (this is inherently local, interactive, latency-sensitive data). Only the shared reads go through DynamoDB.
-
-This means the review agent is never blocked by the DynamoDB migration — it works with SQLite in Phase 1 and gains cloud-backed term data for free in Phase 2 without architectural changes.
+**Dependency**: This design assumes `anki-pipeline-core` has been extracted (see [core-library-extraction.md](./core-library-extraction.md)). The review agent depends on core for term data, tags, LLM access, and configuration.
 
 ---
 
-## Part 2: Vocabulary Review Agent — UX Strategy
+## Purpose
 
-### User persona
+An agent that takes vocabulary terms (organised by topic/lesson tags from the categorisation feature) and:
+
+1. **Reminds** the user to do vocabulary reviews
+2. **Organises** vocabulary reviews separately from Anki cards
+3. **Generates** practice content (example sentences, dialogue prompts) for contextual learning
+
+---
+
+## User persona
 
 A self-directed Mandarin learner who:
 - Takes notes in classes (the source material for extraction)
@@ -172,12 +26,13 @@ A self-directed Mandarin learner who:
 
 ---
 
-### Feature 1: Review Reminders
+## Feature 1: Review Reminders
 
-#### Core problem
+### Core problem
+
 Anki's built-in SRS handles spaced repetition for individual cards. But the user also wants **topic-level** and **lesson-level** review prompts — "you haven't practised your Housing vocabulary in 10 days" rather than card-by-card scheduling.
 
-#### UX approaches (choose one)
+### UX approaches
 
 **Option A: Digest-style daily summary**
 
@@ -220,18 +75,19 @@ Characteristics:
 - Higher friction to set up, but leverages existing reminder infrastructure
 - Risk: becomes "just another calendar event to dismiss"
 
-#### Recommendation for iteration 1
+### Recommendation for iteration 1
 
 Start with **Option A (daily digest)** delivered to stdout (CLI) with an optional webhook for messaging apps. It's the simplest to implement, doesn't require third-party calendar integrations, and gives the richest information at a glance. Add Option B as an enhancement once the scheduling engine is stable.
 
 ---
 
-### Feature 2: Organised Review Sessions (separate from Anki)
+## Feature 2: Organised Review Sessions (separate from Anki)
 
-#### Core problem
+### Core problem
+
 Anki reviews are card-level, mixed across all topics, optimised for retention. The user also wants **coherent, topic-focused review sessions** — "spend 10 minutes on Housing vocabulary" — with progress tracked independently of Anki's SRS state.
 
-#### UX approaches (choose one)
+### UX approaches
 
 **Option A: CLI-driven interactive session**
 
@@ -301,18 +157,19 @@ Characteristics:
 - More complex to implement (state machine per session)
 - Risk: over-engineering for a single user
 
-#### Recommendation for iteration 1
+### Recommendation for iteration 1
 
 Start with **Option A (CLI interactive session)** — it's the natural fit for a developer-user, provides per-term confidence data for scheduling, and is implementable without UI frameworks. Adopt adaptive elements from Option C incrementally (e.g., skip "easy" terms after 3 consecutive easy ratings).
 
 ---
 
-### Feature 3: Practice Content Generation
+## Feature 3: Practice Content Generation
 
-#### Core problem
+### Core problem
+
 Recognising a term in isolation (Anki) is different from using it correctly in context. The user wants the agent to **generate contextualised practice material** — example sentences and dialogue prompts — that exercises terms in realistic situations.
 
-#### UX approaches (choose one)
+### UX approaches
 
 **Option A: Sentence drills (receptive → productive)**
 
@@ -374,11 +231,30 @@ Characteristics:
 - Lower pressure than production tasks
 - Good complement to sentence drills
 
-#### Recommendation for iteration 1
+### Recommendation for iteration 1
 
 Start with **Option A (sentence drills)** as the foundation — it covers the full receptive-to-productive spectrum and each drill is atomic (easy to generate, store, and serve one at a time). Add **Option B (dialogue simulation)** as a second mode once the content generation pipeline is proven, since dialogues are the natural extension when the user is comfortable with individual sentence production.
 
 Option C (reading passages) is a good "bonus" format that can be generated in batch (during the extraction/categorisation run) and served without real-time LLM calls.
+
+---
+
+## Review agent state model
+
+The review agent owns its own local SQLite database (separate from the generator's state) containing:
+
+| Table | Purpose |
+|-------|---------|
+| `review_sessions` | Completed and in-progress sessions (topic, start/end time, terms covered) |
+| `review_schedule` | Per-topic scheduling state (last reviewed, interval, next due) |
+| `term_confidence` | Per-term confidence history (rating, timestamp, session_id) |
+| `generated_content` | Cached LLM-generated drills/passages (term_id, type, content, generated_at) |
+| `notification_log` | When reminders were sent, which were actioned |
+
+This state is:
+- **Local-first**: works offline, sub-ms reads during interactive sessions
+- **Independent**: a bug here never corrupts the generator's canonical card data
+- **Eventually portable**: if multi-device becomes a requirement, this schema could move to DynamoDB with its own table (independent of the generator's migration)
 
 ---
 
@@ -390,24 +266,26 @@ Option C (reading passages) is a good "bonus" format that can be generated in ba
 | Review sessions | CLI interactive with confidence rating | Natural for developer-user, feeds scheduling data |
 | Content generation | Sentence drills (recognition → fill-blank → production) | Atomic, graduated, generates well from LLM |
 
-### Iteration sequence
+---
 
-1. **Extract `anki-pipeline-core`** — data model, state, normalisation, LLM client, config
-2. **Scaffold `vocab-review-agent`** — depends on core, empty CLI with `review` subcommand
-3. **Implement scheduling engine** — per-topic interval tracking, "due" calculation
-4. **Implement daily digest** (Feature 1) — reads schedule state, outputs to terminal
-5. **Implement interactive review session** (Feature 2) — CLI loop with confidence capture
-6. **Implement sentence drill generation** (Feature 3) — LLM generates drills per-term, cached
-7. **Connect scheduling ↔ sessions** — completing a session updates schedule state
+## Iteration sequence
+
+1. **Scaffold `vocab-review-agent`** — depends on core, empty CLI with `review` subcommand
+2. **Implement scheduling engine** — per-topic interval tracking, "due" calculation
+3. **Implement daily digest** (Feature 1) — reads schedule + term/tag state, outputs to terminal
+4. **Implement interactive review session** (Feature 2) — CLI loop with confidence capture
+5. **Implement sentence drill generation** (Feature 3) — LLM generates drills per-term, cached locally
+6. **Connect scheduling ↔ sessions** — completing a session updates schedule state
+7. **Add adaptive session behaviour** — skip easy terms, surface struggling terms
 8. **Add dialogue mode** — real-time LLM conversation using topic terms
 
 ---
 
-## Open Questions for Next Iteration
+## Open questions for next iteration
 
 1. **Notification delivery**: Is CLI stdout sufficient for reminders, or do we need Telegram/Discord/email from day one?
-2. **Multi-device**: Will the user only review from their development machine, or also mobile? (This affects whether a CLI-only approach is viable long-term, and whether review state should eventually move to DynamoDB too.)
+2. **Multi-device**: Will the user only review from their development machine, or also mobile? (This affects whether a CLI-only approach is viable long-term, and whether review state should eventually move to DynamoDB.)
 3. **Confidence model**: Simple interval-based (like SM-2) or something lighter? How much should it overlap/conflict with Anki's own SRS state?
 4. **Content caching**: Pre-generate drills during extraction (batch, cheaper) or generate on-demand during sessions (fresher, more adaptive)?
 5. **Relationship to Anki**: Should review sessions mark terms as "reviewed" in a way that Anki can see (e.g., tagging), or are the two systems intentionally independent?
-6. **DynamoDB table design**: When the generator migrates to DynamoDB, what's the partition key strategy for cards and tags? Single-table design vs separate tables? This affects how efficiently the review agent can query "all terms for topic X".
+6. **Session length**: Fixed (always all terms in a topic) or time-boxed ("10 minutes of Housing")? Time-boxed is more realistic but needs term prioritisation logic.
