@@ -1,6 +1,6 @@
 # Core Library Extraction — `anki-pipeline-core`
 
-## Status: Draft (iteration 1)
+## Status: Draft (iteration 2)
 
 ---
 
@@ -36,9 +36,10 @@ The vocabulary review agent needs access to the same data model, normalisation l
 
 ## What lives in downstream consumers (e.g. review agent)
 
-- Application-specific business logic
-- Application-specific CLI surface
-- Application-specific local state (session progress, schedules, caches)
+- Application-specific business logic (review engine: scheduling, sessions, content generation)
+- **Client adapters** — CLI (terminal I/O), Telegram bot, PWA (see [vocab-review-agent-design.md — Feature 4](./vocab-review-agent-design.md#feature-4-cross-device-access--conversation-carryover))
+- Application-specific state (session progress, schedules, confidence ratings, dialogue history)
+- Local SQLite cache for offline sessions (syncs to DynamoDB when online)
 
 ---
 
@@ -62,11 +63,16 @@ anki-deck-generator/         ← extraction pipeline (depends on core)
 └── cli/
 
 vocab-review-agent/          ← new package (depends on core)
-├── scheduling/
-├── content/
-├── notifications/
-├── sessions/
-└── cli/
+├── engine/                  ← client-agnostic review logic
+│   ├── scheduling/
+│   ├── sessions/
+│   ├── content/
+│   └── notifications/
+├── clients/                 ← thin adapters per device/interface
+│   ├── cli/                 ← terminal I/O adapter
+│   ├── telegram/            ← Telegram Bot API adapter
+│   └── web/                 ← PWA / REST API (future)
+└── state/                   ← review-specific state (DynamoDB + local SQLite cache)
 ```
 
 ---
@@ -160,7 +166,8 @@ Downstream consumers should **not** share a single DynamoDB table or database in
 
 - **Phase 1 (now)**: All apps use SQLite via `StateStore` protocol. Consumers have their own DB file for app state; they read term/tag data from the generator's DB file (or a shared one).
 - **Phase 2 (DynamoDB migration)**: The generator moves card state to DynamoDB. Core gains a `DynamoStateStore` implementation. Consumers switch their term/tag reads to the DynamoDB-backed protocol — **no code change in the consumer itself**, just a config change (`backend = "dynamodb"` instead of `"sqlite"`).
-- **Phase 3 (SQLite deprecated for generator)**: The generator drops its local SQLite. Consumers **keep their own local SQLite** for app-specific, latency-sensitive state. Only shared reads go through DynamoDB.
+- **Phase 2a (review agent cross-device)**: The review agent moves its session/schedule/confidence state to DynamoDB to enable cross-device access (see [vocab-review-agent-design.md — Feature 4](./vocab-review-agent-design.md#feature-4-cross-device-access--conversation-carryover)). The CLI client retains a local SQLite cache for offline sessions and syncs on reconnect. This phase can proceed independently of the generator's migration — the review agent's tables are in a separate DynamoDB table namespace.
+- **Phase 3 (SQLite deprecated for generator)**: The generator drops its local SQLite. Consumers **keep their own local SQLite** for app-specific, latency-sensitive state (offline caches, pre-fetched content). Only shared reads go through DynamoDB.
 
 ---
 
