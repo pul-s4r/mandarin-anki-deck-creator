@@ -241,20 +241,124 @@ Option C (reading passages) is a good "bonus" format that can be generated in ba
 
 ## Review agent state model
 
-The review agent owns its own local SQLite database (separate from the generator's state) containing:
+The review agent owns its own local SQLite database (separate from the generator's state). The schema is split into three domains — **session**, **content**, and **scheduling** — so that adding new review/prompt types never requires schema changes to the session or scheduling layer.
 
-| Table | Purpose |
-|-------|---------|
-| `review_sessions` | Completed and in-progress sessions (topic, start/end time, terms covered) |
-| `review_schedule` | Per-topic scheduling state (last reviewed, interval, next due) |
-| `term_confidence` | Per-term confidence history (rating, timestamp, session_id) |
-| `generated_content` | Cached LLM-generated drills/passages (term_id, type, content, generated_at) |
-| `notification_log` | When reminders were sent, which were actioned |
+### Design principle: review-type-agnostic sessions
 
-This state is:
+The iteration 1 schema embedded term progress (`current_term_idx`, `terms_order`, `completed_terms`) and dialogue state (`dialogue_history`, `dialogue_scenario`) directly in the `review_sessions` table. This creates a problem when adding new review types: each new type needs its own columns bolted onto the session row (reading comprehension progress, grammar drill state, listening exercise position, etc.), or a parallel table that duplicates session envelope logic.
+
+The revised schema separates three concerns:
+
+1. **Session envelope** — who is reviewing, when, on what device, what's the status. Review-type-agnostic.
+2. **Interaction log** — what happened during the session. An append-only event stream, polymorphic by event type.
+3. **Content pipeline** — what was generated, from which prompt template, and what was served. Decoupled from sessions entirely.
+
+### Domain 1: Sessions
+
+| Table | Columns | Purpose |
+|-------|---------|---------|
+| `sessions` | `session_id` PK, `session_type`, `topic`, `status`, `started_at`, `started_on`, `last_active_at`, `last_active_on` | Pure session envelope. Knows nothing about terms, drills, or dialogues. |
+| `session_events` | `event_id` PK, `session_id` FK, `event_type`, `payload` (json), `created_at` | Append-only log of every interaction within a session. |
+
+`session_type` is a string enum (`flashcard_review`, `sentence_drill`, `dialogue`, `reading_comprehension`, or any future type). The session table doesn't interpret the type — it just stores it for filtering and routing.
+
+`event_type` examples and their payloads:
+
+| event_type | payload | Used by session types |
+|------------|---------|----------------------|
+| `term_presented` | `{term_id, position}` | flashcard_review, sentence_drill |
+| `term_rated` | `{term_id, rating, position}` | flashcard_review |
+| `answer_submitted` | `{term_id, user_answer, correct}` | sentence_drill, reading_comprehension |
+| `hint_requested` | `{term_id, hint_type}` | flashcard_review, sentence_drill |
+| `content_served` | `{content_item_id, position}` | sentence_drill, reading_comprehension, dialogue |
+| `message_sent` | `{role: "user", content}` | dialogue |
+| `message_received` | `{role: "agent", content}` | dialogue |
+| `correction_issued` | `{original, corrected, explanation}` | dialogue |
+| `session_paused` | `{reason}` | all |
+| `session_resumed` | `{device}` | all |
+
+**Why an event log instead of mutable state columns**: the event stream is the source of truth. Current session position is derived: "which term is the user on?" = count of `term_presented` events. "What confidence ratings were given?" = filter `term_rated` events. "What's the dialogue history?" = filter `message_sent` + `message_received` events in order. This means:
+
+- Adding a new review type = adding new `event_type` values and `session_type` values. No schema migration.
+- Session carryover across devices works by replaying the event stream — the new client sees exactly what happened, regardless of review type.
+- Analytics ("how long does the user spend per term?", "which drill types produce the best confidence improvement?") come naturally from querying the event log.
+
+**Performance trade-off**: deriving current position from the event log is O(n) in the number of events per session. For a typical session (8–20 terms, 20–60 events), this is sub-millisecond. If sessions grow very large (e.g., a 100-term marathon), a materialised `session_cursor` column on the `sessions` table can cache the derived position — but this is an optimisation, not a schema concern.
+
+### Domain 2: Content pipeline
+
+| Table | Columns | Purpose |
+|-------|---------|---------|
+| `content_templates` | `template_id` PK, `review_type`, `version`, `system_prompt`, `user_prompt_template`, `parameters_schema` (json), `created_at`, `active` | The prompt recipe that tells the LLM how to generate a specific kind of content. Versioned. |
+| `generated_items` | `item_id` PK, `template_id` FK, `term_ids` (json), `topic`, `difficulty`, `content` (json), `generated_at` | A single piece of generated content (one sentence drill, one passage, one dialogue scenario). Linked to the template that produced it. |
+
+**`content_templates`** is the extensibility point. Adding a new review type means inserting a new template row:
+
+```
+template_id: "grammar-pattern-drill-v1"
+review_type: "grammar_drill"
+version: 1
+system_prompt: "You are a Mandarin grammar tutor..."
+user_prompt_template: "Generate a grammar exercise using the pattern {pattern} with these terms: {terms}. Difficulty: {difficulty}."
+parameters_schema: {"pattern": "string", "terms": "list[str]", "difficulty": "enum[beginner,intermediate,advanced]"}
+active: true
+```
+
+No session schema changes, no new tables, no code changes to the session or scheduling layer. The review engine resolves the template at session start, passes parameters, caches the output in `generated_items`.
+
+**`generated_items.content`** is a JSON blob whose shape is defined by the template's `review_type`:
+
+| review_type | content shape |
+|-------------|---------------|
+| `sentence_drill` | `{recognition: {sentence, question}, fill_blank: {sentence_with_blank, hint}, production: {english_prompt}}` |
+| `dialogue` | `{scenario, opening_line, target_terms, role_assignment}` |
+| `reading_comprehension` | `{passage, questions: [{question, answer}]}` |
+| `grammar_drill` | `{pattern, example, exercise, answer}` |
+
+Each review type defines its own content contract. The `generated_items` table doesn't interpret the content — it stores it opaquely. The session-type-specific logic in the review engine knows how to read and render the content for its type.
+
+**Why separate templates from generated items**: the same template can generate many items (one per term or topic). The same item can be served across multiple sessions (a good sentence drill for 房租 doesn't expire after one use — it can be reused weeks later). Prompt versioning is just a new template row with `version` incremented; old generated items remain linked to the old template for traceability.
+
+### Domain 3: Scheduling and confidence
+
+| Table | Columns | Purpose |
+|-------|---------|---------|
+| `review_schedule` | `topic`, `last_reviewed_at`, `interval_days`, `next_due_at` | Per-topic scheduling state. Unchanged from iteration 1. |
+| `term_confidence` | `term_id`, `rating`, `session_id` FK, `created_at` | Per-term confidence history. Unchanged — one row per rating event. |
+| `notification_log` | `notification_id`, `channel`, `topic`, `sent_at`, `actioned_at` | When reminders were sent, which were actioned. Unchanged. |
+
+The scheduling layer doesn't know about review types. It tracks topics and terms. The `term_confidence` table still links back to `session_id` so you can trace which session type produced a given confidence change — but the schedule itself is type-agnostic. "Housing & Rent is due for review" doesn't specify *how* to review it; the user (or the engine's recommendation logic) picks the session type at start time.
+
+### Full table summary
+
+| Domain | Table | Knows about review types? | Changes when adding a new type? |
+|--------|-------|--------------------------|-------------------------------|
+| Session | `sessions` | Stores `session_type` as a string | No — new type is a new string value |
+| Session | `session_events` | Stores `event_type` as a string | No — new events are new string values |
+| Content | `content_templates` | Yes — one row per prompt recipe per version | Yes — **insert new rows** (no schema change) |
+| Content | `generated_items` | Stores `content` as opaque JSON | No — new content shapes are new JSON structures |
+| Scheduling | `review_schedule` | No | No |
+| Scheduling | `term_confidence` | No | No |
+| Scheduling | `notification_log` | No | No |
+
+### What this replaces from the iteration 1 schema
+
+| Iteration 1 | Iteration 2 equivalent | What changed |
+|-------------|----------------------|--------------|
+| `review_sessions.current_term_idx` | Derived from count of `term_presented` events in `session_events` | Mutable column → derived from event log |
+| `review_sessions.terms_order` | First N `term_presented` events (or a `session_started` event with the planned order in its payload) | JSON column on session → event payload |
+| `review_sessions.completed_terms` | `term_rated` events in `session_events` | JSON map → individual event rows |
+| `review_sessions.dialogue_history` | `message_sent` + `message_received` events in `session_events` | JSON array on session → event rows |
+| `review_sessions.dialogue_scenario` | `content_served` event linking to a `generated_items` row of type `dialogue` | Session column → content pipeline |
+| `review_sessions.dialogue_corrections` | `correction_issued` events in `session_events` | JSON array on session → event rows |
+| `generated_content` (flat) | `content_templates` + `generated_items` (template → item) | Unlinked cache → template-linked, versioned pipeline |
+
+### Properties
+
 - **Local-first**: works offline, sub-ms reads during interactive sessions
 - **Independent**: a bug here never corrupts the generator's canonical card data
-- **Eventually portable**: if multi-device becomes a requirement, this schema could move to DynamoDB with its own table (independent of the generator's migration)
+- **Eventually portable**: DynamoDB migration affects table storage, not schema shape — same tables, same separation
+- **Extensible**: new review/prompt types require zero schema migrations — only new template rows and new event/session type string values
 
 ---
 
@@ -275,7 +379,7 @@ The requirement is not "build a mobile app" — it's **make the review agent acc
 
 Cross-device access means two clients (CLI + phone interface) need consistent state. This has a hard prerequisite: **the review agent's SQLite database cannot remain purely local**. At minimum, session and schedule state must be accessible from both devices.
 
-This aligns with the DynamoDB migration path in [core-library-extraction.md](./core-library-extraction.md) — the review agent's tables (`review_sessions`, `term_confidence`, `review_schedule`, `generated_content`, `notification_log`) move to DynamoDB (or a similar cloud store). The CLI keeps a local SQLite cache for offline sessions and syncs when connectivity returns.
+This aligns with the DynamoDB migration path in [core-library-extraction.md](./core-library-extraction.md) — the review agent's tables (`sessions`, `session_events`, `content_templates`, `generated_items`, `review_schedule`, `term_confidence`, `notification_log`) move to DynamoDB (or a similar cloud store). The CLI keeps a local SQLite cache for offline sessions and syncs when connectivity returns.
 
 ### UX approaches for phone access
 
@@ -380,20 +484,20 @@ Add **Option B (PWA)** as a follow-on if the user wants richer display (e.g., st
 
 #### Session state model (extended for multi-device)
 
-The `review_sessions` table gains fields for device tracking:
+The `sessions` table (see [state model](#review-agent-state-model)) carries device-tracking columns:
 
 | Column | Type | Purpose |
 |--------|------|---------|
 | `session_id` | text PK | UUID per session |
+| `session_type` | text | `flashcard_review`, `sentence_drill`, `dialogue`, etc. |
 | `topic` | text | Topic being reviewed |
 | `status` | text | `active`, `paused`, `completed`, `abandoned` |
 | `started_at` | timestamp | When the session began |
 | `started_on` | text | Device/client that started the session (`cli`, `telegram`, `web`) |
 | `last_active_at` | timestamp | Last interaction time (used for timeout/handoff detection) |
 | `last_active_on` | text | Device/client of last interaction |
-| `current_term_idx` | integer | Which term the user is currently on |
-| `terms_order` | json | Ordered list of term_ids for this session (fixed at session start) |
-| `completed_terms` | json | Map of term_id → confidence rating for terms already reviewed |
+
+Session progress (which term the user is on, what ratings they've given) lives in the `session_events` table as an append-only event log. The current position is derived from the event stream, not stored as mutable columns — see [state model](#review-agent-state-model) for why.
 
 #### Carryover flow
 
@@ -401,23 +505,27 @@ The `review_sessions` table gains fields for device tracking:
 Laptop (CLI)                          Phone (Telegram)
 ─────────────                         ────────────────
 1. User starts session
-   → session_id=abc, status=active,
-     started_on=cli, current_term_idx=0
+   → sessions row: session_id=abc, status=active,
+     started_on=cli
+   → session_events: [term_presented(t1), term_presented(t2), ...]
 
 2. Reviews terms 1–4, rates each
-   → current_term_idx=4,
-     completed_terms={t1:2, t2:1, t3:3, t4:2}
+   → session_events: [term_rated(t1,2), term_rated(t2,1),
+                       term_rated(t3,3), term_rated(t4,2)]
+   → derived position: 4/8 complete
 
 3. User closes laptop (or just walks away)
    → last_active_at = 14:32
                                       4. User opens Telegram, taps "Continue session"
-                                         → bot reads session abc,
-                                           sees current_term_idx=4, status=active
+                                         → bot reads session abc (status=active),
+                                           counts term_rated events → 4/8 done,
+                                           finds next un-rated term in presentation order
                                          → "Continuing Housing & Rent — 4/8 done.
                                             Term 5/8: 合同 (hétong)"
 
                                       5. Reviews terms 5–8
-                                         → current_term_idx=8, status=completed
+                                         → session_events: [term_rated(t5,1), ...]
+                                         → status=completed
 
 6. User returns to laptop later
    → CLI shows "Session completed
@@ -438,15 +546,9 @@ This avoids true multi-writer conflicts without requiring distributed locks.
 
 #### Dialogue carryover (Feature 3 extension)
 
-Dialogue simulation sessions are stateful — the LLM conversation has a history. For carryover:
+Dialogue simulation sessions are stateful — the LLM conversation has a history. In the event-based model, this history is the sequence of `message_sent`, `message_received`, and `correction_issued` events in `session_events`. The dialogue scenario lives in `generated_items` (linked via a `content_served` event at session start).
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| `dialogue_history` | json | Array of `{role, content, timestamp}` turns |
-| `dialogue_scenario` | text | The scenario prompt that seeded this dialogue |
-| `dialogue_corrections` | json | Agent corrections issued during the dialogue |
-
-When the phone client picks up a dialogue mid-conversation, it loads `dialogue_history` and replays it as context to the LLM, then continues seamlessly. The user sees a summary:
+When the phone client picks up a dialogue mid-conversation, it queries `session_events` for the dialogue session, reconstructs the message history, and replays it as LLM context. The user sees a summary:
 
 > *Continuing your dialogue: "Asking your landlord about lease terms"*
 > *You've exchanged 4 messages. Here's where you left off:*
