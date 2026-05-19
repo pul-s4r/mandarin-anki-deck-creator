@@ -576,6 +576,54 @@ EventBridge (1-min tick) → Review Engine Lambda (Mode B: check for abandoned s
 | EventBridge | Weekly cron + 1-min tick for pending processing | Daily digest + optional 1-min tick for session cleanup / reminders | Same mechanism, different frequencies |
 | Cold start mitigation | Provisioned concurrency if needed (heavy image) | Less critical (lighter image), but consider Lambda SnapStart or provisioned concurrency for interactive feel | Review agent benefits more from warm pools due to latency sensitivity |
 
+### Cold start scenarios: which user actions are affected
+
+AWS Lambda evicts idle containers after roughly 10–15 minutes of inactivity. A cold start means the runtime initialises from scratch — importing Python modules, establishing DynamoDB connections, and (for the generator) loading CEDICT from S3. For the review agent's lighter image, cold start is estimated at 1–3 seconds; for the generator, 5–10 seconds.
+
+The critical question is: **which user-initiated actions land on a cold Lambda, and what does the user experience?**
+
+#### Actions that trigger a cold start
+
+| # | User action | Lambda hit | Cold start likely? | User-perceived impact |
+|---|-------------|-----------|-------------------|----------------------|
+| 1 | **First Telegram interaction of the day** — user opens chat after overnight inactivity, taps "Start review" or sees the daily digest reply buttons and taps one | Review Engine Lambda | **Yes** — container has been idle for hours | 1–3s delay before the bot responds with the first term. Most noticeable cold start. |
+| 2 | **Resuming after a gap mid-session** — user reviews 4 terms, puts the phone down for 20+ minutes, picks it back up and taps the next confidence rating | Review Engine Lambda | **Yes** — container was evicted during the idle gap | 1–3s delay on what should feel like a continuation. Jarring because the previous interactions were instant. |
+| 3 | **Requesting a new drill or dialogue** — user finishes a review session and taps "Generate sentence drill" or "Start dialogue" | Review Engine Lambda (Bedrock call) | Possibly — depends on whether a prior interaction warmed the container | If cold: 1–3s Lambda init + 2–5s Bedrock LLM call = 3–8s total. The LLM latency dominates regardless, so cold start is less noticeable here. |
+| 4 | **Tapping the daily digest notification** — the scheduled digest arrives as a Telegram message; user taps an inline button ("Review Housing & Rent") | Review Engine Lambda | **Likely** — the digest was sent by a separate scheduled invocation; the user taps minutes or hours later | 1–3s delay. Same as scenario 1. |
+| 5 | **CLI `vocab review start`** — user opens terminal and starts a review session | Review Engine Lambda (if CLI talks to the cloud engine) or local-only (if CLI uses local SQLite cache) | **Depends on architecture**: if the CLI calls the Lambda API, same cold-start risk. If CLI runs the review engine locally, no Lambda involved. | 0s (local) or 1–3s (remote). Design should prefer local engine for CLI. |
+
+#### Actions that do NOT trigger a cold start
+
+| # | Action | Why no cold start |
+|---|--------|-------------------|
+| A | **Rapid-fire taps during an active session** — user reviews terms 1, 2, 3, 4 in quick succession (each tap 5–15 seconds apart) | Container stays warm between interactions. Each response is sub-100ms (DynamoDB read + Telegram Bot API call). |
+| B | **Daily digest delivery** (the cron job itself) | System-initiated via EventBridge. Cold start happens on the *cron Lambda*, not on a user-facing interaction. The user sees the message arrive in Telegram — they don't wait for it. |
+| C | **Session cleanup / heartbeat check** | System-initiated background tick. No user waiting. |
+
+#### The worst-case user experience
+
+The most problematic scenario is **#2 — resuming after a mid-session gap**. The user tapped "2-ok" for term 4, got an instant response showing term 5, then put the phone in their pocket. Twenty minutes later they pull it out and tap "Reveal answer" — and wait 2 seconds for what was previously instant. The mental model breaks because the interaction *felt* like a continuous session.
+
+Scenario #1 (first interaction of the day) is less jarring because the user is initiating a new action — they expect a brief loading moment when opening something fresh.
+
+#### Mitigations
+
+| Mitigation | Effect | Cost / complexity |
+|------------|--------|-------------------|
+| **Provisioned concurrency (1 instance)** | Eliminates cold starts entirely. One container is always warm. | ~$5–8/month for a small Lambda. Defeats scale-to-zero but is cheap for a single-user app. |
+| **EventBridge warm-ping** | A 5-minute scheduled ping invokes the Lambda with a no-op event, keeping the container warm during study hours (e.g., 6 PM–10 PM). | Near-zero cost (a few hundred invocations/month). Requires a "warm-ping" event type the handler recognises and short-circuits. |
+| **Telegram "typing" indicator** | On webhook receipt, immediately call `sendChatAction(action="typing")` before invoking the engine Lambda. The user sees "Bot is typing..." which sets the expectation that a response is coming. | Zero cost. Doesn't reduce latency, but significantly improves perceived responsiveness. |
+| **Pre-warm on digest send** | After the daily digest Lambda sends the Telegram message, it also invokes the Review Engine Lambda with a warm-ping. By the time the user taps a button (seconds to minutes later), the container is warm. | Near-zero cost. Covers scenario #4 well; doesn't help with scenario #2. |
+| **Migrate to Fargate** | Persistent process, no cold starts ever. | ~$9/month. The nuclear option — use only if cold starts prove unacceptable after trying the above. |
+
+**Recommended approach**: Start with the **"typing" indicator** (free, immediate UX improvement) and the **EventBridge warm-ping during study hours** (near-zero cost, covers the common case). Add provisioned concurrency only if measured P95 latency exceeds acceptable thresholds.
+
+#### Comparison to the deck generator
+
+The generator does not have a cold-start problem because no user waits for its Lambda to respond. Drive webhook pings are acknowledged by the thin Receiver Lambda (no heavy init), and the Sync Lambda runs asynchronously — the user checks results later. A 5–10 second cold start on a minutes-long batch job is invisible.
+
+This is the sharpest operational difference between the two: **the generator's cold starts are free; the review agent's cold starts are the primary latency risk.**
+
 ### Alternative: long-polling instead of Lambda for Telegram
 
 If Telegram uses **long-polling** instead of webhooks, the review agent needs a persistent process (not Lambda). Options:
