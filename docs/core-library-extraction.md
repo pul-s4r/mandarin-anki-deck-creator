@@ -217,9 +217,26 @@ Downstream consumers should **not** share a single DynamoDB table or database in
 
 ---
 
+## Shared serverless infrastructure
+
+The generator's planned serverless deployment (§§9–18 of the architecture plan) and the review agent's deployment share the same AWS account, DynamoDB service, Bedrock credentials, Secrets Manager, and EventBridge Scheduler. A full comparison of shared components and operational differences is documented in [vocab-review-agent-design.md — Shared Infrastructure with the Deck Generator](./vocab-review-agent-design.md#shared-infrastructure-with-the-deck-generator).
+
+Key implications for the core extraction:
+
+1. **`core.llm`** is used by both apps — the generator for batch vocabulary extraction, the review agent for drill generation and dialogue evaluation. The `LlmClient` protocol must support both usage patterns (large multi-chunk batch calls and small single-turn interactive calls) without forcing either app to configure the other's prompt strategy.
+
+2. **`core.state`** — the `DynamoCardStore` and `DynamoTagStore` implementations serve both apps. The generator writes cards and tags; the review agent reads them. The DynamoDB table namespace is partitioned by application (`generator-*` vs `review-*` for app-specific tables), but shared tables (`cards`, `tags`) are in a `core-*` namespace accessible to both.
+
+3. **`core.config`** gains a deployment-target dimension: both apps need AWS region, DynamoDB table prefix, and Bedrock model settings, but the review agent additionally needs Telegram bot token config while the generator needs Drive OAuth paths. The shared `LlmSettings` and `StateSettings` cover the overlap; app-specific settings stay in each consumer's own config.
+
+4. **Container images** — both apps share the same Python 3.12 Lambda base image and bundle `anki-pipeline-core` as a dependency. The generator image is significantly larger (includes CEDICT, PyMuPDF, python-docx) while the review agent image is lighter. A multi-stage Docker build with a shared core layer and app-specific final stages minimises image duplication.
+
+---
+
 ## Open questions
 
 1. **Monorepo vs multi-repo**: Should core, generator, and review agent live in one repo (simpler CI, atomic cross-package changes) or separate repos (independent versioning, cleaner ownership)?
 2. **Versioning**: Does core follow its own semver, or is it versioned in lockstep with the generator?
 3. **DynamoDB table design**: Single-table design (PK=`user_id`, SK=`entity#id`) or separate tables per entity? Affects query patterns for "all terms for topic X".
 4. **Generator backwards compatibility**: During extraction, does the generator keep a copy of `VocabularyRow` locally (thin adapter over `core.models.VocabularyTerm`) or fully adopt the core model? Adapter is lower-risk.
+5. **IaC structure**: Shared IaC project with separate stacks per app (keeps deployment independent, shares DynamoDB/secrets definitions) vs completely separate IaC per app (simpler per-app, duplicates shared resource definitions)?

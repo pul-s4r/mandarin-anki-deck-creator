@@ -501,6 +501,119 @@ Each client is a thin adapter that translates its native interaction model (term
 
 ---
 
+## Shared Infrastructure with the Deck Generator
+
+The deck generator's serverless deployment (§§9–18 of the [architecture plan](./architecture/web-server-and-integrations-plan.md)) establishes an AWS stack: Lambda container images, EventBridge Scheduler, API Gateway, SQS FIFO, DynamoDB, and Secrets Manager. The review agent can reuse most of this infrastructure. This section confirms what is shared, what diverges, and what the operational differences are.
+
+### What is shared
+
+| Component | Generator usage | Review agent usage | Sharing model |
+|-----------|-----------------|-------------------|---------------|
+| **AWS account** | Bedrock LLM, Lambda, DynamoDB | Bedrock LLM, Lambda, DynamoDB | Same account — single billing, shared IAM |
+| **DynamoDB** | `cards`, `tags`, `sources`, `chunks`, `pending_edits`, `drive_channels` | `review_sessions`, `review_schedule`, `term_confidence`, `generated_content`, `notification_log` | Same service, **separate table namespace** (e.g. `generator-*` vs `review-*`). No cross-table writes. |
+| **Bedrock** | Heavy — vocabulary extraction from notes (batch, multi-chunk) | Lighter per call — sentence drills, dialogue turns, translation evaluation | Same model, same credentials, same `LlmClient` protocol from `anki-pipeline-core` |
+| **Secrets Manager / SSM** | Google Drive OAuth refresh token, Bedrock config | Telegram bot token, Bedrock config | Same store; separate secret paths per app |
+| **Lambda container base** | `public.ecr.aws/lambda/python:3.12` + pipeline deps | Same base + review engine deps (lighter — no CEDICT, no PDF/DOCX parsers) | Separate images, shared base layer in ECR. Generator image is larger (~120 MB CEDICT). |
+| **EventBridge Scheduler** | Cron per source set (weekly Drive refresh) | Cron for daily digest + Mode B tick (1-min poll for pending review actions) | Same service, separate schedule groups |
+| **API Gateway** | Drive webhook endpoint (`POST /drive/notifications`) | Telegram webhook endpoint (`POST /telegram/webhook`), or unused if Telegram uses long-polling | Same API Gateway instance with separate routes, or separate APIs |
+| **`anki-pipeline-core`** | Data models, state protocol, LLM client, normalisation | Same | Shared Python package, bundled in both container images |
+
+### What diverges: operational profile comparison
+
+The fundamental difference is **batch-event vs interactive**. The generator processes documents in bulk, infrequently. The review agent handles many small user interactions throughout the day.
+
+| Dimension | Deck Generator | Review Agent |
+|-----------|----------------|--------------|
+| **Trigger pattern** | Cron (weekly) + Drive webhook (sporadic edits) | User interaction (each tap/message) + daily digest cron |
+| **Invocation frequency** | Low: a few times per week | High: dozens of small invocations per day during active study |
+| **Execution duration** | Long: seconds to minutes per run (multi-chunk LLM extraction) | Short: sub-second per interaction (DB read + format response) |
+| **Latency requirement** | None — async batch; user checks results later | Strict — Telegram expects response within ~2s; interactive sessions need sub-second feel |
+| **LLM cost per invocation** | High — extracts vocabulary from full document chunks | Low to medium — generates one sentence drill or evaluates one dialogue turn |
+| **Cold start sensitivity** | Low — minutes-long runs amortize 5–10s cold start; CEDICT load from S3 adds ~3s | High — a 5s cold start on a Telegram response feels broken. Container image is lighter (no CEDICT), but Lambda cold starts still matter. |
+| **State write pattern** | Bulk: upsert many cards + chunks after a full pipeline run | Incremental: one confidence rating, one session-progress update per interaction |
+| **Concurrency model** | Serialized per source set (SQS FIFO `MessageGroupId`); no parallel processing of same channel | Single user, but concurrent clients (CLI + Telegram) access same session state; liveness-window protocol prevents true concurrency |
+| **Failure recovery** | Retry-safe: PendingEdits absorbs duplicates; content-hash dedup makes reprocessing a no-op | Session-aware: failed interaction leaves session in last-known-good state; client retries are safe because `record_rating` is idempotent on `(session_id, term_id)` |
+| **Debounce** | Yes — `quiet_minutes` + `max_delay_minutes` to coalesce rapid Drive edits before expensive LLM work | No — user interactions are intentional, not bursty; each one should be processed immediately |
+| **Data dependencies at runtime** | CEDICT dictionary (~120 MB), source documents, prior card state | Vocabulary terms (read from generator's cards via core `StateStore`), session state, cached drill content |
+| **Container image size** | Large: CEDICT, PyMuPDF, python-docx, langchain-aws | Small: review engine, `python-telegram-bot` or `httpx`, langchain-aws (for drill generation only) |
+
+### Lambda hosting model differences
+
+The generator's two-Lambda design (webhook receiver + unified sync Lambda) maps cleanly to the review agent, but with different trade-offs per component:
+
+**Generator Lambda topology (from §18):**
+
+```
+Drive webhook → API Gateway → Webhook Receiver Lambda (thin, fast)
+                                     ↓ SQS FIFO
+                              Unified Sync Lambda
+                                Mode A: pull_changes (changes.list → PendingEdits)
+                                Mode B: process_pending (run_sync → cards)
+EventBridge (weekly cron) → Unified Sync Lambda (Mode B)
+```
+
+**Review agent Lambda topology (equivalent):**
+
+```
+Telegram webhook → API Gateway → Telegram Receiver Lambda (thin, fast)
+                                       ↓ (inline or SQS)
+                                 Review Engine Lambda
+                                   • get_active_session / start_session
+                                   • record_rating / get_next_term
+                                   • generate_drill (Bedrock call)
+                                   → respond via Telegram Bot API
+EventBridge (daily cron) → Digest Lambda (reads schedule, sends Telegram message)
+EventBridge (1-min tick) → Review Engine Lambda (Mode B: check for abandoned sessions, send reminders)
+```
+
+**Key difference: inline vs queued processing.** The generator must queue work because `run_sync` takes minutes. The review agent can often respond inline within the Telegram webhook handler because most operations (read session, return next term) are sub-100ms DynamoDB reads. Only drill generation (Bedrock call) might need async handling.
+
+| Component | Generator | Review Agent | Difference |
+|-----------|-----------|-------------|------------|
+| Webhook receiver | Must return 200 in <2s (Drive SLA) → enqueue to SQS | Must return 200 in <2s (Telegram spec) → can often respond inline | Review agent may skip the SQS hop for simple reads |
+| Worker Lambda | Minutes-long execution; invoked from SQS | Sub-second for most operations; seconds for LLM drill generation | Review agent Lambda timeout can be much shorter (30s vs 5min) |
+| SQS FIFO | Required — serializes per-channel, absorbs duplicate Drive pings | Optional — only needed if drill generation is deferred to avoid Telegram timeout | Review agent can start without SQS and add it only for LLM-heavy operations |
+| EventBridge | Weekly cron + 1-min tick for pending processing | Daily digest + optional 1-min tick for session cleanup / reminders | Same mechanism, different frequencies |
+| Cold start mitigation | Provisioned concurrency if needed (heavy image) | Less critical (lighter image), but consider Lambda SnapStart or provisioned concurrency for interactive feel | Review agent benefits more from warm pools due to latency sensitivity |
+
+### Alternative: long-polling instead of Lambda for Telegram
+
+If Telegram uses **long-polling** instead of webhooks, the review agent needs a persistent process (not Lambda). Options:
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **ECS Fargate task** (0.25 vCPU, 0.5 GB) | Always-on, no cold start, simple `python-telegram-bot` loop | ~$9/month; not scale-to-zero |
+| **EC2 `t4g.nano`** | Cheapest always-on ($3/month), full control | Manual patching, not serverless |
+| **Lambda + webhook** (as above) | Scale-to-zero, no always-on cost | Cold start latency; needs API Gateway + public URL |
+
+**Recommendation**: Start with **Lambda + Telegram webhook** mode to match the generator's serverless model. The Telegram Bot API supports both modes — `setWebhook` for Lambda, `getUpdates` long-polling for a persistent process. If cold-start latency proves unacceptable for interactive sessions, migrate to a Fargate task for the Telegram client while keeping the review engine and state store unchanged.
+
+### Shared IaC and deployment
+
+Both apps can share a single IaC project (CDK, SAM, or Terraform) with separate stacks or modules:
+
+```
+infra/
+├── shared/
+│   ├── dynamodb.tf          # table definitions for both apps
+│   ├── secrets.tf           # Secrets Manager paths
+│   └── ecr.tf               # shared ECR repository
+├── generator/
+│   ├── lambda_webhook.tf    # Drive webhook receiver
+│   ├── lambda_sync.tf       # Unified sync Lambda
+│   ├── api_gateway.tf       # /drive/notifications route
+│   ├── eventbridge.tf       # weekly cron + 1-min tick
+│   └── sqs.tf               # FIFO queue
+└── review-agent/
+    ├── lambda_telegram.tf   # Telegram webhook receiver / engine
+    ├── api_gateway.tf       # /telegram/webhook route (or add route to shared API)
+    └── eventbridge.tf       # daily digest + session cleanup
+```
+
+This keeps deployment independent (updating the review agent doesn't redeploy the generator) while sharing the DynamoDB and secrets infrastructure.
+
+---
+
 ## Summary of Recommendations
 
 | Feature | Recommended approach | Rationale |
