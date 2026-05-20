@@ -7,7 +7,7 @@ Pipeline: PDF / Markdown / DOCX → plain text → Amazon Bedrock (LangChain) �
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e "packages/generator[dev]"
+pip install -r requirements-dev.txt
 ```
 
 ```bash
