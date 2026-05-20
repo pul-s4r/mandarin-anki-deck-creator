@@ -54,7 +54,7 @@ def test_bare_venv_install_and_cli_help(tmp_path: Path) -> None:
     subprocess.run([sys.executable, "-m", "venv", str(vdir)], check=True)
     py = vdir / "bin" / "python"
     pip = vdir / "bin" / "pip"
-    subprocess.run([str(pip), "install", "-q", "."], cwd=REPO_ROOT, check=True)
+    subprocess.run([str(pip), "install", "-q", "packages/generator"], cwd=REPO_ROOT, check=True)
     subprocess.run([str(py), "-m", "anki_deck_generator.cli", "--help"], cwd=REPO_ROOT, check=True)
     subprocess.run([str(py), "-m", "anki_deck_generator.cli", "run", "--help"], cwd=REPO_ROOT, check=True)
 

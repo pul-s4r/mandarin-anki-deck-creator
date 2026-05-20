@@ -7,7 +7,7 @@ Pipeline: PDF / Markdown / DOCX → plain text → Amazon Bedrock (LangChain) �
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e "packages/generator[dev]"
 ```
 
 ```bash
@@ -32,7 +32,7 @@ Options: `--chunk-size`, `--chunk-overlap`, `--csv-bom`, `--skip-lines-filter`, 
 
 ### Local state and incremental sync (optional)
 
-Install the sync extra if you use YAML source sets: `pip install -e ".[sync]"` (PyYAML is also included in `[dev]`).
+Install the sync extra if you use YAML source sets: `pip install -e "packages/generator[sync]"` (PyYAML is also included in `[dev]`).
 
 ```bash
 anki-notes-pipeline state init --db-path ~/.local/share/anki-notes-pipeline/state.db
