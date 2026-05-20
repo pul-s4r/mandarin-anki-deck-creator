@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vocab-review-agent"
+version = "0.1.0"
+description = "Vocabulary review and learning agent (scaffold)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anki-pipeline-core",
+]
+
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vocab_review_agent"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

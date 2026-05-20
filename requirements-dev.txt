@@ -1,0 +1,2 @@
+-e ./packages/core
+-e ./packages/generator[dev,google-drive,ankiweb]

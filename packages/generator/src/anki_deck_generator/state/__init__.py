@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from anki_deck_generator.config.settings import Settings, default_state_db_path
+from anki_pipeline_core.config import default_state_db_path
+
+from anki_deck_generator.config.settings import Settings
 from anki_deck_generator.state.records import (
     CardRecord,
     CardUpsertResult,
