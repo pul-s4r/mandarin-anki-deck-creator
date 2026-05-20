@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
 
+from anki_pipeline_core.llm import build_bedrock_converse
 from anki_deck_generator.config.settings import Settings
 from anki_deck_generator.llm.fixture_player import FixtureLlmModel
 from anki_deck_generator.llm.schemas import (
@@ -62,16 +63,7 @@ def build_bedrock_model(settings: Settings) -> ChatBedrockConverse | FixtureLlmM
     fp = settings.llm_fixture_path
     if fp is not None and fp.is_file():
         return FixtureLlmModel.from_path(fp)
-    kwargs: dict[str, Any] = {
-        "model_id": settings.bedrock_model_id,
-        "temperature": settings.bedrock_temperature,
-        "max_tokens": settings.bedrock_max_tokens,
-    }
-    if settings.aws_region:
-        kwargs["region_name"] = settings.aws_region
-    if settings.bedrock_top_p is not None:
-        kwargs["top_p"] = settings.bedrock_top_p
-    return ChatBedrockConverse(**kwargs)
+    return build_bedrock_converse(settings)
 
 
 def extract_vocabulary_from_chunk(
