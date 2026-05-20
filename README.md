@@ -53,9 +53,20 @@ Re-running `schedule` on unchanged files skips ingest/LLM at the document level;
 
 The module `anki_deck_generator.debuglog` is kept in the repo as a small NDJSON logger you can use when diagnosing pipeline issues. By default, the pipeline does **not** emit debug logs; add temporary calls to `debug_log(...)` where needed and remove them after verification.
 
+## Monorepo packages
+
+| Package | Path |
+|---------|------|
+| `anki-pipeline-core` | `packages/core/` |
+| `anki-deck-generator` | `packages/generator/` |
+| `vocab-review-agent` (scaffold) | `packages/review-agent/` |
+
+See `docs/core-library-extraction.md` for boundaries and migration notes.
+
 ## Tests
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
 
