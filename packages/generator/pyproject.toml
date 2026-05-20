@@ -1,0 +1,8 @@
+# Generator packaging lives here after packages/generator migration (see docs/core-library-extraction.md).
+# Until then, install from the repository root: pip install -e ".[dev]"
+
+[project]
+name = "anki-deck-generator"
+version = "0.1.0"
+description = "Convert Chinese study notes (PDF/Markdown/DOCX) to Anki vocabulary CSV"
+requires-python = ">=3.12"
