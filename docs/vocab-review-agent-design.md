@@ -304,7 +304,7 @@ parameters_schema: {"pattern": "string", "terms": "list[str]", "difficulty": "en
 active: true
 ```
 
-No session schema changes, no new tables, no code changes to the session or scheduling layer. The review engine resolves the template at session start, passes parameters, caches the output in `generated_items`.
+No session schema changes, no code changes to the session or scheduling layer — just data in the content pipeline. The review engine resolves the template at session start, passes parameters, caches the output in `generated_items`.
 
 **`generated_items.content`** is a JSON blob whose shape is defined by the template's `review_type`:
 
@@ -341,9 +341,25 @@ The scheduling layer doesn't know about review types. It tracks topics and terms
 | Scheduling | `term_confidence` | No | No |
 | Scheduling | `notification_log` | No | No |
 
-### What this replaces from the iteration 1 schema
+### Migration cost: iteration 1 → iteration 2
 
-| Iteration 1 | Iteration 2 equivalent | What changed |
+This schema revision is not free. The table-level changes from iteration 1:
+
+| Iteration 1 table | Iteration 2 table | Migration |
+|---|---|---|
+| `review_sessions` | `sessions` | **Renamed and stripped.** Drops `current_term_idx`, `terms_order`, `completed_terms`, and all dialogue columns. Adds `session_type`. |
+| *(did not exist)* | `session_events` | **New table.** Absorbs all per-interaction state that was previously embedded as JSON columns on `review_sessions`. |
+| *(did not exist)* | `content_templates` | **New table.** Stores versioned prompt recipes — no equivalent existed in iteration 1. |
+| `generated_content` | `generated_items` | **Restructured.** Gains `template_id` FK linking to the recipe that produced it, `term_ids` (list instead of single), `difficulty`. Drops the unlinked flat `type` string. |
+| `review_schedule` | `review_schedule` | Unchanged. |
+| `term_confidence` | `term_confidence` | Unchanged. |
+| `notification_log` | `notification_log` | Unchanged. |
+
+**Net change: +2 new tables, 2 renamed/restructured, 3 unchanged.** This is a one-time schema migration when adopting the iteration 2 design. Since no code has been implemented yet (the review agent is still at the design stage), this is a paper change — there is no production data to migrate.
+
+### Column-level mapping (what moved where)
+
+| Iteration 1 location | Iteration 2 equivalent | What changed |
 |-------------|----------------------|--------------|
 | `review_sessions.current_term_idx` | Derived from count of `term_presented` events in `session_events` | Mutable column → derived from event log |
 | `review_sessions.terms_order` | First N `term_presented` events (or a `session_started` event with the planned order in its payload) | JSON column on session → event payload |
@@ -351,14 +367,14 @@ The scheduling layer doesn't know about review types. It tracks topics and terms
 | `review_sessions.dialogue_history` | `message_sent` + `message_received` events in `session_events` | JSON array on session → event rows |
 | `review_sessions.dialogue_scenario` | `content_served` event linking to a `generated_items` row of type `dialogue` | Session column → content pipeline |
 | `review_sessions.dialogue_corrections` | `correction_issued` events in `session_events` | JSON array on session → event rows |
-| `generated_content` (flat) | `content_templates` + `generated_items` (template → item) | Unlinked cache → template-linked, versioned pipeline |
+| `generated_content.type` (flat string) | `generated_items.template_id` FK → `content_templates` row | Unlinked type label → foreign key to versioned prompt recipe |
 
 ### Properties
 
 - **Local-first**: works offline, sub-ms reads during interactive sessions
 - **Independent**: a bug here never corrupts the generator's canonical card data
 - **Eventually portable**: DynamoDB migration affects table storage, not schema shape — same tables, same separation
-- **Extensible**: new review/prompt types require zero schema migrations — only new template rows and new event/session type string values
+- **Extensible after initial setup**: once the iteration 2 schema is in place, new review/prompt types require only new `content_template` rows and new `event_type`/`session_type` string values — no further schema migrations
 
 ---
 
