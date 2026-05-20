@@ -7,9 +7,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from anki_pipeline_core.models import CardRecord, CardUpsertResult
+
     from anki_deck_generator.state.records import (
-        CardRecord,
-        CardUpsertResult,
         ChunkRecord,
         DriveChannelRecord,
         RunReportRecord,

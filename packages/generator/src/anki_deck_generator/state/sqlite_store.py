@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from anki_pipeline_core.state import SqliteTagStore
+
 from anki_deck_generator.errors import StateError
 from anki_deck_generator.state.records import (
     CardRecord,
@@ -123,6 +125,7 @@ class SqliteStateStore:
     def init_schema(self) -> None:
         """Create database file and schema (idempotent)."""
         self._ensure_schema(self._conn())
+        SqliteTagStore(self._db_path).init_schema()
 
     def close(self) -> None:
         c = getattr(self._local, "conn", None)
