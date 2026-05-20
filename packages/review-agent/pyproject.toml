@@ -12,6 +12,7 @@ dependencies = [
     "anki-pipeline-core",
 ]
 
+
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 

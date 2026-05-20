@@ -9,6 +9,7 @@ description = "Convert Chinese study notes (PDF/Markdown/DOCX) to Anki vocabular
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anki-pipeline-core",
     "boto3>=1.35",
     "langchain>=0.3",
     "langchain-aws>=1.4",
