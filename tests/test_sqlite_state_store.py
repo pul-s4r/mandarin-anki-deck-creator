@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -188,3 +189,83 @@ def test_concurrent_upserts(store: SqliteStateStore) -> None:
         t.join()
     assert not errors
     assert len(list(store.iter_all_cards())) == 3
+
+
+def test_migration_adds_ankiweb_columns_to_legacy_db(tmp_path: Path) -> None:
+    """Pre-M4 databases had cards without ankiweb_* columns; opening migrates in place."""
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE cards (
+            card_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            simplified TEXT NOT NULL,
+            traditional TEXT NOT NULL DEFAULT '',
+            pinyin TEXT NOT NULL DEFAULT '',
+            meaning TEXT NOT NULL DEFAULT '',
+            part_of_speech TEXT NOT NULL DEFAULT '',
+            usage_notes TEXT NOT NULL DEFAULT '',
+            sentence_simplified TEXT NOT NULL DEFAULT '',
+            first_seen_source_id TEXT NOT NULL DEFAULT '',
+            last_updated_at TEXT,
+            content_hash TEXT NOT NULL DEFAULT '',
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(user_id, simplified)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db)
+    store.init_schema()
+
+    with sqlite3.connect(str(db)) as c2:
+        cols = {row[1] for row in c2.execute("PRAGMA table_info(cards)")}
+    assert "ankiweb_note_id" in cols
+    assert "ankiweb_last_synced_at" in cols
+    assert "ankiweb_last_synced_fields" in cols
+
+    now = datetime.now(UTC)
+    cr = CardRecord(
+        card_id="c1",
+        simplified="词",
+        meaning="same",
+        last_updated_at=now,
+        first_seen_source_id="s",
+        content_hash="",
+    )
+    assert store.upsert_card(cr) is CardUpsertResult.CREATED
+    synced = replace(
+        cr,
+        ankiweb_note_id=99,
+        ankiweb_last_synced_at=now,
+        ankiweb_last_synced_fields={"Meaning": "same"},
+    )
+    assert store.upsert_card(synced) is CardUpsertResult.UPDATED
+    got = store.get_card_by_key("词")
+    assert got is not None and got.ankiweb_note_id == 99
+
+
+def test_upsert_updates_ankiweb_when_vocab_unchanged(store: SqliteStateStore) -> None:
+    now = datetime.now(UTC)
+    cr = CardRecord(
+        card_id="c1",
+        simplified="词",
+        meaning="same",
+        last_updated_at=now,
+        first_seen_source_id="s",
+        content_hash="",
+    )
+    assert store.upsert_card(cr) is CardUpsertResult.CREATED
+    synced = replace(
+        cr,
+        ankiweb_note_id=42,
+        ankiweb_last_synced_at=now,
+        ankiweb_last_synced_fields={"Meaning": "same"},
+    )
+    assert store.upsert_card(synced) is CardUpsertResult.UPDATED
+    got = store.get_card_by_key("词")
+    assert got is not None and got.ankiweb_note_id == 42

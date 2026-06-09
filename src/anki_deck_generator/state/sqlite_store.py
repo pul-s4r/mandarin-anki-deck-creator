@@ -36,6 +36,53 @@ def _parse_dt(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def _normalize_stored_anki_fields(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(k): str(v) for k, v in loaded.items()}
+
+
+def _ankiweb_meta_matches_row(row: sqlite3.Row, rec: CardRecord) -> bool:
+    sid = row["ankiweb_note_id"]
+    rid = rec.ankiweb_note_id
+    if sid is None and rid is None:
+        note_ok = True
+    elif sid is not None and rid is not None:
+        note_ok = int(sid) == int(rid)
+    else:
+        note_ok = False
+    if not note_ok:
+        return False
+    row_ts = _parse_dt(row["ankiweb_last_synced_at"]) if row["ankiweb_last_synced_at"] else None
+    if _dt_iso(row_ts) != _dt_iso(rec.ankiweb_last_synced_at):
+        return False
+    return _normalize_stored_anki_fields(row["ankiweb_last_synced_fields"]) == dict(rec.ankiweb_last_synced_fields or {})
+
+
+def _ensure_cards_ankiweb_columns(conn: sqlite3.Connection) -> None:
+    """Add ankiweb_* columns when upgrading pre-M4 databases (idempotent)."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cards' LIMIT 1"
+        ).fetchone()
+        is None
+    ):
+        return
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(cards)")}
+    if "ankiweb_note_id" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_note_id INTEGER")
+    if "ankiweb_last_synced_at" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_last_synced_at TEXT")
+    if "ankiweb_last_synced_fields" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN ankiweb_last_synced_fields TEXT")
+
+
 class SqliteStateStore:
     """One SQLite file per deployment; thread-safe writes via BEGIN IMMEDIATE."""
 
@@ -118,6 +165,7 @@ class SqliteStateStore:
             );
             """
         )
+        _ensure_cards_ankiweb_columns(conn)
         conn.commit()
 
     def init_schema(self) -> None:
@@ -312,7 +360,13 @@ class SqliteStateStore:
                 )
                 return CardUpsertResult.CREATED
             if (existing["content_hash"] or "") == h:
-                return CardUpsertResult.UNCHANGED
+                detail = conn.execute(
+                    "SELECT ankiweb_note_id, ankiweb_last_synced_at, ankiweb_last_synced_fields "
+                    "FROM cards WHERE card_id = ?",
+                    (existing["card_id"],),
+                ).fetchone()
+                if detail is not None and _ankiweb_meta_matches_row(detail, rec):
+                    return CardUpsertResult.UNCHANGED
             now_up = _dt_iso(rec.last_updated_at or datetime.now(UTC))
             conn.execute(
                 """
