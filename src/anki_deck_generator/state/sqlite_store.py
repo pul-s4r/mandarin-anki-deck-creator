@@ -14,10 +14,13 @@ from typing import Any
 from anki_deck_generator.errors import StateError
 from anki_deck_generator.state.card_compare import ankiweb_meta_matches_stored, dt_iso, normalize_stored_anki_fields
 from anki_deck_generator.state.records import (
+    AgentRecord,
     CardRecord,
     CardUpsertResult,
     ChunkRecord,
     DriveChannelRecord,
+    IssuedBatchRecord,
+    PendingSyncCursor,
     RunReportRecord,
     SourceRecord,
     compute_card_content_hash,
@@ -127,6 +130,40 @@ class SqliteStateStore:
                 sync_report_json TEXT NOT NULL DEFAULT '{}',
                 schema_version INTEGER NOT NULL DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS agents (
+                agent_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                token_hash TEXT NOT NULL,
+                created_at TEXT,
+                last_seen_at TEXT,
+                last_poll_at TEXT,
+                last_batch_id TEXT NOT NULL DEFAULT '',
+                last_sync_status TEXT NOT NULL DEFAULT '',
+                revoked_at TEXT,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_cursors (
+                agent_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                cursor_at TEXT,
+                cursor_card_id TEXT NOT NULL DEFAULT '',
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, agent_id)
+            );
+            CREATE TABLE IF NOT EXISTS issued_batches (
+                batch_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                issued_at TEXT,
+                acked_at TEXT,
+                cursor_at TEXT,
+                cursor_card_id TEXT NOT NULL DEFAULT '',
+                items_json TEXT NOT NULL DEFAULT '[]',
+                schema_version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_issued_batches_open
+                ON issued_batches(user_id, agent_id, acked_at);
             """
         )
         _ensure_cards_ankiweb_columns(conn)
@@ -503,3 +540,231 @@ class SqliteStateStore:
                 schema_version=int(row["schema_version"]),
                 user_id=row["user_id"] or "default",
             )
+
+    def get_run(self, run_id: str, *, user_id: str = "default") -> RunReportRecord | None:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ? AND user_id = ?",
+            (run_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return RunReportRecord(
+            run_id=row["run_id"],
+            trigger=row["trigger"] or "manual",
+            started_at=_parse_dt(row["started_at"]),
+            finished_at=_parse_dt(row["finished_at"]),
+            sync_report_json=row["sync_report_json"] or "{}",
+            schema_version=int(row["schema_version"]),
+            user_id=row["user_id"] or "default",
+        )
+
+    def update_run_report(self, run_id: str, sync_report_json: str, *, user_id: str = "default") -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runs SET sync_report_json = ? WHERE run_id = ? AND user_id = ?",
+                (sync_report_json, run_id, user_id),
+            )
+
+        self._write(op)
+
+    def upsert_agent(self, rec: AgentRecord) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO agents (
+                    agent_id, user_id, token_hash, created_at, last_seen_at, last_poll_at,
+                    last_batch_id, last_sync_status, revoked_at, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, agent_id) DO UPDATE SET
+                    token_hash = excluded.token_hash,
+                    last_seen_at = excluded.last_seen_at,
+                    last_poll_at = excluded.last_poll_at,
+                    last_batch_id = excluded.last_batch_id,
+                    last_sync_status = excluded.last_sync_status,
+                    revoked_at = excluded.revoked_at,
+                    schema_version = excluded.schema_version
+                """,
+                (
+                    rec.agent_id,
+                    rec.user_id,
+                    rec.token_hash,
+                    dt_iso(rec.created_at),
+                    dt_iso(rec.last_seen_at),
+                    dt_iso(rec.last_poll_at),
+                    rec.last_batch_id,
+                    rec.last_sync_status,
+                    dt_iso(rec.revoked_at),
+                    rec.schema_version,
+                ),
+            )
+
+        self._write(op)
+
+    def get_agent(self, agent_id: str, *, user_id: str = "default") -> AgentRecord | None:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM agents WHERE agent_id = ? AND user_id = ?",
+            (agent_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_agent(row)
+
+    def iter_agents(self, *, user_id: str = "default") -> Iterable[AgentRecord]:
+        conn = self._conn()
+        for row in conn.execute("SELECT * FROM agents WHERE user_id = ?", (user_id,)):
+            yield self._row_to_agent(row)
+
+    def _row_to_agent(self, row: sqlite3.Row) -> AgentRecord:
+        return AgentRecord(
+            agent_id=row["agent_id"],
+            token_hash=row["token_hash"],
+            created_at=_parse_dt(row["created_at"]),
+            last_seen_at=_parse_dt(row["last_seen_at"]),
+            last_poll_at=_parse_dt(row["last_poll_at"]),
+            last_batch_id=row["last_batch_id"] or "",
+            last_sync_status=row["last_sync_status"] or "",
+            revoked_at=_parse_dt(row["revoked_at"]),
+            schema_version=int(row["schema_version"]),
+            user_id=row["user_id"] or "default",
+        )
+
+    def revoke_agent(self, agent_id: str, *, user_id: str = "default") -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE agents SET revoked_at = ? WHERE agent_id = ? AND user_id = ?",
+                (dt_iso(datetime.now(UTC)), agent_id, user_id),
+            )
+
+        self._write(op)
+
+    def touch_agent_poll(
+        self,
+        agent_id: str,
+        *,
+        user_id: str = "default",
+        batch_id: str = "",
+        sync_status: str = "",
+        seen_at: datetime | None = None,
+    ) -> None:
+        now = seen_at or datetime.now(UTC)
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                UPDATE agents SET last_poll_at = ?, last_seen_at = ?, last_batch_id = ?,
+                    last_sync_status = CASE WHEN ? != '' THEN ? ELSE last_sync_status END
+                WHERE agent_id = ? AND user_id = ?
+                """,
+                (dt_iso(now), dt_iso(now), batch_id, sync_status, sync_status, agent_id, user_id),
+            )
+
+        self._write(op)
+
+    def get_agent_cursor(self, agent_id: str, *, user_id: str = "default") -> PendingSyncCursor | None:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM agent_cursors WHERE agent_id = ? AND user_id = ?",
+            (agent_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return PendingSyncCursor(
+            agent_id=row["agent_id"],
+            cursor_at=_parse_dt(row["cursor_at"]),
+            cursor_card_id=row["cursor_card_id"] or "",
+            schema_version=int(row["schema_version"]),
+            user_id=row["user_id"] or "default",
+        )
+
+    def set_agent_cursor(self, rec: PendingSyncCursor) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO agent_cursors (agent_id, user_id, cursor_at, cursor_card_id, schema_version)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, agent_id) DO UPDATE SET
+                    cursor_at = excluded.cursor_at,
+                    cursor_card_id = excluded.cursor_card_id,
+                    schema_version = excluded.schema_version
+                """,
+                (
+                    rec.agent_id,
+                    rec.user_id,
+                    dt_iso(rec.cursor_at),
+                    rec.cursor_card_id,
+                    rec.schema_version,
+                ),
+            )
+
+        self._write(op)
+
+    def put_issued_batch(self, rec: IssuedBatchRecord) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO issued_batches (
+                    batch_id, agent_id, user_id, issued_at, acked_at,
+                    cursor_at, cursor_card_id, items_json, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec.batch_id,
+                    rec.agent_id,
+                    rec.user_id,
+                    dt_iso(rec.issued_at),
+                    dt_iso(rec.acked_at),
+                    dt_iso(rec.cursor_at),
+                    rec.cursor_card_id,
+                    rec.items_json,
+                    rec.schema_version,
+                ),
+            )
+
+        self._write(op)
+
+    def get_issued_batch(self, batch_id: str) -> IssuedBatchRecord | None:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM issued_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_batch(row)
+
+    def get_open_batch_for_agent(self, agent_id: str, *, user_id: str = "default") -> IssuedBatchRecord | None:
+        conn = self._conn()
+        row = conn.execute(
+            """
+            SELECT * FROM issued_batches
+            WHERE agent_id = ? AND user_id = ? AND acked_at IS NULL
+            ORDER BY issued_at DESC LIMIT 1
+            """,
+            (agent_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_batch(row)
+
+    def _row_to_batch(self, row: sqlite3.Row) -> IssuedBatchRecord:
+        return IssuedBatchRecord(
+            batch_id=row["batch_id"],
+            agent_id=row["agent_id"],
+            user_id=row["user_id"] or "default",
+            issued_at=_parse_dt(row["issued_at"]),
+            acked_at=_parse_dt(row["acked_at"]),
+            cursor_at=_parse_dt(row["cursor_at"]),
+            cursor_card_id=row["cursor_card_id"] or "",
+            items_json=row["items_json"] or "[]",
+            schema_version=int(row["schema_version"]),
+        )
+
+    def mark_batch_acked(self, batch_id: str, *, acked_at: datetime) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            cur = conn.execute(
+                "UPDATE issued_batches SET acked_at = ? WHERE batch_id = ? AND acked_at IS NULL",
+                (dt_iso(acked_at), batch_id),
+            )
+            if cur.rowcount != 1:
+                raise StateError("Batch ack failed or already acknowledged")
+
+        self._write(op)

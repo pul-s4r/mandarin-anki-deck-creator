@@ -26,6 +26,22 @@ class SyncReportStats:
 
 
 @dataclass
+class AnkiWebExportReport:
+    agent_id: str = ""
+    batch_id: str = ""
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    skipped: int = 0
+    conflicts: int = 0
+    errors: int = 0
+    sync_requested: bool = False
+    sync_status: str = ""
+    duration_ms: int = 0
+    exporter: str = "ankiweb"
+
+
+@dataclass
 class SyncReport:
     run_id: str
     run_started_at: datetime
@@ -33,6 +49,7 @@ class SyncReport:
     outcomes: list[SyncRunOutcome] = field(default_factory=list)
     stats: SyncReportStats = field(default_factory=SyncReportStats)
     export_paths: list[str] = field(default_factory=list)
+    exports: dict[str, list[AnkiWebExportReport]] = field(default_factory=dict)
     dry_run: bool = False
 
     def to_jsonable(self) -> dict:

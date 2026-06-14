@@ -1,0 +1,13 @@
+[Unit]
+Description=Anki Notes Pipeline pull agent
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=__VENV_PYTHON__ __AGENT_SCRIPT__
+Environment=ANKI_AGENT_CONFIG=__AGENT_CONFIG__
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

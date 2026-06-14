@@ -8,7 +8,17 @@ from datetime import UTC, datetime
 
 import pytest
 
-from anki_deck_generator.state.records import CardRecord, CardUpsertResult, ChunkRecord, RunReportRecord, SourceRecord
+from anki_deck_generator.state.agent_tokens import hash_agent_token, verify_agent_token
+from anki_deck_generator.state.records import (
+    AgentRecord,
+    CardRecord,
+    CardUpsertResult,
+    ChunkRecord,
+    IssuedBatchRecord,
+    PendingSyncCursor,
+    RunReportRecord,
+    SourceRecord,
+)
 from anki_deck_generator.state.store import StateStore
 
 
@@ -176,3 +186,43 @@ class StateStoreConformanceTests:
         assert store.upsert_card(synced) is CardUpsertResult.UPDATED
         got = store.get_card_by_key("词")
         assert got is not None and got.ankiweb_note_id == 42
+
+    def test_agent_register_cursor_and_batch_ack(self, store: StateStore) -> None:
+        now = datetime.now(UTC)
+        token_hash = hash_agent_token("secret-token")
+        store.upsert_agent(
+            AgentRecord(
+                agent_id="desktop",
+                token_hash=token_hash,
+                created_at=now,
+                last_seen_at=now,
+            )
+        )
+        got = store.get_agent("desktop")
+        assert got is not None
+        assert verify_agent_token("secret-token", got.token_hash)
+
+        store.set_agent_cursor(
+            PendingSyncCursor(agent_id="desktop", cursor_at=now, cursor_card_id="c0")
+        )
+        cursor = store.get_agent_cursor("desktop")
+        assert cursor is not None and cursor.cursor_card_id == "c0"
+
+        store.put_issued_batch(
+            IssuedBatchRecord(
+                batch_id="batch-1",
+                agent_id="desktop",
+                issued_at=now,
+                cursor_at=now,
+                cursor_card_id="c1",
+                items_json='[{"card_id":"c1"}]',
+            )
+        )
+        open_batch = store.get_open_batch_for_agent("desktop")
+        assert open_batch is not None and open_batch.batch_id == "batch-1"
+        store.mark_batch_acked("batch-1", acked_at=now)
+        assert store.get_open_batch_for_agent("desktop") is None
+
+        store.revoke_agent("desktop")
+        revoked = store.get_agent("desktop")
+        assert revoked is not None and revoked.revoked_at is not None

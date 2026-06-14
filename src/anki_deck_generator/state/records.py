@@ -109,6 +109,44 @@ class RunReportRecord:
     user_id: str = "default"
 
 
+@dataclass
+class AgentRecord:
+    agent_id: str
+    token_hash: str
+    created_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    last_poll_at: datetime | None = None
+    last_batch_id: str = ""
+    last_sync_status: str = ""
+    revoked_at: datetime | None = None
+    schema_version: int = 1
+    user_id: str = "default"
+
+
+@dataclass
+class PendingSyncCursor:
+    """Per-agent cursor: last acked (last_updated_at, card_id) tiebreaker."""
+
+    agent_id: str
+    cursor_at: datetime | None = None
+    cursor_card_id: str = ""
+    schema_version: int = 1
+    user_id: str = "default"
+
+
+@dataclass
+class IssuedBatchRecord:
+    batch_id: str
+    agent_id: str
+    user_id: str = "default"
+    issued_at: datetime | None = None
+    acked_at: datetime | None = None
+    cursor_at: datetime | None = None
+    cursor_card_id: str = ""
+    items_json: str = "[]"
+    schema_version: int = 1
+
+
 def record_to_jsonable(obj: Any) -> Any:
     """Convert datetimes in nested dicts/lists for JSON serialization."""
     if isinstance(obj, datetime):

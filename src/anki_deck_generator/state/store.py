@@ -8,10 +8,13 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from anki_deck_generator.state.records import (
+        AgentRecord,
         CardRecord,
         CardUpsertResult,
         ChunkRecord,
         DriveChannelRecord,
+        IssuedBatchRecord,
+        PendingSyncCursor,
         RunReportRecord,
         SourceRecord,
     )
@@ -51,3 +54,37 @@ class StateStore(Protocol):
     def record_run(self, rec: RunReportRecord) -> None: ...
 
     def iter_runs(self, *, limit: int = 100) -> Iterable[RunReportRecord]: ...
+
+    def get_run(self, run_id: str, *, user_id: str = "default") -> RunReportRecord | None: ...
+
+    def update_run_report(self, run_id: str, sync_report_json: str, *, user_id: str = "default") -> None: ...
+
+    def upsert_agent(self, rec: AgentRecord) -> None: ...
+
+    def get_agent(self, agent_id: str, *, user_id: str = "default") -> AgentRecord | None: ...
+
+    def iter_agents(self, *, user_id: str = "default") -> Iterable[AgentRecord]: ...
+
+    def revoke_agent(self, agent_id: str, *, user_id: str = "default") -> None: ...
+
+    def touch_agent_poll(
+        self,
+        agent_id: str,
+        *,
+        user_id: str = "default",
+        batch_id: str = "",
+        sync_status: str = "",
+        seen_at: datetime | None = None,
+    ) -> None: ...
+
+    def get_agent_cursor(self, agent_id: str, *, user_id: str = "default") -> PendingSyncCursor | None: ...
+
+    def set_agent_cursor(self, rec: PendingSyncCursor) -> None: ...
+
+    def put_issued_batch(self, rec: IssuedBatchRecord) -> None: ...
+
+    def get_issued_batch(self, batch_id: str) -> IssuedBatchRecord | None: ...
+
+    def get_open_batch_for_agent(self, agent_id: str, *, user_id: str = "default") -> IssuedBatchRecord | None: ...
+
+    def mark_batch_acked(self, batch_id: str, *, acked_at: datetime) -> None: ...

@@ -165,6 +165,22 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=None, help="Bind port (default: ANKI_SERVER_PORT or 8000)")
     serve.add_argument("-v", "--verbose", action="store_true")
 
+    agent = sub.add_parser("agent", help="Manage the desktop AnkiWeb pull agent")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    setup = agent_sub.add_parser("setup", help="Register agent token and install background service")
+    setup.add_argument("--server-url", type=str, default=None)
+    setup.add_argument("--agent-id", type=str, default=None)
+    setup.add_argument("--register-secret", type=str, default=None)
+    setup.add_argument("--anki-connect-url", type=str, default="http://127.0.0.1:8765")
+    setup.add_argument("--deck-name", type=str, default="Chinese vocabulary")
+    setup.add_argument("--model-name", type=str, default="Chinese vocabulary")
+    agent_sub.add_parser("status", help="Show local agent cache/cursor status")
+    uninstall = agent_sub.add_parser("uninstall", help="Remove init unit, venv, and cache")
+    uninstall.add_argument("--purge", action="store_true", help="Also delete agent.toml")
+    agent_sub.add_parser("rebuild-venv", help="Recreate the isolated agent virtualenv")
+    revoke = agent_sub.add_parser("revoke", help="Revoke the cloud agent token")
+    revoke.add_argument("--register-secret", type=str, default=None)
+
     return p
 
 
@@ -204,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
         from anki_deck_generator.cli_handlers.serve import run_serve_command
 
         return run_serve_command(args)
+    if args.command == "agent":
+        from anki_deck_generator.cli_handlers.agent import run_agent_command
+
+        return run_agent_command(args)
     return 1
 
 

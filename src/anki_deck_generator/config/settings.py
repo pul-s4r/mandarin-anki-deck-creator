@@ -89,6 +89,13 @@ class ServerSettings(BaseSettings):
     port: int = 8000
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     max_upload_size_mb: int = 50
+    agent_register_secret: str = Field(
+        default="",
+        description="Shared secret for POST /api/ankiweb/agent/register (env: ANKI_SERVER_AGENT_REGISTER_SECRET)",
+    )
+    ankiweb_deck_name: str = "Chinese vocabulary"
+    ankiweb_model_name: str = "Chinese vocabulary"
+    ankiweb_pending_batch_size: int = 50
 
     @field_validator("cors_origins", mode="before")
     @classmethod

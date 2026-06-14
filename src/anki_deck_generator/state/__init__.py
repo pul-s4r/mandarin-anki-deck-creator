@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from anki_deck_generator.config.settings import Settings, default_state_db_path
 from anki_deck_generator.state.records import (
+    AgentRecord,
     CardRecord,
     CardUpsertResult,
     ChunkRecord,
     DriveChannelRecord,
+    IssuedBatchRecord,
+    PendingSyncCursor,
     RunReportRecord,
     SourceRecord,
     compute_card_content_hash,
