@@ -1,0 +1,428 @@
+"""DynamoDB-backed StateStore (single-table design)."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+
+from botocore.exceptions import ClientError
+
+from anki_deck_generator.errors import StateError
+from anki_deck_generator.state.card_compare import ankiweb_meta_matches_stored, dt_iso, normalize_stored_anki_fields
+from anki_deck_generator.state.dynamo_table import CARD_BY_KEY_INDEX
+from anki_deck_generator.state.records import (
+    CardRecord,
+    CardUpsertResult,
+    ChunkRecord,
+    DriveChannelRecord,
+    RunReportRecord,
+    SourceRecord,
+    compute_card_content_hash,
+)
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _source_keys(rec: SourceRecord) -> dict[str, str]:
+    return {
+        "pk": f"USER#{rec.user_id}",
+        "sk": f"SRC#{rec.provider}#{rec.external_id}",
+    }
+
+
+def _chunk_keys(rec: ChunkRecord) -> dict[str, str]:
+    return {
+        "pk": f"SRC#{rec.source_id}",
+        "sk": f"CHUNK#{rec.chunk_index:05d}",
+    }
+
+
+def _card_keys(card_id: str) -> dict[str, str]:
+    return {"pk": f"CARD#{card_id}", "sk": "META"}
+
+
+def _channel_keys(channel_id: str) -> dict[str, str]:
+    return {"pk": f"CHAN#{channel_id}", "sk": "META"}
+
+
+def _run_keys(rec: RunReportRecord) -> dict[str, str]:
+    return {"pk": f"USER#{rec.user_id}", "sk": f"RUN#{rec.run_id}"}
+
+
+def _item_to_source(item: dict[str, Any]) -> SourceRecord:
+    return SourceRecord(
+        source_id=str(item["source_id"]),
+        provider=str(item["provider"]),
+        external_id=str(item["external_id"]),
+        revision_id=str(item.get("revision_id", "")),
+        etag=str(item.get("etag", "")),
+        content_sha256=str(item.get("content_sha256", "")),
+        last_ingested_at=_parse_dt(item.get("last_ingested_at")),
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+    )
+
+
+def _item_to_chunk(item: dict[str, Any]) -> ChunkRecord:
+    raw_ids = item.get("llm_output_card_ids", "[]")
+    if isinstance(raw_ids, str):
+        card_ids = json.loads(raw_ids)
+    else:
+        card_ids = list(raw_ids)
+    return ChunkRecord(
+        source_id=str(item["source_id"]),
+        chunk_index=int(item["chunk_index"]),
+        chunk_sha256=str(item.get("chunk_sha256", "")),
+        processed_at=_parse_dt(item.get("processed_at")),
+        model_id=str(item.get("model_id", "")),
+        llm_output_card_ids=[str(x) for x in card_ids],
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+    )
+
+
+def _item_to_card(item: dict[str, Any]) -> CardRecord:
+    note_id = item.get("ankiweb_note_id")
+    if isinstance(note_id, Decimal):
+        note_id = int(note_id)
+    raw_fields = item.get("ankiweb_last_synced_fields")
+    fields: dict[str, str] | None
+    if raw_fields is None:
+        fields = None
+    else:
+        normalized = normalize_stored_anki_fields(raw_fields if isinstance(raw_fields, str) else raw_fields)
+        fields = normalized or None
+    return CardRecord(
+        card_id=str(item["card_id"]),
+        simplified=str(item["simplified"]),
+        traditional=str(item.get("traditional", "")),
+        pinyin=str(item.get("pinyin", "")),
+        meaning=str(item.get("meaning", "")),
+        part_of_speech=str(item.get("part_of_speech", "")),
+        usage_notes=str(item.get("usage_notes", "")),
+        sentence_simplified=str(item.get("sentence_simplified", "")),
+        first_seen_source_id=str(item.get("first_seen_source_id", "")),
+        last_updated_at=_parse_dt(item.get("last_updated_at")),
+        content_hash=str(item.get("content_hash", "")),
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+        ankiweb_note_id=note_id,
+        ankiweb_last_synced_at=_parse_dt(item.get("ankiweb_last_synced_at")),
+        ankiweb_last_synced_fields=fields,
+    )
+
+
+def _item_to_channel(item: dict[str, Any]) -> DriveChannelRecord:
+    return DriveChannelRecord(
+        channel_id=str(item["channel_id"]),
+        resource_id=str(item.get("resource_id", "")),
+        page_token=str(item.get("page_token", "")),
+        expiration=_parse_dt(item.get("expiration")),
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+    )
+
+
+def _item_to_run(item: dict[str, Any]) -> RunReportRecord:
+    return RunReportRecord(
+        run_id=str(item["run_id"]),
+        trigger=str(item.get("trigger", "manual")),
+        started_at=_parse_dt(item.get("started_at")),
+        finished_at=_parse_dt(item.get("finished_at")),
+        sync_report_json=str(item.get("sync_report_json", "{}")),
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+    )
+
+
+class DynamoStateStore:
+    """Single-table DynamoDB StateStore implementation."""
+
+    def __init__(self, *, table_name: str, dynamodb_resource: Any | None = None) -> None:
+        import boto3
+
+        self._table_name = table_name
+        self._resource = dynamodb_resource or boto3.resource("dynamodb", region_name="us-east-1")
+        self._table = self._resource.Table(table_name)
+
+    def get_source_record(self, provider: str, external_id: str, *, user_id: str = "default") -> SourceRecord | None:
+        response = self._table.get_item(
+            Key={"pk": f"USER#{user_id}", "sk": f"SRC#{provider}#{external_id}"},
+        )
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_source(item)
+
+    def upsert_source_record(self, rec: SourceRecord) -> None:
+        item = {
+            **_source_keys(rec),
+            "entity_type": "source",
+            "source_id": rec.source_id,
+            "provider": rec.provider,
+            "external_id": rec.external_id,
+            "revision_id": rec.revision_id,
+            "etag": rec.etag,
+            "content_sha256": rec.content_sha256,
+            "last_ingested_at": dt_iso(rec.last_ingested_at),
+            "schema_version": rec.schema_version,
+            "user_id": rec.user_id,
+        }
+        self._table.put_item(Item=item)
+
+    def get_processed_chunk(self, source_id: str, chunk_index: int) -> ChunkRecord | None:
+        response = self._table.get_item(
+            Key={"pk": f"SRC#{source_id}", "sk": f"CHUNK#{chunk_index:05d}"},
+        )
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_chunk(item)
+
+    def upsert_processed_chunk(self, rec: ChunkRecord) -> None:
+        item = {
+            **_chunk_keys(rec),
+            "entity_type": "chunk",
+            "source_id": rec.source_id,
+            "chunk_index": rec.chunk_index,
+            "chunk_sha256": rec.chunk_sha256,
+            "processed_at": dt_iso(rec.processed_at),
+            "model_id": rec.model_id,
+            "llm_output_card_ids": json.dumps(rec.llm_output_card_ids),
+            "schema_version": rec.schema_version,
+            "user_id": rec.user_id,
+        }
+        self._table.put_item(Item=item)
+
+    def _get_card_item_by_key(self, natural_key: str, *, user_id: str) -> dict[str, Any] | None:
+        response = self._table.query(
+            IndexName=CARD_BY_KEY_INDEX,
+            KeyConditionExpression="user_id = :uid AND simplified = :simp",
+            ExpressionAttributeValues={":uid": user_id, ":simp": natural_key},
+            Limit=1,
+        )
+        items = response.get("Items", [])
+        if not items:
+            return None
+        return items[0]
+
+    def get_card_by_key(self, natural_key: str, *, user_id: str = "default") -> CardRecord | None:
+        item = self._get_card_item_by_key(natural_key, user_id=user_id)
+        if item is None:
+            return None
+        return _item_to_card(item)
+
+    def get_card_by_id(self, card_id: str) -> CardRecord | None:
+        response = self._table.get_item(Key=_card_keys(card_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_card(item)
+
+    def _put_card_item(self, rec: CardRecord) -> None:
+        fields_json = json.dumps(rec.ankiweb_last_synced_fields) if rec.ankiweb_last_synced_fields else None
+        item: dict[str, Any] = {
+            **_card_keys(rec.card_id),
+            "entity_type": "card",
+            "card_id": rec.card_id,
+            "user_id": rec.user_id,
+            "simplified": rec.simplified,
+            "traditional": rec.traditional,
+            "pinyin": rec.pinyin,
+            "meaning": rec.meaning,
+            "part_of_speech": rec.part_of_speech,
+            "usage_notes": rec.usage_notes,
+            "sentence_simplified": rec.sentence_simplified,
+            "first_seen_source_id": rec.first_seen_source_id,
+            "last_updated_at": dt_iso(rec.last_updated_at),
+            "content_hash": rec.content_hash,
+            "schema_version": rec.schema_version,
+            "ankiweb_note_id": rec.ankiweb_note_id,
+            "ankiweb_last_synced_at": dt_iso(rec.ankiweb_last_synced_at),
+            "ankiweb_last_synced_fields": fields_json,
+        }
+        self._table.put_item(Item=item)
+
+    def upsert_card(self, rec: CardRecord) -> CardUpsertResult:
+        content_hash = rec.content_hash or compute_card_content_hash(
+            simplified=rec.simplified,
+            traditional=rec.traditional,
+            pinyin=rec.pinyin,
+            meaning=rec.meaning,
+            part_of_speech=rec.part_of_speech,
+            usage_notes=rec.usage_notes,
+        )
+        existing = self._get_card_item_by_key(rec.simplified, user_id=rec.user_id)
+        now_dt = rec.last_updated_at or datetime.now(UTC)
+        if existing is None:
+            card_id = rec.card_id or str(uuid.uuid4())
+            self._put_card_item(
+                CardRecord(
+                    card_id=card_id,
+                    simplified=rec.simplified,
+                    traditional=rec.traditional,
+                    pinyin=rec.pinyin,
+                    meaning=rec.meaning,
+                    part_of_speech=rec.part_of_speech,
+                    usage_notes=rec.usage_notes,
+                    sentence_simplified=rec.sentence_simplified,
+                    first_seen_source_id=rec.first_seen_source_id,
+                    last_updated_at=now_dt,
+                    content_hash=content_hash,
+                    schema_version=rec.schema_version,
+                    user_id=rec.user_id,
+                    ankiweb_note_id=rec.ankiweb_note_id,
+                    ankiweb_last_synced_at=rec.ankiweb_last_synced_at,
+                    ankiweb_last_synced_fields=rec.ankiweb_last_synced_fields,
+                )
+            )
+            return CardUpsertResult.CREATED
+
+        if (existing.get("content_hash") or "") == content_hash and ankiweb_meta_matches_stored(
+            stored_note_id=existing.get("ankiweb_note_id"),
+            stored_synced_at=_parse_dt(existing.get("ankiweb_last_synced_at")),
+            stored_synced_fields=existing.get("ankiweb_last_synced_fields"),
+            rec=rec,
+        ):
+            return CardUpsertResult.UNCHANGED
+
+        card_id = str(existing["card_id"])
+        self._put_card_item(
+            CardRecord(
+                card_id=card_id,
+                simplified=rec.simplified,
+                traditional=rec.traditional,
+                pinyin=rec.pinyin,
+                meaning=rec.meaning,
+                part_of_speech=rec.part_of_speech,
+                usage_notes=rec.usage_notes,
+                sentence_simplified=rec.sentence_simplified,
+                first_seen_source_id=rec.first_seen_source_id,
+                last_updated_at=rec.last_updated_at or datetime.now(UTC),
+                content_hash=content_hash,
+                schema_version=rec.schema_version,
+                user_id=rec.user_id,
+                ankiweb_note_id=rec.ankiweb_note_id,
+                ankiweb_last_synced_at=rec.ankiweb_last_synced_at,
+                ankiweb_last_synced_fields=rec.ankiweb_last_synced_fields,
+            )
+        )
+        return CardUpsertResult.UPDATED
+
+    def iter_cards_changed_since(self, ts: datetime, *, user_id: str = "default") -> Iterable[CardRecord]:
+        iso = dt_iso(ts)
+        response = self._table.query(
+            IndexName=CARD_BY_KEY_INDEX,
+            KeyConditionExpression="user_id = :uid",
+            ExpressionAttributeValues={":uid": user_id},
+        )
+        items = response.get("Items", [])
+        while True:
+            for item in items:
+                updated = item.get("last_updated_at")
+                if updated and updated > (iso or ""):
+                    yield _item_to_card(item)
+            if "LastEvaluatedKey" not in response:
+                break
+            response = self._table.query(
+                IndexName=CARD_BY_KEY_INDEX,
+                KeyConditionExpression="user_id = :uid",
+                ExpressionAttributeValues={":uid": user_id},
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            items = response.get("Items", [])
+
+    def iter_all_cards(self, *, user_id: str = "default") -> Iterable[CardRecord]:
+        response = self._table.query(
+            IndexName=CARD_BY_KEY_INDEX,
+            KeyConditionExpression="user_id = :uid",
+            ExpressionAttributeValues={":uid": user_id},
+        )
+        items = response.get("Items", [])
+        while True:
+            for item in sorted(items, key=lambda row: str(row.get("simplified", ""))):
+                yield _item_to_card(item)
+            if "LastEvaluatedKey" not in response:
+                break
+            response = self._table.query(
+                IndexName=CARD_BY_KEY_INDEX,
+                KeyConditionExpression="user_id = :uid",
+                ExpressionAttributeValues={":uid": user_id},
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            items = response.get("Items", [])
+
+    def get_drive_channel(self, channel_id: str) -> DriveChannelRecord | None:
+        response = self._table.get_item(Key=_channel_keys(channel_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_channel(item)
+
+    def upsert_drive_channel(self, rec: DriveChannelRecord) -> None:
+        item = {
+            **_channel_keys(rec.channel_id),
+            "entity_type": "channel",
+            "channel_id": rec.channel_id,
+            "resource_id": rec.resource_id,
+            "page_token": rec.page_token,
+            "expiration": dt_iso(rec.expiration),
+            "schema_version": rec.schema_version,
+            "user_id": rec.user_id,
+        }
+        self._table.put_item(Item=item)
+
+    def advance_drive_channel_token(
+        self,
+        channel_id: str,
+        *,
+        expected_token: str,
+        new_token: str,
+    ) -> None:
+        try:
+            self._table.update_item(
+                Key=_channel_keys(channel_id),
+                UpdateExpression="SET page_token = :new_token",
+                ConditionExpression="page_token = :expected_token",
+                ExpressionAttributeValues={
+                    ":new_token": new_token,
+                    ":expected_token": expected_token,
+                },
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                raise StateError("Conditional drive channel token advance failed") from exc
+            raise StateError(str(exc)) from exc
+
+    def record_run(self, rec: RunReportRecord) -> None:
+        item = {
+            **_run_keys(rec),
+            "entity_type": "run",
+            "run_id": rec.run_id,
+            "trigger": rec.trigger,
+            "started_at": dt_iso(rec.started_at),
+            "finished_at": dt_iso(rec.finished_at),
+            "sync_report_json": rec.sync_report_json,
+            "schema_version": rec.schema_version,
+            "user_id": rec.user_id,
+        }
+        self._table.put_item(Item=item)
+
+    def iter_runs(self, *, limit: int = 100) -> Iterable[RunReportRecord]:
+        response = self._table.query(
+            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
+            ExpressionAttributeValues={":pk": "USER#default", ":prefix": "RUN#"},
+            Limit=limit,
+            ScanIndexForward=False,
+        )
+        for item in response.get("Items", []):
+            yield _item_to_run(item)
