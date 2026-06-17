@@ -160,6 +160,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output directory for downloaded files (google-drive)",
     )
 
+    serve = sub.add_parser("serve", help="Start the HTTP API server (requires [server] extra)")
+    serve.add_argument("--host", type=str, default=None, help="Bind host (default: ANKI_SERVER_HOST or 0.0.0.0)")
+    serve.add_argument("--port", type=int, default=None, help="Bind port (default: ANKI_SERVER_PORT or 8000)")
+    serve.add_argument("-v", "--verbose", action="store_true")
+
     return p
 
 
@@ -195,6 +200,10 @@ def main(argv: list[str] | None = None) -> int:
         from anki_deck_generator.cli_handlers.import_command import run_import_command
 
         return run_import_command(args)
+    if args.command == "serve":
+        from anki_deck_generator.cli_handlers.serve import run_serve_command
+
+        return run_serve_command(args)
     return 1
 
 

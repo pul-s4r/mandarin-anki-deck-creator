@@ -1,4 +1,4 @@
-"""Persistent state (SQLite / future DynamoDB)."""
+"""Persistent state (SQLite / DynamoDB)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ def get_store(settings: Settings) -> StateStore | None:
 
         path = settings.state_db_path or default_state_db_path()
         return SqliteStateStore(path)
+    if settings.state_backend == "dynamodb":
+        from anki_deck_generator.state.dynamo_store import DynamoStateStore
+
+        return DynamoStateStore(table_name=settings.dynamodb_table_name)
     return None
 
 

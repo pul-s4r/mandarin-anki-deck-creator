@@ -40,6 +40,14 @@ class StateStore(Protocol):
 
     def upsert_drive_channel(self, rec: DriveChannelRecord) -> None: ...
 
+    def advance_drive_channel_token(
+        self,
+        channel_id: str,
+        *,
+        expected_token: str,
+        new_token: str,
+    ) -> None: ...
+
     def record_run(self, rec: RunReportRecord) -> None: ...
 
     def iter_runs(self, *, limit: int = 100) -> Iterable[RunReportRecord]: ...

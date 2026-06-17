@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from anki_deck_generator.errors import StateError
+from anki_deck_generator.state.card_compare import ankiweb_meta_matches_stored, dt_iso, normalize_stored_anki_fields
 from anki_deck_generator.state.records import (
     CardRecord,
     CardUpsertResult,
@@ -22,47 +23,10 @@ from anki_deck_generator.state.records import (
     compute_card_content_hash,
 )
 
-def _dt_iso(dt: datetime | None) -> str | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).isoformat()
-
-
 def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def _normalize_stored_anki_fields(raw: str | None) -> dict[str, str]:
-    if not raw:
-        return {}
-    try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(loaded, dict):
-        return {}
-    return {str(k): str(v) for k, v in loaded.items()}
-
-
-def _ankiweb_meta_matches_row(row: sqlite3.Row, rec: CardRecord) -> bool:
-    sid = row["ankiweb_note_id"]
-    rid = rec.ankiweb_note_id
-    if sid is None and rid is None:
-        note_ok = True
-    elif sid is not None and rid is not None:
-        note_ok = int(sid) == int(rid)
-    else:
-        note_ok = False
-    if not note_ok:
-        return False
-    row_ts = _parse_dt(row["ankiweb_last_synced_at"]) if row["ankiweb_last_synced_at"] else None
-    if _dt_iso(row_ts) != _dt_iso(rec.ankiweb_last_synced_at):
-        return False
-    return _normalize_stored_anki_fields(row["ankiweb_last_synced_fields"]) == dict(rec.ankiweb_last_synced_fields or {})
 
 
 def _ensure_cards_ankiweb_columns(conn: sqlite3.Connection) -> None:
@@ -226,7 +190,7 @@ class SqliteStateStore:
                     rec.revision_id,
                     rec.etag,
                     rec.content_sha256,
-                    _dt_iso(rec.last_ingested_at),
+                    dt_iso(rec.last_ingested_at),
                     rec.schema_version,
                 ),
             )
@@ -285,7 +249,7 @@ class SqliteStateStore:
                     rec.chunk_index,
                     rec.user_id,
                     rec.chunk_sha256,
-                    _dt_iso(rec.processed_at),
+                    dt_iso(rec.processed_at),
                     rec.model_id,
                     json.dumps(rec.llm_output_card_ids),
                     rec.schema_version,
@@ -327,7 +291,7 @@ class SqliteStateStore:
                 (rec.simplified, rec.user_id),
             ).fetchone()
             now_dt = rec.last_updated_at or datetime.now(UTC)
-            now = _dt_iso(now_dt)
+            now = dt_iso(now_dt)
             if existing is None:
                 cid = rec.card_id or str(uuid.uuid4())
                 conn.execute(
@@ -354,7 +318,7 @@ class SqliteStateStore:
                         h,
                         rec.schema_version,
                         rec.ankiweb_note_id,
-                        _dt_iso(rec.ankiweb_last_synced_at),
+                        dt_iso(rec.ankiweb_last_synced_at),
                         json.dumps(rec.ankiweb_last_synced_fields) if rec.ankiweb_last_synced_fields else None,
                     ),
                 )
@@ -365,9 +329,14 @@ class SqliteStateStore:
                     "FROM cards WHERE card_id = ?",
                     (existing["card_id"],),
                 ).fetchone()
-                if detail is not None and _ankiweb_meta_matches_row(detail, rec):
+                if detail is not None and ankiweb_meta_matches_stored(
+                    stored_note_id=detail["ankiweb_note_id"],
+                    stored_synced_at=_parse_dt(detail["ankiweb_last_synced_at"]),
+                    stored_synced_fields=detail["ankiweb_last_synced_fields"],
+                    rec=rec,
+                ):
                     return CardUpsertResult.UNCHANGED
-            now_up = _dt_iso(rec.last_updated_at or datetime.now(UTC))
+            now_up = dt_iso(rec.last_updated_at or datetime.now(UTC))
             conn.execute(
                 """
                 UPDATE cards SET
@@ -389,7 +358,7 @@ class SqliteStateStore:
                     h,
                     rec.schema_version,
                     rec.ankiweb_note_id,
-                    _dt_iso(rec.ankiweb_last_synced_at),
+                    dt_iso(rec.ankiweb_last_synced_at),
                     json.dumps(rec.ankiweb_last_synced_fields) if rec.ankiweb_last_synced_fields else None,
                     existing["card_id"],
                 ),
@@ -400,15 +369,8 @@ class SqliteStateStore:
 
     def _row_to_card(self, row: sqlite3.Row) -> CardRecord:
         raw_fields = row["ankiweb_last_synced_fields"]
-        fields: dict[str, str] | None
-        if raw_fields:
-            try:
-                loaded = json.loads(raw_fields)
-                fields = {str(k): str(v) for k, v in loaded.items()} if isinstance(loaded, dict) else None
-            except json.JSONDecodeError:
-                fields = None
-        else:
-            fields = None
+        normalized = normalize_stored_anki_fields(raw_fields)
+        fields: dict[str, str] | None = normalized or None
         return CardRecord(
             card_id=row["card_id"],
             simplified=row["simplified"],
@@ -430,7 +392,7 @@ class SqliteStateStore:
 
     def iter_cards_changed_since(self, ts: datetime, *, user_id: str = "default") -> Iterable[CardRecord]:
         conn = self._conn()
-        iso = _dt_iso(ts)
+        iso = dt_iso(ts)
         for row in conn.execute(
             "SELECT * FROM cards WHERE user_id = ? AND last_updated_at > ? ORDER BY last_updated_at",
             (user_id, iso),
@@ -477,10 +439,31 @@ class SqliteStateStore:
                     rec.user_id,
                     rec.resource_id,
                     rec.page_token,
-                    _dt_iso(rec.expiration),
+                    dt_iso(rec.expiration),
                     rec.schema_version,
                 ),
             )
+
+        self._write(op)
+
+    def advance_drive_channel_token(
+        self,
+        channel_id: str,
+        *,
+        expected_token: str,
+        new_token: str,
+    ) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            cur = conn.execute(
+                """
+                UPDATE drive_channels
+                SET page_token = ?
+                WHERE channel_id = ? AND page_token = ?
+                """,
+                (new_token, channel_id, expected_token),
+            )
+            if cur.rowcount != 1:
+                raise StateError("Conditional drive channel token advance failed")
 
         self._write(op)
 
@@ -496,8 +479,8 @@ class SqliteStateStore:
                     rec.run_id,
                     rec.user_id,
                     rec.trigger,
-                    _dt_iso(rec.started_at),
-                    _dt_iso(rec.finished_at),
+                    dt_iso(rec.started_at),
+                    dt_iso(rec.finished_at),
                     rec.sync_report_json,
                     rec.schema_version,
                 ),
