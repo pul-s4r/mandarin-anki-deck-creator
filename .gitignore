@@ -8,4 +8,9 @@ build/
 htmlcov/
 .pytest_cache/
 .env
+
+# Cursor hook state and review logs (see .cursor/hooks/README.md)
+.cursor/hooks/state/
+.cursor/hooks/review-logs/
+.cursor/hooks/disable-review-hooks
 *.apkg
