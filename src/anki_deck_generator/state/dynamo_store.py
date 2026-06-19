@@ -15,10 +15,13 @@ from anki_deck_generator.errors import StateError
 from anki_deck_generator.state.card_compare import ankiweb_meta_matches_stored, dt_iso, normalize_stored_anki_fields
 from anki_deck_generator.state.dynamo_table import CARD_BY_KEY_INDEX
 from anki_deck_generator.state.records import (
+    AgentRecord,
     CardRecord,
     CardUpsertResult,
     ChunkRecord,
     DriveChannelRecord,
+    IssuedBatchRecord,
+    PendingSyncCursor,
     RunReportRecord,
     SourceRecord,
     compute_card_content_hash,
@@ -55,6 +58,18 @@ def _channel_keys(channel_id: str) -> dict[str, str]:
 
 def _run_keys(rec: RunReportRecord) -> dict[str, str]:
     return {"pk": f"USER#{rec.user_id}", "sk": f"RUN#{rec.run_id}"}
+
+
+def _agent_keys(user_id: str, agent_id: str) -> dict[str, str]:
+    return {"pk": f"agent#{user_id}", "sk": agent_id}
+
+
+def _cursor_keys(user_id: str, agent_id: str) -> dict[str, str]:
+    return {"pk": f"sync_cursor#{user_id}", "sk": agent_id}
+
+
+def _batch_keys(batch_id: str) -> dict[str, str]:
+    return {"pk": f"BATCH#{batch_id}", "sk": "META"}
 
 
 def _item_to_source(item: dict[str, Any]) -> SourceRecord:
@@ -426,3 +441,185 @@ class DynamoStateStore:
         )
         for item in response.get("Items", []):
             yield _item_to_run(item)
+
+    def get_run(self, run_id: str, *, user_id: str = "default") -> RunReportRecord | None:
+        response = self._table.get_item(Key={"pk": f"USER#{user_id}", "sk": f"RUN#{run_id}"})
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_run(item)
+
+    def update_run_report(self, run_id: str, sync_report_json: str, *, user_id: str = "default") -> None:
+        self._table.update_item(
+            Key={"pk": f"USER#{user_id}", "sk": f"RUN#{run_id}"},
+            UpdateExpression="SET sync_report_json = :json",
+            ExpressionAttributeValues={":json": sync_report_json},
+        )
+
+    def upsert_agent(self, rec: AgentRecord) -> None:
+        item = {
+            **_agent_keys(rec.user_id, rec.agent_id),
+            "entity_type": "agent",
+            "agent_id": rec.agent_id,
+            "user_id": rec.user_id,
+            "token_hash": rec.token_hash,
+            "created_at": dt_iso(rec.created_at),
+            "last_seen_at": dt_iso(rec.last_seen_at),
+            "last_poll_at": dt_iso(rec.last_poll_at),
+            "last_batch_id": rec.last_batch_id,
+            "last_sync_status": rec.last_sync_status,
+            "revoked_at": dt_iso(rec.revoked_at),
+            "schema_version": rec.schema_version,
+        }
+        self._table.put_item(Item=item)
+
+    def get_agent(self, agent_id: str, *, user_id: str = "default") -> AgentRecord | None:
+        response = self._table.get_item(Key=_agent_keys(user_id, agent_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_agent(item)
+
+    def iter_agents(self, *, user_id: str = "default") -> Iterable[AgentRecord]:
+        response = self._table.query(
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": f"agent#{user_id}"},
+        )
+        for item in response.get("Items", []):
+            yield _item_to_agent(item)
+
+    def revoke_agent(self, agent_id: str, *, user_id: str = "default") -> None:
+        self._table.update_item(
+            Key=_agent_keys(user_id, agent_id),
+            UpdateExpression="SET revoked_at = :rev",
+            ExpressionAttributeValues={":rev": dt_iso(datetime.now(UTC))},
+        )
+
+    def touch_agent_poll(
+        self,
+        agent_id: str,
+        *,
+        user_id: str = "default",
+        batch_id: str = "",
+        sync_status: str = "",
+        seen_at: datetime | None = None,
+    ) -> None:
+        now = dt_iso(seen_at or datetime.now(UTC))
+        values: dict[str, Any] = {":poll": now, ":seen": now, ":bid": batch_id}
+        expr = "SET last_poll_at = :poll, last_seen_at = :seen, last_batch_id = :bid"
+        if sync_status:
+            expr += ", last_sync_status = :status"
+            values[":status"] = sync_status
+        self._table.update_item(
+            Key=_agent_keys(user_id, agent_id),
+            UpdateExpression=expr,
+            ExpressionAttributeValues=values,
+        )
+
+    def get_agent_cursor(self, agent_id: str, *, user_id: str = "default") -> PendingSyncCursor | None:
+        response = self._table.get_item(Key=_cursor_keys(user_id, agent_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        return PendingSyncCursor(
+            agent_id=str(item["agent_id"]),
+            cursor_at=_parse_dt(item.get("cursor_at")),
+            cursor_card_id=str(item.get("cursor_card_id", "")),
+            schema_version=int(item.get("schema_version", 1)),
+            user_id=str(item.get("user_id", user_id)),
+        )
+
+    def set_agent_cursor(self, rec: PendingSyncCursor) -> None:
+        item = {
+            **_cursor_keys(rec.user_id, rec.agent_id),
+            "entity_type": "sync_cursor",
+            "agent_id": rec.agent_id,
+            "user_id": rec.user_id,
+            "cursor_at": dt_iso(rec.cursor_at),
+            "cursor_card_id": rec.cursor_card_id,
+            "schema_version": rec.schema_version,
+        }
+        self._table.put_item(Item=item)
+
+    def put_issued_batch(self, rec: IssuedBatchRecord) -> None:
+        item: dict[str, Any] = {
+            **_batch_keys(rec.batch_id),
+            "entity_type": "issued_batch",
+            "batch_id": rec.batch_id,
+            "agent_id": rec.agent_id,
+            "user_id": rec.user_id,
+            "issued_at": dt_iso(rec.issued_at),
+            "cursor_at": dt_iso(rec.cursor_at),
+            "cursor_card_id": rec.cursor_card_id,
+            "items_json": rec.items_json,
+            "schema_version": rec.schema_version,
+        }
+        acked = dt_iso(rec.acked_at)
+        if acked is not None:
+            item["acked_at"] = acked
+        self._table.put_item(Item=item)
+
+    def get_issued_batch(self, batch_id: str) -> IssuedBatchRecord | None:
+        response = self._table.get_item(Key=_batch_keys(batch_id))
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_batch(item)
+
+    def get_open_batch_for_agent(self, agent_id: str, *, user_id: str = "default") -> IssuedBatchRecord | None:
+        response = self._table.scan(
+            FilterExpression="entity_type = :etype AND agent_id = :aid AND user_id = :uid AND attribute_not_exists(acked_at)",
+            ExpressionAttributeValues={
+                ":etype": "issued_batch",
+                ":aid": agent_id,
+                ":uid": user_id,
+            },
+        )
+        items = response.get("Items", [])
+        if not items:
+            return None
+        items.sort(key=lambda row: str(row.get("issued_at", "")), reverse=True)
+        return _item_to_batch(items[0])
+
+    def mark_batch_acked(self, batch_id: str, *, acked_at: datetime) -> None:
+        try:
+            self._table.update_item(
+                Key=_batch_keys(batch_id),
+                UpdateExpression="SET acked_at = :ack",
+                ConditionExpression="attribute_not_exists(acked_at)",
+                ExpressionAttributeValues={":ack": dt_iso(acked_at)},
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                raise StateError("Batch ack failed or already acknowledged") from exc
+            raise StateError(str(exc)) from exc
+
+
+def _item_to_agent(item: dict[str, Any]) -> AgentRecord:
+    return AgentRecord(
+        agent_id=str(item["agent_id"]),
+        token_hash=str(item["token_hash"]),
+        created_at=_parse_dt(item.get("created_at")),
+        last_seen_at=_parse_dt(item.get("last_seen_at")),
+        last_poll_at=_parse_dt(item.get("last_poll_at")),
+        last_batch_id=str(item.get("last_batch_id", "")),
+        last_sync_status=str(item.get("last_sync_status", "")),
+        revoked_at=_parse_dt(item.get("revoked_at")),
+        schema_version=int(item.get("schema_version", 1)),
+        user_id=str(item.get("user_id", "default")),
+    )
+
+
+def _item_to_batch(item: dict[str, Any]) -> IssuedBatchRecord:
+    return IssuedBatchRecord(
+        batch_id=str(item["batch_id"]),
+        agent_id=str(item["agent_id"]),
+        user_id=str(item.get("user_id", "default")),
+        issued_at=_parse_dt(item.get("issued_at")),
+        acked_at=_parse_dt(item.get("acked_at")),
+        cursor_at=_parse_dt(item.get("cursor_at")),
+        cursor_card_id=str(item.get("cursor_card_id", "")),
+        items_json=str(item.get("items_json", "[]")),
+        schema_version=int(item.get("schema_version", 1)),
+    )

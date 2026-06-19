@@ -84,6 +84,14 @@ def test_sync_run_processes_upload(client: TestClient) -> None:
     body = response.json()
     assert body["stats"]["deduped_card_count"] >= 1
     assert any(row["simplified"] == "的" for row in body["rows"])
+    persistence = body["persistence"]
+    assert persistence is not None
+    assert persistence["run_id"]
+    assert persistence["cards_created"] >= 1
+
+    run_resp = client.get(f"/api/sync/runs/{persistence['run_id']}")
+    assert run_resp.status_code == 200
+    assert run_resp.json()["trigger"] == "api-upload"
 
 
 def test_sync_run_rejects_oversized_upload(client: TestClient) -> None:
@@ -93,6 +101,54 @@ def test_sync_run_rejects_oversized_upload(client: TestClient) -> None:
         files={"file": ("sample.md", huge, "text/markdown")},
     )
     assert response.status_code == 413
+
+
+def test_sync_run_populates_agent_pending_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = tmp_path / "state.db"
+    store = SqliteStateStore(db)
+    store.init_schema()
+    settings = Settings(state_backend="sqlite", state_db_path=db, skip_lines_filter=False, enable_sentences=False)
+    server_settings = ServerSettings(
+        agent_register_secret="register-secret",
+        ankiweb_deck_name="D",
+        ankiweb_model_name="Chinese vocabulary",
+    )
+    app = create_app(server_settings=server_settings)
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_state_store] = lambda: store
+    app.dependency_overrides[get_server_settings] = lambda: server_settings
+
+    monkeypatch.setattr("anki_deck_generator.pipeline.build_bedrock_model", lambda _settings: MagicMock())
+
+    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+        if "词" in chunk:
+            return [LlmVocabularyItem(simplified="词", meaning="word")]
+        return []
+
+    monkeypatch.setattr("anki_deck_generator.pipeline.extract_vocabulary_from_chunk", fake_extract)
+    with TestClient(app) as api_client:
+        reg = api_client.post(
+            "/api/ankiweb/agent/register",
+            json={"agent_id": "desktop", "register_secret": "register-secret"},
+        )
+        token = reg.json()["token"]
+        upload = api_client.post(
+            "/api/sync/run",
+            files={"file": ("notes.md", "1. 词 ci - word\n".encode(), "text/markdown")},
+        )
+        assert upload.status_code == 200
+        assert upload.json()["persistence"]["cards_created"] == 1
+
+        pending = api_client.get(
+            "/api/ankiweb/pending",
+            params={"agent_id": "desktop"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert pending.status_code == 200
+        items = pending.json()["items"]
+        assert len(items) == 1
+        assert items[0]["anki"]["fields"]["Simplified"] == "词"
+    store.close()
 
 
 def test_sync_run_requires_state_backend(tmp_path: Path) -> None:

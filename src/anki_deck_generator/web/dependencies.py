@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from functools import lru_cache
 from typing import Annotated
 
@@ -11,7 +12,6 @@ from anki_deck_generator.config.settings import ServerSettings, Settings
 from anki_deck_generator.dictionary.index import DictionaryIndex
 from anki_deck_generator.dictionary.source import FileLineDictionarySource
 from anki_deck_generator.state import StateStore, get_store
-
 
 @lru_cache
 def get_settings() -> Settings:
@@ -38,3 +38,17 @@ def get_state_store(settings: Annotated[Settings, Depends(get_settings)]) -> Sta
             detail="State backend is not configured (set ANKI_PIPELINE_STATE_BACKEND=sqlite or dynamodb)",
         )
     return store
+
+
+def require_register_secret(
+    body_secret: str,
+    server_settings: Annotated[ServerSettings, Depends(get_server_settings)],
+) -> None:
+    expected = server_settings.agent_register_secret
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent registration is disabled (set ANKI_SERVER_AGENT_REGISTER_SECRET)",
+        )
+    if not hmac.compare_digest(body_secret, expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid register secret")
