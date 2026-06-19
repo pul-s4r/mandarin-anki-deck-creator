@@ -92,7 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="YAML file (default: ANKI_PIPELINE_SOURCE_SET_CONFIG)",
     )
-    sched.add_argument("--output", "-o", type=Path, required=True, help="Export vocabulary CSV path")
+    sched.add_argument("--output", "-o", type=Path, default=None, help="Export vocabulary CSV path (required if source set has no exporters)")
     sched.add_argument("--cedict-path", type=Path, default=None)
     sched.add_argument("--llm-fixture-path", type=Path, default=None, help="Deterministic LLM fixture JSON (tests)")
     sched.add_argument("--chunk-size", type=int, default=None)

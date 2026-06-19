@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from anki_deck_generator.config.source_sets import GoogleDriveSource, LocalFileSource, SourceSet
 from anki_deck_generator.export.base import Exporter
+from anki_deck_generator.export.exporters import VocabularyXlsxFileExporter
 from anki_deck_generator.export.file_target import FileTargetExporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
@@ -383,6 +384,9 @@ def run_incremental_sync(
                     "run_incremental_sync requires FileTargetExporter (with output_path); "
                     f"got {type(exp).__name__}"
                 )
+            if isinstance(exp, VocabularyXlsxFileExporter):
+                exp.sync_report = report
+                exp.source_set_name = source_set.name
             rows = list(state_store.iter_all_cards(user_id=user_id))
             vrows = card_records_to_pipeline_rows(rows)
             pr = PipelineResult(
