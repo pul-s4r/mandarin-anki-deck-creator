@@ -181,6 +181,54 @@ def _build_parser() -> argparse.ArgumentParser:
     revoke = agent_sub.add_parser("revoke", help="Revoke the cloud agent token")
     revoke.add_argument("--register-secret", type=str, default=None)
 
+    # ── drive (M8) ──────────────────────────────────────────────────────── #
+    drive = sub.add_parser("drive", help="Drive watch channels, webhook simulation, and pending-edit processing")
+    drive_sub = drive.add_subparsers(dest="drive_command", required=True)
+
+    # drive watch
+    watch = drive_sub.add_parser("watch", help="Manage Drive watch channels")
+    watch_sub = watch.add_subparsers(dest="watch_command", required=True)
+
+    watch_reg = watch_sub.add_parser("register", help="Register a Drive watch channel")
+    watch_reg.add_argument("--source-set", type=str, required=True, help="Source set name")
+    watch_reg.add_argument("--webhook-url", type=str, required=True, help="HTTPS webhook endpoint URL")
+    watch_reg.add_argument("--credentials-file", type=str, required=True, help="OAuth token JSON path")
+    watch_reg.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+    watch_reg.add_argument("--user-id", type=str, default="default")
+
+    watch_unreg = watch_sub.add_parser("unregister", help="Stop and remove a Drive watch channel")
+    watch_unreg.add_argument("--channel-id", type=str, required=True, help="Channel ID to unregister")
+    watch_unreg.add_argument("--credentials-file", type=str, required=True, help="OAuth token JSON path")
+    watch_unreg.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+    watch_unreg.add_argument("--user-id", type=str, default="default")
+
+    watch_renew = watch_sub.add_parser("renew", help="Renew channels expiring in <48 h")
+    watch_renew.add_argument("--webhook-url", type=str, required=True, help="HTTPS webhook endpoint URL")
+    watch_renew.add_argument("--credentials-file", type=str, required=True, help="OAuth token JSON path")
+    watch_renew.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+    watch_renew.add_argument("--user-id", type=str, default="default")
+
+    # drive webhook
+    webhook = drive_sub.add_parser("webhook", help="Simulate or inspect Drive webhook notifications")
+    webhook_sub = webhook.add_subparsers(dest="webhook_command", required=True)
+
+    webhook_sim = webhook_sub.add_parser("simulate", help="Simulate a Drive webhook notification locally")
+    webhook_sim.add_argument("--channel-id", type=str, required=True, help="Channel ID to simulate")
+    webhook_sim.add_argument("--state", type=str, default="change",
+                              choices=["sync", "change", "update", "exists", "remove"],
+                              help="X-Goog-Resource-State to simulate")
+    webhook_sim.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+
+    # drive process-pending
+    proc = drive_sub.add_parser("process-pending", help="Run Mode B: process settled pending edits (D7)")
+    proc.add_argument("--source-set", type=str, required=True, help="Source set name")
+    proc.add_argument("--state-db", type=Path, required=True, help="SQLite state database path")
+    proc.add_argument("--source-set-config", type=Path, default=None,
+                       help="YAML source-set config (required for actual sync)")
+    proc.add_argument("--cedict-path", type=Path, default=None)
+    proc.add_argument("--llm-fixture-path", type=Path, default=None)
+    proc.add_argument("--user-id", type=str, default="default")
+
     return p
 
 
@@ -224,6 +272,10 @@ def main(argv: list[str] | None = None) -> int:
         from anki_deck_generator.cli_handlers.agent import run_agent_command
 
         return run_agent_command(args)
+    if args.command == "drive":
+        from anki_deck_generator.cli_handlers.drive import run_drive_command
+
+        return run_drive_command(args)
     return 1
 
 
