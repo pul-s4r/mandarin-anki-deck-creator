@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from anki_deck_generator.config.settings import ServerSettings
-from anki_deck_generator.web.routes import ankiweb_agent, health, sync, sync_runs
+from anki_deck_generator.web.routes import ankiweb_agent, drive_webhook, health, sync, sync_runs
 
 
 def create_app(*, server_settings: ServerSettings | None = None) -> FastAPI:
@@ -23,4 +23,5 @@ def create_app(*, server_settings: ServerSettings | None = None) -> FastAPI:
     app.include_router(sync.router)
     app.include_router(sync_runs.router)
     app.include_router(ankiweb_agent.router)
+    app.include_router(drive_webhook.router)
     return app

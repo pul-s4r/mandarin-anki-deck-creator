@@ -207,6 +207,7 @@ def run_incremental_sync(
     only_file_ids: list[str] | None = None,
     user_id: str = "default",
     dry_run: bool = False,
+    trigger: str = "schedule",
 ) -> SyncReport:
     """
     Process each source in the set, persist cards, run exporters.
@@ -415,7 +416,7 @@ def run_incremental_sync(
         state_store.record_run(
             RunReportRecord(
                 run_id=run_id,
-                trigger="schedule",
+                trigger=trigger,
                 started_at=started,
                 finished_at=finished,
                 sync_report_json=report.to_json(),
