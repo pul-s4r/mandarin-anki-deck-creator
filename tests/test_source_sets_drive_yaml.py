@@ -99,3 +99,4 @@ def test_source_set_to_jsonable_google_drive(tmp_path: Path) -> None:
     j = source_set_to_jsonable({"n": ss})
     assert j["n"]["sources"][0]["provider"] == "google-drive"
     assert j["n"]["sources"][0]["folder_ids"] == ["f1"]
+    assert j["n"]["exporters"] == []

@@ -31,17 +31,61 @@ SourceEntry = LocalFileSource | GoogleDriveSource
 
 
 @dataclass(frozen=True)
+class CsvExporterConfig:
+    """CSV file export target from a source set."""
+
+    type: Literal["csv"]
+    destination: Path
+
+
+@dataclass(frozen=True)
+class XlsxExporterConfig:
+    """XLSX file export target from a source set."""
+
+    type: Literal["xlsx"]
+    destination: Path
+
+
+ExporterConfig = CsvExporterConfig | XlsxExporterConfig
+
+
+@dataclass(frozen=True)
 class SourceSet:
-    """Named collection of sources."""
+    """Named collection of sources and optional export targets."""
 
     name: str
     sources: tuple[SourceEntry, ...]
+    exporters: tuple[ExporterConfig, ...] = ()
 
 
 def _default_google_drive_external_id(folder_ids: tuple[str, ...], file_ids: tuple[str, ...]) -> str:
     fi = ",".join(sorted(folder_ids))
     ids = ",".join(sorted(file_ids))
     return f"google-drive:f:{fi}:i:{ids}"
+
+
+def _parse_exporter_config(name: str, raw: object) -> ExporterConfig:
+    if not isinstance(raw, dict):
+        raise ValueError(f"source_sets.{name}.exporters entries must be mappings")
+    exp_type = raw.get("type")
+    dest = raw.get("destination")
+    if not dest:
+        raise ValueError(f"Missing destination in source_sets.{name} exporter {raw!r}")
+    path = Path(str(dest)).expanduser()
+    if exp_type == "csv":
+        return CsvExporterConfig(type="csv", destination=path)
+    if exp_type == "xlsx":
+        return XlsxExporterConfig(type="xlsx", destination=path)
+    raise ValueError(f"Unsupported exporter type {exp_type!r} in source_sets.{name}")
+
+
+def _parse_exporters(name: str, body: dict[str, Any]) -> tuple[ExporterConfig, ...]:
+    exporters_raw = body.get("exporters")
+    if exporters_raw is None:
+        return ()
+    if not isinstance(exporters_raw, list):
+        raise ValueError(f"source_sets.{name}.exporters must be a list")
+    return tuple(_parse_exporter_config(name, item) for item in exporters_raw)
 
 
 def load_source_sets_yaml(path: Path) -> dict[str, SourceSet]:
@@ -109,7 +153,8 @@ def load_source_sets_yaml(path: Path) -> dict[str, SourceSet]:
                 )
             else:
                 raise ValueError(f"Unsupported provider {prov!r} in {name}[{i}]")
-        out[str(name)] = SourceSet(name=str(name), sources=tuple(sources))
+        exporters = _parse_exporters(name, body)
+        out[str(name)] = SourceSet(name=str(name), sources=tuple(sources), exporters=exporters)
     return out
 
 
@@ -132,6 +177,11 @@ def source_set_to_jsonable(config: dict[str, SourceSet]) -> dict[str, Any]:
         }
 
     return {
-        name: {"sources": [entry_json(s) for s in ss.sources]}
+        name: {
+            "sources": [entry_json(s) for s in ss.sources],
+            "exporters": [
+                {"type": e.type, "destination": str(e.destination)} for e in ss.exporters
+            ],
+        }
         for name, ss in config.items()
     }

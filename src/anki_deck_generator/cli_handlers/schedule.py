@@ -11,7 +11,7 @@ from anki_deck_generator.cli_handlers.common import apply_run_like_settings
 from anki_deck_generator.config.settings import Settings
 from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
 from anki_deck_generator.errors import AnkiPipelineError
-from anki_deck_generator.export.exporters import VocabularyCsvFileExporter
+from anki_deck_generator.export.exporter_factory import resolve_exporters_for_schedule
 from anki_deck_generator.state.sqlite_store import SqliteStateStore
 from anki_deck_generator.sync.orchestrator import run_incremental_sync
 
@@ -33,11 +33,20 @@ def run_schedule_command(args: argparse.Namespace) -> int:
     try:
         sets = load_source_sets_yaml(Path(cfg_path).resolve())
         sset = pick_source_set(sets, args.source_set)
+        try:
+            exporters = resolve_exporters_for_schedule(
+                sset,
+                cli_output=Path(args.output).resolve() if args.output is not None else None,
+                csv_bom=settings.csv_bom,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         report = run_incremental_sync(
             sset,
             settings=settings,
             state_store=store,
-            exporters=[VocabularyCsvFileExporter(output_path=Path(args.output).resolve(), bom=settings.csv_bom)],
+            exporters=exporters,
             dry_run=bool(args.dry_run),
         )
     except AnkiPipelineError as exc:
