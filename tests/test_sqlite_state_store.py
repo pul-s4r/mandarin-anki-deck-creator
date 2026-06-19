@@ -120,3 +120,131 @@ def test_advance_drive_channel_token_sqlite(store: SqliteStateStore) -> None:
 
     with pytest.raises(StateError):
         store.advance_drive_channel_token("ch1", expected_token="tok-a", new_token="tok-c")
+
+
+# ─────────────── M8: DriveChannelRecord extended fields ─────────────── #
+
+
+def test_drive_channel_m8_fields_roundtrip(store: SqliteStateStore) -> None:
+    from datetime import UTC, datetime
+
+    from anki_deck_generator.state.records import DriveChannelRecord
+
+    now = datetime.now(UTC)
+    rec = DriveChannelRecord(
+        channel_id="m8-chan",
+        resource_id="res-m8",
+        page_token="tok-m8",
+        source_set_name="set-a",
+        channel_token="my-secret-token",
+        last_advanced_at=now,
+    )
+    store.upsert_drive_channel(rec)
+    got = store.get_drive_channel("m8-chan")
+    assert got is not None
+    assert got.source_set_name == "set-a"
+    assert got.channel_token == "my-secret-token"
+    assert got.last_advanced_at is not None
+
+
+def test_advance_token_updates_last_advanced_at(store: SqliteStateStore) -> None:
+    from datetime import UTC, datetime
+
+    from anki_deck_generator.state.records import DriveChannelRecord
+
+    store.upsert_drive_channel(
+        DriveChannelRecord(channel_id="ch-adv", page_token="tok-1", resource_id="r")
+    )
+    before = datetime.now(UTC)
+    store.advance_drive_channel_token("ch-adv", expected_token="tok-1", new_token="tok-2")
+    got = store.get_drive_channel("ch-adv")
+    assert got is not None
+    assert got.last_advanced_at is not None
+    assert got.last_advanced_at >= before
+
+
+def test_list_drive_channels(store: SqliteStateStore) -> None:
+    from anki_deck_generator.state.records import DriveChannelRecord
+
+    for i in range(3):
+        store.upsert_drive_channel(
+            DriveChannelRecord(
+                channel_id=f"chan-{i}",
+                resource_id=f"res-{i}",
+                page_token=f"tok-{i}",
+                source_set_name="my-set",
+            )
+        )
+    channels = store.list_drive_channels(user_id="default")
+    assert len(channels) == 3
+
+
+def test_migration_adds_m8_columns_to_legacy_drive_channels(tmp_path: Path) -> None:
+    """Pre-M8 drive_channels table without new columns should be migrated."""
+    import sqlite3
+
+    db = tmp_path / "legacy_m8.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE drive_channels (
+            channel_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            resource_id TEXT NOT NULL DEFAULT '',
+            page_token TEXT NOT NULL DEFAULT '',
+            expiration TEXT,
+            schema_version INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStore(db)
+    store.init_schema()
+
+    with sqlite3.connect(str(db)) as c2:
+        cols = {row[1] for row in c2.execute("PRAGMA table_info(drive_channels)")}
+    assert "source_set_name" in cols
+    assert "channel_token" in cols
+    assert "last_advanced_at" in cols
+
+
+# ─────────────── M8: PendingEditRecord ──────────────────────────────── #
+
+
+def test_pending_edit_full_lifecycle(store: SqliteStateStore) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+
+    # Insert.
+    rec = store.upsert_pending_edit_debounced(
+        user_id="default",
+        source_set_name="set-a",
+        file_id="fid-1",
+        now=now,
+        quiet_seconds=600,
+        max_delay_seconds=7200,
+    )
+    assert rec.file_id == "fid-1"
+
+    # Get.
+    got = store.get_pending_edit(user_id="default", source_set_name="set-a", file_id="fid-1")
+    assert got is not None
+
+    # Force.
+    store.force_pending_edit(user_id="default", source_set_name="set-a", file_id="fid-1")
+    forced = store.get_pending_edit(user_id="default", source_set_name="set-a", file_id="fid-1")
+    assert forced is not None and forced.force_process is True
+
+    # Clear.
+    cleared = store.clear_pending_edit(
+        user_id="default",
+        source_set_name="set-a",
+        file_id="fid-1",
+        if_last_seen_before=now + timedelta(hours=1),
+    )
+    assert cleared is True
+    assert store.get_pending_edit(user_id="default", source_set_name="set-a", file_id="fid-1") is None
