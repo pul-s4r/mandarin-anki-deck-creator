@@ -31,10 +31,19 @@ class PipelineStatsResponse(BaseModel):
     sentence_link_count: int
 
 
+class SyncRunPersistenceResponse(BaseModel):
+    run_id: str
+    source_id: str
+    cards_created: int = 0
+    cards_updated: int = 0
+    cards_unchanged: int = 0
+
+
 class SyncRunResponse(BaseModel):
     rows: list[VocabularyRowResponse]
     stats: PipelineStatsResponse
     sentence_link_count: int = Field(description="Number of sentence links produced")
+    persistence: SyncRunPersistenceResponse | None = None
 
 
 class ErrorResponse(BaseModel):

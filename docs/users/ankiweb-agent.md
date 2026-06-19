@@ -2,28 +2,16 @@
 
 ## Prerequisites
 
-The `agent` subcommand is available on the **`m6-ankiweb-agent`** branch. If you see:
-
-```text
-invalid choice: 'agent' (choose from 'run', 'state', 'schedule', 'auth', 'import', 'serve')
-```
-
-you are on an older branch or using a stale install. Check out `m6-ankiweb-agent` and reinstall:
+Install from this branch and confirm the CLI includes the `agent` subcommand:
 
 ```bash
-git checkout m6-ankiweb-agent
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,server,ankiweb]"
-```
-
-Confirm the right CLI is on your `PATH`:
-
-```bash
 .venv/bin/anki-notes-pipeline --help
 # must list: run, state, schedule, auth, import, serve, agent
 ```
 
-Use `.venv/bin/anki-notes-pipeline` for every command below (or `pip install -e` into your active venv from the repo root).
+Use `.venv/bin/anki-notes-pipeline` for every command below.
 
 ---
 
@@ -99,11 +87,32 @@ Check local agent status:
 
 The pull agent only syncs cards already stored in `StateStore` (`CardRecord` rows where `ankiweb_last_synced_at` is missing or older than `last_updated_at`).
 
-**Important:** `POST /api/sync/run` runs the pipeline and returns vocabulary rows in the HTTP response, but it does **not** write cards into `StateStore` today. For agent testing you must persist cards through one of the paths below.
+#### Path A — API upload (recommended)
 
-#### Path A — CLI schedule (recommended)
+`POST /api/sync/run` runs the pipeline, **persists cards to state**, and records a sync run. Use the same `ANKI_PIPELINE_STATE_DB_PATH` as the server.
 
-Uses the same incremental-sync stack as production and writes cards + a run report to `ANKI_PIPELINE_STATE_DB_PATH`.
+```bash
+curl -s -F "file=@tests/baselines/inputs/sample.md" \
+  http://127.0.0.1:8000/api/sync/run | jq '{stats, persistence}'
+```
+
+The response includes a `persistence` block with `run_id`, `cards_created`, and related counts. Pending cards appear on the agent queue immediately:
+
+```bash
+TOKEN="<token from agent setup or register>"
+curl -s "http://127.0.0.1:8000/api/ankiweb/pending?agent_id=desktop" \
+  -H "Authorization: Bearer $TOKEN" | jq '.items | length'
+```
+
+Inspect the run report (replace `RUN_ID` with `persistence.run_id`):
+
+```bash
+curl -s http://127.0.0.1:8000/api/sync/runs/RUN_ID | jq '.sync_report'
+```
+
+#### Path B — CLI schedule
+
+Uses the incremental-sync stack with a source-set YAML (Drive or local files). Useful when you want chunk-level skip semantics across repeated runs.
 
 1. Create a tiny source-set config:
 
@@ -136,19 +145,6 @@ export ANKI_PIPELINE_SOURCE_SET_CONFIG=/tmp/agent-test-sources.yaml
 .venv/bin/anki-notes-pipeline state list-cards --db-path "$ANKI_PIPELINE_STATE_DB_PATH"
 .venv/bin/anki-notes-pipeline state list-runs --db-path "$ANKI_PIPELINE_STATE_DB_PATH"
 ```
-
-Note the latest `run_id` from `list-runs` for step 7.
-
-#### Path B — API upload (pipeline only, no persistence yet)
-
-Useful to verify upload + LLM pipeline over HTTP; **not sufficient alone** for the agent loop until cards are persisted via Path A.
-
-```bash
-curl -s -F "file=@tests/baselines/inputs/sample.md" \
-  http://127.0.0.1:8000/api/sync/run | jq '.stats'
-```
-
-After this, `GET /api/ankiweb/pending` will still return an empty batch until you run Path A (or otherwise upsert `CardRecord` rows).
 
 #### Path C — Quick manual seed (agent smoke test only)
 
@@ -187,7 +183,7 @@ PY
 
 ### 7. Observability
 
-If you used Path A, inspect the run report (replace `RUN_ID`):
+Inspect the run report from the upload response (`persistence.run_id`) or from `state list-runs`:
 
 ```bash
 curl -s http://127.0.0.1:8000/api/sync/runs/RUN_ID | jq '.exports_ankiweb'

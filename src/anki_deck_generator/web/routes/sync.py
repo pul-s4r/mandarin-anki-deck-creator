@@ -14,9 +14,11 @@ from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.pipeline import run_pipeline_from_text
 from anki_deck_generator.pipeline_types import PipelineResult
 from anki_deck_generator.state.store import StateStore
+from anki_deck_generator.sync.upload_persistence import persist_api_upload
 from anki_deck_generator.web.dependencies import get_server_settings, get_settings, get_state_store
 from anki_deck_generator.web.schemas import (
     PipelineStatsResponse,
+    SyncRunPersistenceResponse,
     SyncRunResponse,
     VocabularyRowResponse,
 )
@@ -52,7 +54,11 @@ async def _read_upload_limited(upload: UploadFile, *, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _pipeline_result_to_response(result: PipelineResult) -> SyncRunResponse:
+def _pipeline_result_to_response(
+    result: PipelineResult,
+    *,
+    persistence: SyncRunPersistenceResponse | None = None,
+) -> SyncRunResponse:
     return SyncRunResponse(
         rows=[
             VocabularyRowResponse(
@@ -78,13 +84,14 @@ def _pipeline_result_to_response(result: PipelineResult) -> SyncRunResponse:
             sentence_link_count=result.stats.sentence_link_count,
         ),
         sentence_link_count=len(result.sentence_links),
+        persistence=persistence,
     )
 
 
 @router.post("/run", response_model=SyncRunResponse)
 async def sync_run(
     file: Annotated[UploadFile, File()],
-    _store: Annotated[StateStore, Depends(get_state_store)],
+    store: Annotated[StateStore, Depends(get_state_store)],
     settings: Annotated[Settings, Depends(get_settings)],
     server_settings: Annotated[ServerSettings, Depends(get_server_settings)],
     skip_lines_filter: Annotated[bool | None, Form()] = None,
@@ -116,4 +123,20 @@ async def sync_run(
     except AnkiPipelineError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
-    return _pipeline_result_to_response(result)
+    def persist() -> SyncRunPersistenceResponse:
+        saved = persist_api_upload(
+            store,
+            filename=file.filename,
+            raw_bytes=data,
+            pipeline_result=result,
+        )
+        return SyncRunPersistenceResponse(
+            run_id=saved.run_id,
+            source_id=saved.source_id,
+            cards_created=saved.cards_created,
+            cards_updated=saved.cards_updated,
+            cards_unchanged=saved.cards_unchanged,
+        )
+
+    persistence = await asyncio.to_thread(persist)
+    return _pipeline_result_to_response(result, persistence=persistence)
