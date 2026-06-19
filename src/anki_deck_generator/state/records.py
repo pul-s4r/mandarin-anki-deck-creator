@@ -96,6 +96,28 @@ class DriveChannelRecord:
     expiration: datetime | None = None
     schema_version: int = 1
     user_id: str = "default"
+    # M8 additions (backward-compatible; default empty)
+    source_set_name: str = ""
+    channel_token: str = ""
+    last_advanced_at: datetime | None = None
+
+
+@dataclass
+class PendingEditRecord:
+    """Debounce record for a Drive file change pending processing.
+
+    Keyed by (user_id, source_set_name, file_id).
+    """
+
+    user_id: str
+    source_set_name: str
+    file_id: str
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    ready_at: datetime | None = None
+    hard_deadline_at: datetime | None = None
+    force_process: bool = False
+    schema_version: int = 1
 
 
 @dataclass

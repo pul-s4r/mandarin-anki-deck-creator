@@ -21,6 +21,7 @@ from anki_deck_generator.state.records import (
     ChunkRecord,
     DriveChannelRecord,
     IssuedBatchRecord,
+    PendingEditRecord,
     PendingSyncCursor,
     RunReportRecord,
     SourceRecord,
@@ -70,6 +71,10 @@ def _cursor_keys(user_id: str, agent_id: str) -> dict[str, str]:
 
 def _batch_keys(batch_id: str) -> dict[str, str]:
     return {"pk": f"BATCH#{batch_id}", "sk": "META"}
+
+
+def _pending_edit_keys(user_id: str, source_set_name: str, file_id: str) -> dict[str, str]:
+    return {"pk": f"PENDING#{user_id}#{source_set_name}", "sk": file_id}
 
 
 def _item_to_source(item: dict[str, Any]) -> SourceRecord:
@@ -143,6 +148,23 @@ def _item_to_channel(item: dict[str, Any]) -> DriveChannelRecord:
         expiration=_parse_dt(item.get("expiration")),
         schema_version=int(item.get("schema_version", 1)),
         user_id=str(item.get("user_id", "default")),
+        source_set_name=str(item.get("source_set_name", "")),
+        channel_token=str(item.get("channel_token", "")),
+        last_advanced_at=_parse_dt(item.get("last_advanced_at")),
+    )
+
+
+def _item_to_pending_edit(item: dict[str, Any]) -> PendingEditRecord:
+    return PendingEditRecord(
+        user_id=str(item.get("user_id", "default")),
+        source_set_name=str(item.get("source_set_name", "")),
+        file_id=str(item["file_id"]),
+        first_seen_at=_parse_dt(item.get("first_seen_at")),
+        last_seen_at=_parse_dt(item.get("last_seen_at")),
+        ready_at=_parse_dt(item.get("ready_at")),
+        hard_deadline_at=_parse_dt(item.get("hard_deadline_at")),
+        force_process=bool(item.get("force_process", False)),
+        schema_version=int(item.get("schema_version", 1)),
     )
 
 
@@ -392,8 +414,18 @@ class DynamoStateStore:
             "expiration": dt_iso(rec.expiration),
             "schema_version": rec.schema_version,
             "user_id": rec.user_id,
+            "source_set_name": rec.source_set_name,
+            "channel_token": rec.channel_token,
+            "last_advanced_at": dt_iso(rec.last_advanced_at),
         }
         self._table.put_item(Item=item)
+
+    def list_drive_channels(self, *, user_id: str = "default") -> list[DriveChannelRecord]:
+        response = self._table.scan(
+            FilterExpression="entity_type = :etype AND user_id = :uid",
+            ExpressionAttributeValues={":etype": "channel", ":uid": user_id},
+        )
+        return [_item_to_channel(item) for item in response.get("Items", [])]
 
     def advance_drive_channel_token(
         self,
@@ -402,14 +434,16 @@ class DynamoStateStore:
         expected_token: str,
         new_token: str,
     ) -> None:
+        now = dt_iso(datetime.now(UTC))
         try:
             self._table.update_item(
                 Key=_channel_keys(channel_id),
-                UpdateExpression="SET page_token = :new_token",
+                UpdateExpression="SET page_token = :new_token, last_advanced_at = :now",
                 ConditionExpression="page_token = :expected_token",
                 ExpressionAttributeValues={
                     ":new_token": new_token,
                     ":expected_token": expected_token,
+                    ":now": now,
                 },
             )
         except ClientError as exc:
@@ -417,6 +451,128 @@ class DynamoStateStore:
             if code == "ConditionalCheckFailedException":
                 raise StateError("Conditional drive channel token advance failed") from exc
             raise StateError(str(exc)) from exc
+
+    # ------------------------------------------------------------------ #
+    # PendingEdits (M8)                                                    #
+    # ------------------------------------------------------------------ #
+
+    def upsert_pending_edit_debounced(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        now: datetime,
+        quiet_seconds: int,
+        max_delay_seconds: int,
+    ) -> PendingEditRecord:
+        from datetime import timedelta
+
+        now_iso = dt_iso(now)
+        ready_iso = dt_iso(now + timedelta(seconds=quiet_seconds))
+        hard_iso = dt_iso(now + timedelta(seconds=max_delay_seconds))
+        keys = _pending_edit_keys(user_id, source_set_name, file_id)
+        # Fetch existing to preserve hard_deadline_at.
+        existing_resp = self._table.get_item(Key=keys)
+        existing = existing_resp.get("Item")
+
+        if existing is None:
+            item = {
+                **keys,
+                "entity_type": "pending_edit",
+                "user_id": user_id,
+                "source_set_name": source_set_name,
+                "file_id": file_id,
+                "first_seen_at": now_iso,
+                "last_seen_at": now_iso,
+                "ready_at": ready_iso,
+                "hard_deadline_at": hard_iso,
+                "force_process": False,
+                "schema_version": 1,
+            }
+            self._table.put_item(Item=item)
+        else:
+            self._table.update_item(
+                Key=keys,
+                UpdateExpression="SET last_seen_at = :lsa, ready_at = :ra",
+                ExpressionAttributeValues={":lsa": now_iso, ":ra": ready_iso},
+            )
+        resp2 = self._table.get_item(Key=keys)
+        item2 = resp2.get("Item")
+        assert item2 is not None
+        return _item_to_pending_edit(item2)
+
+    def list_ready_pending_edits(
+        self,
+        *,
+        user_id: str,
+        now: datetime,
+    ) -> list[PendingEditRecord]:
+        now_iso = dt_iso(now)
+        response = self._table.scan(
+            FilterExpression=(
+                "entity_type = :etype AND user_id = :uid AND "
+                "(force_process = :force OR ready_at <= :now OR hard_deadline_at <= :now)"
+            ),
+            ExpressionAttributeValues={
+                ":etype": "pending_edit",
+                ":uid": user_id,
+                ":force": True,
+                ":now": now_iso,
+            },
+        )
+        return [_item_to_pending_edit(item) for item in response.get("Items", [])]
+
+    def clear_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        if_last_seen_before: datetime,
+    ) -> bool:
+        guard_iso = dt_iso(if_last_seen_before)
+        keys = _pending_edit_keys(user_id, source_set_name, file_id)
+        try:
+            self._table.delete_item(
+                Key=keys,
+                ConditionExpression="last_seen_at <= :guard",
+                ExpressionAttributeValues={":guard": guard_iso},
+            )
+            return True
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "ConditionalCheckFailedException":
+                return False
+            raise StateError(str(exc)) from exc
+
+    def force_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> None:
+        keys = _pending_edit_keys(user_id, source_set_name, file_id)
+        self._table.update_item(
+            Key=keys,
+            UpdateExpression="SET force_process = :fp",
+            ExpressionAttributeValues={":fp": True},
+        )
+
+    def get_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> PendingEditRecord | None:
+        keys = _pending_edit_keys(user_id, source_set_name, file_id)
+        response = self._table.get_item(Key=keys)
+        item = response.get("Item")
+        if not item:
+            return None
+        return _item_to_pending_edit(item)
 
     def record_run(self, rec: RunReportRecord) -> None:
         item = {
