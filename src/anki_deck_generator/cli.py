@@ -52,6 +52,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--chunk-size", type=int, default=None)
     run.add_argument("--chunk-overlap", type=int, default=None)
+    run.add_argument(
+        "--llm-fixture-path",
+        type=Path,
+        default=None,
+        help="Deterministic LLM fixture JSON (tests; or set ANKI_PIPELINE_LLM_FIXTURE_PATH)",
+    )
     run.add_argument("--csv-bom", action="store_true", help="Write UTF-8 BOM for Excel")
     run.add_argument("--no-skip-lines-filter", action="store_true", help="Disable date-only line dropping")
     run.add_argument("--cedict-force-overwrite", action="store_true", help="Overwrite LLM meaning/pinyin from CEDICT")
