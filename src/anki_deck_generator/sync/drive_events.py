@@ -10,15 +10,56 @@ Mode B: triggered by a timer/CLI tick; scans ready PendingEdits and calls
 from __future__ import annotations
 
 import logging
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from anki_deck_generator.config.source_sets import GoogleDriveSource, SourceSet
     from anki_deck_generator.config.settings import Settings
     from anki_deck_generator.export.base import Exporter
     from anki_deck_generator.state.store import StateStore
 
 logger = logging.getLogger(__name__)
+
+
+def _load_source_set(source_set_name: str) -> SourceSet:
+    from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
+
+    cfg_raw = os.environ.get("ANKI_PIPELINE_SOURCE_SET_CONFIG")
+    if not cfg_raw:
+        raise RuntimeError(
+            "Mode A requires ANKI_PIPELINE_SOURCE_SET_CONFIG to resolve Drive credentials"
+        )
+    config = load_source_sets_yaml(Path(cfg_raw).expanduser().resolve())
+    return pick_source_set(config, source_set_name)
+
+
+def _authenticate_drive_for_source_set(source_set_name: str) -> tuple[Any, SourceSet, GoogleDriveSource]:
+    from anki_deck_generator.config.source_sets import GoogleDriveSource
+    from anki_deck_generator.integrations.registry import get_provider
+
+    import importlib
+
+    importlib.import_module("anki_deck_generator.integrations.google_drive")
+    sset = _load_source_set(source_set_name)
+    drive_src: GoogleDriveSource | None = None
+    for src in sset.sources:
+        if isinstance(src, GoogleDriveSource):
+            drive_src = src
+            break
+    if drive_src is None:
+        raise RuntimeError(f"Source set {source_set_name!r} has no google-drive source")
+    provider = get_provider("google-drive")
+    provider.authenticate({"credentials_file": str(drive_src.credentials_file)})
+    return provider, sset, drive_src
+
+
+def _settling_seconds(source_set: SourceSet) -> tuple[int, int]:
+    quiet = max(1, int(source_set.edit_settling.quiet_minutes) * 60)
+    max_delay = max(quiet, int(source_set.edit_settling.max_delay_minutes) * 60)
+    return quiet, max_delay
 
 
 # ─────────────────────────── in-process queue ──────────────────────────── #
@@ -68,7 +109,6 @@ def pull_changes(
     import importlib
 
     importlib.import_module("anki_deck_generator.integrations.google_drive")
-    from anki_deck_generator.integrations.registry import get_provider
 
     rec = state_store.get_drive_channel(channel_id)
     if rec is None:
@@ -79,11 +119,10 @@ def pull_changes(
         logger.warning("Mode A: channel %r has no page_token; ignoring", channel_id)
         return []
 
-    # We don't have Drive credentials here; use a registry provider that's already authenticated.
-    # For local use, credentials are loaded via the CLI register command.
-    # In production, the Lambda env provides credentials.
-    # We pass an empty dict; the actual creds come from environment.
-    provider = get_provider("google-drive")
+    provider, sset, drive_src = _authenticate_drive_for_source_set(rec.source_set_name)
+    if folder_ids is None:
+        folder_ids = list(drive_src.folder_ids)
+    quiet_seconds, max_delay_seconds = _settling_seconds(sset)
 
     result = provider.list_changes(rec.page_token)
     file_ids: list[str] = result["file_ids"]
@@ -101,8 +140,8 @@ def pull_changes(
             source_set_name=rec.source_set_name,
             file_id=fid,
             now=now,
-            quiet_seconds=600,    # 10 min default; overridden by Mode B config
-            max_delay_seconds=7200,  # 2 hr default
+            quiet_seconds=quiet_seconds,
+            max_delay_seconds=max_delay_seconds,
         )
         written.append(fid)
         logger.debug("Mode A: upserted pending edit for file %r (channel %r)", fid, channel_id)
