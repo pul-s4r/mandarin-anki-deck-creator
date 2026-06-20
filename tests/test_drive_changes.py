@@ -36,7 +36,7 @@ def test_get_start_page_token_passes_supports_all_drives(drive_provider: gd.Goog
     drive_provider.get_start_page_token()
     _, kwargs = changes_api.getStartPageToken.call_args
     assert kwargs.get("supportsAllDrives") is True
-    assert kwargs.get("includeItemsFromAllDrives") is True
+    assert "includeItemsFromAllDrives" not in kwargs
 
 
 # ─────────────────────────── list_changes ──────────────────────────────── #

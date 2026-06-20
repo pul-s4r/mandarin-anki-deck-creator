@@ -346,7 +346,6 @@ class GoogleDriveProvider(IntegrationProvider):
         try:
             resp = svc.changes().getStartPageToken(
                 supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
             ).execute()
         except Exception as exc:
             _map_http_error(exc, context="Drive getStartPageToken")
