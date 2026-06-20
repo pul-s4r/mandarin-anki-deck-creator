@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from anki_deck_generator.state.records import DriveChannelRecord
 from anki_deck_generator.state.sqlite_store import SqliteStateStore
 from anki_deck_generator.web.app import create_app
+from anki_deck_generator.web.dependencies import get_state_store
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def client_with_store(tmp_path: Path):
     )
 
     app = create_app()
-    app.state.state_store = store
+    app.dependency_overrides[get_state_store] = lambda: store
     return TestClient(app), store
 
 
@@ -61,6 +62,7 @@ def test_change_state_enqueues_mode_a(client_with_store, monkeypatch: pytest.Mon
 
     enqueued: list[str] = []
     monkeypatch.setattr(drive_events, "enqueue_mode_a", lambda cid: enqueued.append(cid))
+    monkeypatch.setattr(drive_events, "drain_mode_a_queue", lambda **kw: [])
 
     client, _ = client_with_store
     r = _post(client, {
@@ -77,6 +79,7 @@ def test_update_state_also_enqueues(client_with_store, monkeypatch: pytest.Monke
 
     enqueued: list[str] = []
     monkeypatch.setattr(drive_events, "enqueue_mode_a", lambda cid: enqueued.append(cid))
+    monkeypatch.setattr(drive_events, "drain_mode_a_queue", lambda **kw: [])
 
     client, _ = client_with_store
     r = _post(client, {
@@ -152,6 +155,7 @@ def test_duplicate_change_notifications_safe(client_with_store, monkeypatch: pyt
 
     enqueued: list[str] = []
     monkeypatch.setattr(drive_events, "enqueue_mode_a", lambda cid: enqueued.append(cid))
+    monkeypatch.setattr(drive_events, "drain_mode_a_queue", lambda **kw: [])
 
     client, _ = client_with_store
     headers = {
