@@ -122,6 +122,85 @@ def test_drive_incremental_skips_second_run_by_revision(
     assert r2.stats.documents_skipped == 1
 
 
+def test_drive_incremental_with_trigger_param(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, llm_settings: Settings
+) -> None:
+    fake = FakeDriveProvider()
+    monkeypatch.setattr(orch, "drive_provider_factory", lambda: fake)
+
+    db = tmp_path / "state.db"
+    store = SqliteStateStore(db)
+    store.init_schema()
+    cred = tmp_path / "cred.json"
+    cred.write_text("{}", encoding="utf-8")
+
+    sset = SourceSet(
+        name="set",
+        sources=(
+            GoogleDriveSource(
+                provider="google-drive",
+                folder_ids=("fld",),
+                file_ids=(),
+                credentials_file=cred,
+                external_id="ext",
+            ),
+        ),
+    )
+    out = tmp_path / "deck.csv"
+    exp = VocabularyCsvFileExporter(output_path=out, bom=False)
+
+    report = orch.run_incremental_sync(
+        sset,
+        settings=llm_settings,
+        state_store=store,
+        exporters=[exp],
+        trigger="drive-push",
+    )
+
+    # Verify trigger is stored in the run record.
+    runs = list(store.iter_runs())
+    assert runs
+    assert runs[0].trigger == "drive-push"
+
+
+def test_drive_incremental_only_file_ids_filter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, llm_settings: Settings
+) -> None:
+    fake = FakeDriveProvider()
+    monkeypatch.setattr(orch, "drive_provider_factory", lambda: fake)
+
+    db = tmp_path / "state.db"
+    store = SqliteStateStore(db)
+    store.init_schema()
+    cred = tmp_path / "cred.json"
+    cred.write_text("{}", encoding="utf-8")
+
+    sset = SourceSet(
+        name="set",
+        sources=(
+            GoogleDriveSource(
+                provider="google-drive",
+                folder_ids=("fld",),
+                file_ids=(),
+                credentials_file=cred,
+                external_id="ext",
+            ),
+        ),
+    )
+    out = tmp_path / "deck.csv"
+    exp = VocabularyCsvFileExporter(output_path=out, bom=False)
+
+    # Filter to a file ID that doesn't exist in FakeDriveProvider — should skip all.
+    report = orch.run_incremental_sync(
+        sset,
+        settings=llm_settings,
+        state_store=store,
+        exporters=[exp],
+        only_file_ids=["nonexistent-file-id"],
+    )
+    assert fake.import_calls == 0
+
+
 def test_drive_dry_run_cold_store_prints_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         ChunkRecord,
         DriveChannelRecord,
         IssuedBatchRecord,
+        PendingEditRecord,
         PendingSyncCursor,
         RunReportRecord,
         SourceRecord,
@@ -88,3 +89,48 @@ class StateStore(Protocol):
     def get_open_batch_for_agent(self, agent_id: str, *, user_id: str = "default") -> IssuedBatchRecord | None: ...
 
     def mark_batch_acked(self, batch_id: str, *, acked_at: datetime) -> None: ...
+
+    # ---- PendingEdits (M8) ---- #
+
+    def upsert_pending_edit_debounced(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        now: datetime,
+        quiet_seconds: int,
+        max_delay_seconds: int,
+    ) -> PendingEditRecord: ...
+
+    def list_ready_pending_edits(
+        self,
+        *,
+        user_id: str,
+        now: datetime,
+    ) -> list[PendingEditRecord]: ...
+
+    def clear_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        if_last_seen_before: datetime,
+    ) -> bool: ...
+
+    def force_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> None: ...
+
+    def get_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> PendingEditRecord | None: ...

@@ -31,6 +31,28 @@ SourceEntry = LocalFileSource | GoogleDriveSource
 
 
 @dataclass(frozen=True)
+class EditSettlingConfig:
+    """Debounce configuration for Drive push-notification edit settling.
+
+    ``enabled`` defaults to True for Drive source sets.
+    ``quiet_minutes``: how long to wait after the last edit before processing.
+    ``max_delay_minutes``: hard ceiling; process even if edits keep arriving.
+    """
+
+    enabled: bool = True
+    quiet_minutes: int = 10
+    max_delay_minutes: int = 120
+
+    @property
+    def quiet_seconds(self) -> int:
+        return self.quiet_minutes * 60
+
+    @property
+    def max_delay_seconds(self) -> int:
+        return self.max_delay_minutes * 60
+
+
+@dataclass(frozen=True)
 class CsvExporterConfig:
     """CSV file export target from a source set."""
 
@@ -56,6 +78,7 @@ class SourceSet:
     name: str
     sources: tuple[SourceEntry, ...]
     exporters: tuple[ExporterConfig, ...] = ()
+    edit_settling: EditSettlingConfig = EditSettlingConfig()
 
 
 def _default_google_drive_external_id(folder_ids: tuple[str, ...], file_ids: tuple[str, ...]) -> str:
@@ -77,6 +100,22 @@ def _parse_exporter_config(name: str, raw: object) -> ExporterConfig:
     if exp_type == "xlsx":
         return XlsxExporterConfig(type="xlsx", destination=path)
     raise ValueError(f"Unsupported exporter type {exp_type!r} in source_sets.{name}")
+
+
+def _parse_edit_settling(name: str, body: dict[str, Any]) -> EditSettlingConfig:
+    raw = body.get("edit_settling")
+    if raw is None:
+        return EditSettlingConfig()
+    if not isinstance(raw, dict):
+        raise ValueError(f"source_sets.{name}.edit_settling must be a mapping")
+    enabled = bool(raw.get("enabled", True))
+    quiet_minutes = int(raw.get("quiet_minutes", 10))
+    max_delay_minutes = int(raw.get("max_delay_minutes", 120))
+    return EditSettlingConfig(
+        enabled=enabled,
+        quiet_minutes=quiet_minutes,
+        max_delay_minutes=max_delay_minutes,
+    )
 
 
 def _parse_exporters(name: str, body: dict[str, Any]) -> tuple[ExporterConfig, ...]:
@@ -154,7 +193,13 @@ def load_source_sets_yaml(path: Path) -> dict[str, SourceSet]:
             else:
                 raise ValueError(f"Unsupported provider {prov!r} in {name}[{i}]")
         exporters = _parse_exporters(name, body)
-        out[str(name)] = SourceSet(name=str(name), sources=tuple(sources), exporters=exporters)
+        edit_settling = _parse_edit_settling(name, body)
+        out[str(name)] = SourceSet(
+            name=str(name),
+            sources=tuple(sources),
+            exporters=exporters,
+            edit_settling=edit_settling,
+        )
     return out
 
 
@@ -182,6 +227,11 @@ def source_set_to_jsonable(config: dict[str, SourceSet]) -> dict[str, Any]:
             "exporters": [
                 {"type": e.type, "destination": str(e.destination)} for e in ss.exporters
             ],
+            "edit_settling": {
+                "enabled": ss.edit_settling.enabled,
+                "quiet_minutes": ss.edit_settling.quiet_minutes,
+                "max_delay_minutes": ss.edit_settling.max_delay_minutes,
+            },
         }
         for name, ss in config.items()
     }

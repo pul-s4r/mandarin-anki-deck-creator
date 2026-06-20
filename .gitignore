@@ -9,6 +9,9 @@ htmlcov/
 .pytest_cache/
 .env
 
+# Local copy of architecture plan (canonical copy lives outside the repo)
+web-server-plan-r2-1.md
+
 # Cursor hook state and review logs (see .cursor/hooks/README.md)
 .cursor/hooks/state/
 .cursor/hooks/review-logs/

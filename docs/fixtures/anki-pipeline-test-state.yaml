@@ -1,0 +1,68 @@
+# Reference copy of the personal E2E source-set config.
+# On your machine, the live file is typically:
+#   ~/Documents/anki-pipeline-test-state.yaml
+#
+# Copy and adjust absolute paths before use:
+#   cp docs/fixtures/anki-pipeline-test-state.yaml ~/Documents/anki-pipeline-test-state.yaml
+
+schema_version: 1
+source_sets:
+  demo:
+    sources:
+      - provider: local-filesystem
+        path: /home/jjmoey/Documents/mandarin-notes-sample-1.pdf
+    exporters:
+      - type: csv
+        destination: /home/jjmoey/Documents/demo-export.csv
+      - type: xlsx
+        destination: /home/jjmoey/Documents/demo-export.xlsx
+
+  demo-second:
+    sources:
+      - provider: local-filesystem
+        path: /home/jjmoey/Documents/mandarin-notes-sample-2.pdf
+    exporters:
+      - type: csv
+        destination: /home/jjmoey/Documents/demo-second-export.csv
+
+  demo-multi:
+    sources:
+      - provider: local-filesystem
+        path: /home/jjmoey/Documents/mandarin-notes-sample-1.pdf
+      - provider: local-filesystem
+        path: /home/jjmoey/Documents/mandarin-notes-sample-2.pdf
+    exporters:
+      - type: csv
+        destination: /home/jjmoey/Documents/demo-multi-export.csv
+      - type: xlsx
+        destination: /home/jjmoey/Documents/demo-multi-export.xlsx
+
+  demo-drive:
+    sources:
+      - provider: google-drive
+        folder_ids: ["REPLACE_WITH_DRIVE_FOLDER_ID"]
+        file_ids: []
+        credentials_file: /home/jjmoey/.config/anki-notes-pipeline/google-drive-token.json
+    exporters:
+      - type: csv
+        destination: /home/jjmoey/Documents/demo-drive-export.csv
+      - type: xlsx
+        destination: /home/jjmoey/Documents/demo-drive-export.xlsx
+    edit_settling:
+      enabled: true
+      quiet_minutes: 10
+      max_delay_minutes: 120
+
+  demo-drive-fast:
+    sources:
+      - provider: google-drive
+        folder_ids: ["REPLACE_WITH_DRIVE_FOLDER_ID"]
+        file_ids: []
+        credentials_file: /home/jjmoey/.config/anki-notes-pipeline/google-drive-token.json
+    exporters:
+      - type: csv
+        destination: /home/jjmoey/Documents/demo-drive-fast-export.csv
+    edit_settling:
+      enabled: true
+      quiet_minutes: 1
+      max_delay_minutes: 5

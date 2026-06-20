@@ -335,3 +335,106 @@ class GoogleDriveProvider(IntegrationProvider):
             )
 
         return ImportResult(documents=docs, source_description=description)
+
+    # ------------------------------------------------------------------ #
+    # D4: Changes/Watch API                                                #
+    # ------------------------------------------------------------------ #
+
+    def get_start_page_token(self) -> str:
+        """Return the current start page token for changes.list polling."""
+        svc = self._svc()
+        try:
+            resp = svc.changes().getStartPageToken(
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as exc:
+            _map_http_error(exc, context="Drive getStartPageToken")
+        return str(resp.get("startPageToken", ""))
+
+    def list_changes(self, page_token: str) -> dict:
+        """Paginate through changes.list starting at *page_token*.
+
+        Returns a dict with keys:
+          - ``file_ids``: list of changed file IDs (excluding trashed-only changes)
+          - ``new_start_page_token``: stable cursor when pagination is complete (empty while more pages exist)
+          - ``next_page_token``: present when more pages are available
+        """
+        svc = self._svc()
+        file_ids: list[str] = []
+        current_token = page_token
+        new_start_page_token = ""
+        next_page_token = ""
+
+        try:
+            while True:
+                resp = svc.changes().list(
+                    pageToken=current_token,
+                    spaces="drive",
+                    fields="nextPageToken, newStartPageToken, changes(fileId, removed, file(trashed))",
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+                for change in resp.get("changes", []):
+                    fid = change.get("fileId")
+                    if not fid:
+                        continue
+                    removed = change.get("removed", False)
+                    trashed = (change.get("file") or {}).get("trashed", False)
+                    if not removed and not trashed:
+                        file_ids.append(fid)
+                next_page_token = resp.get("nextPageToken", "")
+                new_start_page_token = resp.get("newStartPageToken", "")
+                if not next_page_token:
+                    break
+                current_token = next_page_token
+        except Exception as exc:
+            _map_http_error(exc, context="Drive changes.list")
+
+        return {
+            "file_ids": file_ids,
+            "new_start_page_token": new_start_page_token,
+            "next_page_token": next_page_token,
+        }
+
+    def watch_changes(
+        self,
+        *,
+        page_token: str,
+        address: str,
+        channel_id: str,
+        channel_token: str,
+        expiration_ms: int | None = None,
+    ) -> dict:
+        """Register a push-notification channel for changes.
+
+        Returns the raw Google API response body including ``resourceId`` and
+        ``expiration`` (epoch ms as string).
+        """
+        svc = self._svc()
+        body: dict = {
+            "id": channel_id,
+            "type": "web_hook",
+            "address": address,
+            "token": channel_token,
+        }
+        if expiration_ms is not None:
+            body["expiration"] = str(expiration_ms)
+        try:
+            resp = svc.changes().watch(
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                body=body,
+            ).execute()
+        except Exception as exc:
+            _map_http_error(exc, context="Drive changes.watch")
+        return dict(resp)
+
+    def stop_channel(self, channel_id: str, resource_id: str) -> None:
+        """Stop (unsubscribe) a push-notification channel."""
+        svc = self._svc()
+        body = {"id": channel_id, "resourceId": resource_id}
+        try:
+            svc.channels().stop(body=body).execute()
+        except Exception as exc:
+            _map_http_error(exc, context=f"Drive channels.stop {channel_id!r}")

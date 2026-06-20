@@ -20,6 +20,7 @@ from anki_deck_generator.state.records import (
     ChunkRecord,
     DriveChannelRecord,
     IssuedBatchRecord,
+    PendingEditRecord,
     PendingSyncCursor,
     RunReportRecord,
     SourceRecord,
@@ -30,6 +31,24 @@ def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _ensure_drive_channel_m8_columns(conn: sqlite3.Connection) -> None:
+    """Add M8 columns to drive_channels when upgrading pre-M8 databases (idempotent)."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_channels' LIMIT 1"
+        ).fetchone()
+        is None
+    ):
+        return
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(drive_channels)")}
+    if "source_set_name" not in cols:
+        conn.execute("ALTER TABLE drive_channels ADD COLUMN source_set_name TEXT NOT NULL DEFAULT ''")
+    if "channel_token" not in cols:
+        conn.execute("ALTER TABLE drive_channels ADD COLUMN channel_token TEXT NOT NULL DEFAULT ''")
+    if "last_advanced_at" not in cols:
+        conn.execute("ALTER TABLE drive_channels ADD COLUMN last_advanced_at TEXT")
 
 
 def _ensure_cards_ankiweb_columns(conn: sqlite3.Connection) -> None:
@@ -164,9 +183,24 @@ class SqliteStateStore:
             );
             CREATE INDEX IF NOT EXISTS idx_issued_batches_open
                 ON issued_batches(user_id, agent_id, acked_at);
+            CREATE TABLE IF NOT EXISTS pending_edits (
+                user_id TEXT NOT NULL DEFAULT 'default',
+                source_set_name TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                first_seen_at TEXT,
+                last_seen_at TEXT,
+                ready_at TEXT,
+                hard_deadline_at TEXT,
+                force_process INTEGER NOT NULL DEFAULT 0,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, source_set_name, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_edits_ready
+                ON pending_edits(user_id, ready_at);
             """
         )
         _ensure_cards_ankiweb_columns(conn)
+        _ensure_drive_channel_m8_columns(conn)
         conn.commit()
 
     def init_schema(self) -> None:
@@ -444,11 +478,8 @@ class SqliteStateStore:
         ):
             yield self._row_to_card(row)
 
-    def get_drive_channel(self, channel_id: str) -> DriveChannelRecord | None:
-        conn = self._conn()
-        row = conn.execute("SELECT * FROM drive_channels WHERE channel_id = ?", (channel_id,)).fetchone()
-        if row is None:
-            return None
+    def _row_to_drive_channel(self, row: sqlite3.Row) -> DriveChannelRecord:
+        keys = {r[1] for r in self._conn().execute("PRAGMA table_info(drive_channels)")}
         return DriveChannelRecord(
             channel_id=row["channel_id"],
             resource_id=row["resource_id"] or "",
@@ -456,20 +487,42 @@ class SqliteStateStore:
             expiration=_parse_dt(row["expiration"]),
             schema_version=int(row["schema_version"]),
             user_id=row["user_id"] or "default",
+            source_set_name=row["source_set_name"] if "source_set_name" in keys else "",
+            channel_token=row["channel_token"] if "channel_token" in keys else "",
+            last_advanced_at=_parse_dt(row["last_advanced_at"]) if "last_advanced_at" in keys else None,
         )
+
+    def get_drive_channel(self, channel_id: str) -> DriveChannelRecord | None:
+        conn = self._conn()
+        row = conn.execute("SELECT * FROM drive_channels WHERE channel_id = ?", (channel_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_drive_channel(row)
+
+    def list_drive_channels(self, *, user_id: str = "default") -> list[DriveChannelRecord]:
+        """Return all drive channels for the given user."""
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM drive_channels WHERE user_id = ?", (user_id,)
+        ).fetchall()
+        return [self._row_to_drive_channel(r) for r in rows]
 
     def upsert_drive_channel(self, rec: DriveChannelRecord) -> None:
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
                 INSERT INTO drive_channels (
-                    channel_id, user_id, resource_id, page_token, expiration, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    channel_id, user_id, resource_id, page_token, expiration, schema_version,
+                    source_set_name, channel_token, last_advanced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel_id) DO UPDATE SET
                     resource_id = excluded.resource_id,
                     page_token = excluded.page_token,
                     expiration = excluded.expiration,
-                    schema_version = excluded.schema_version
+                    schema_version = excluded.schema_version,
+                    source_set_name = excluded.source_set_name,
+                    channel_token = excluded.channel_token,
+                    last_advanced_at = excluded.last_advanced_at
                 """,
                 (
                     rec.channel_id,
@@ -478,6 +531,9 @@ class SqliteStateStore:
                     rec.page_token,
                     dt_iso(rec.expiration),
                     rec.schema_version,
+                    rec.source_set_name,
+                    rec.channel_token,
+                    dt_iso(rec.last_advanced_at),
                 ),
             )
 
@@ -490,19 +546,170 @@ class SqliteStateStore:
         expected_token: str,
         new_token: str,
     ) -> None:
+        now = dt_iso(datetime.now(UTC))
+
         def op(conn: sqlite3.Connection) -> None:
             cur = conn.execute(
                 """
                 UPDATE drive_channels
-                SET page_token = ?
+                SET page_token = ?, last_advanced_at = ?
                 WHERE channel_id = ? AND page_token = ?
                 """,
-                (new_token, channel_id, expected_token),
+                (new_token, now, channel_id, expected_token),
             )
             if cur.rowcount != 1:
                 raise StateError("Conditional drive channel token advance failed")
 
         self._write(op)
+
+    # ------------------------------------------------------------------ #
+    # PendingEdits (M8)                                                    #
+    # ------------------------------------------------------------------ #
+
+    def upsert_pending_edit_debounced(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        now: datetime,
+        quiet_seconds: int,
+        max_delay_seconds: int,
+    ) -> PendingEditRecord:
+        from datetime import timedelta
+
+        now_iso = dt_iso(now)
+        ready_iso = dt_iso(now + timedelta(seconds=quiet_seconds))
+        hard_iso = dt_iso(now + timedelta(seconds=max_delay_seconds))
+
+        def op(conn: sqlite3.Connection) -> PendingEditRecord | None:
+            existing = conn.execute(
+                "SELECT * FROM pending_edits WHERE user_id = ? AND source_set_name = ? AND file_id = ?",
+                (user_id, source_set_name, file_id),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO pending_edits
+                        (user_id, source_set_name, file_id, first_seen_at, last_seen_at,
+                         ready_at, hard_deadline_at, force_process, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
+                    """,
+                    (user_id, source_set_name, file_id, now_iso, now_iso, ready_iso, hard_iso),
+                )
+                return None
+            # Update last_seen_at and push ready_at forward (slide quiet window).
+            # Preserve hard_deadline_at from first_seen to enforce max delay.
+            conn.execute(
+                """
+                UPDATE pending_edits
+                SET last_seen_at = ?, ready_at = ?
+                WHERE user_id = ? AND source_set_name = ? AND file_id = ?
+                """,
+                (now_iso, ready_iso, user_id, source_set_name, file_id),
+            )
+            return None
+
+        self._write(op)
+        row = self._conn().execute(
+            "SELECT * FROM pending_edits WHERE user_id = ? AND source_set_name = ? AND file_id = ?",
+            (user_id, source_set_name, file_id),
+        ).fetchone()
+        assert row is not None
+        return self._row_to_pending_edit(row)
+
+    def list_ready_pending_edits(
+        self,
+        *,
+        user_id: str,
+        now: datetime,
+    ) -> list[PendingEditRecord]:
+        now_iso = dt_iso(now)
+        conn = self._conn()
+        rows = conn.execute(
+            """
+            SELECT * FROM pending_edits
+            WHERE user_id = ?
+              AND (force_process = 1 OR ready_at <= ? OR hard_deadline_at <= ?)
+            ORDER BY hard_deadline_at ASC, ready_at ASC
+            """,
+            (user_id, now_iso, now_iso),
+        ).fetchall()
+        return [self._row_to_pending_edit(r) for r in rows]
+
+    def clear_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+        if_last_seen_before: datetime,
+    ) -> bool:
+        """Delete the pending edit iff last_seen_at <= if_last_seen_before.
+
+        Returns True if a row was deleted (guard held).
+        """
+        guard_iso = dt_iso(if_last_seen_before)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute(
+                """
+                DELETE FROM pending_edits
+                WHERE user_id = ? AND source_set_name = ? AND file_id = ?
+                  AND last_seen_at <= ?
+                """,
+                (user_id, source_set_name, file_id, guard_iso),
+            )
+            return cur.rowcount == 1
+
+        return self._write(op)
+
+    def force_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> None:
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                UPDATE pending_edits SET force_process = 1
+                WHERE user_id = ? AND source_set_name = ? AND file_id = ?
+                """,
+                (user_id, source_set_name, file_id),
+            )
+
+        self._write(op)
+
+    def get_pending_edit(
+        self,
+        *,
+        user_id: str,
+        source_set_name: str,
+        file_id: str,
+    ) -> PendingEditRecord | None:
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT * FROM pending_edits WHERE user_id = ? AND source_set_name = ? AND file_id = ?",
+            (user_id, source_set_name, file_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_pending_edit(row)
+
+    def _row_to_pending_edit(self, row: sqlite3.Row) -> PendingEditRecord:
+        return PendingEditRecord(
+            user_id=row["user_id"] or "default",
+            source_set_name=row["source_set_name"] or "",
+            file_id=row["file_id"] or "",
+            first_seen_at=_parse_dt(row["first_seen_at"]),
+            last_seen_at=_parse_dt(row["last_seen_at"]),
+            ready_at=_parse_dt(row["ready_at"]),
+            hard_deadline_at=_parse_dt(row["hard_deadline_at"]),
+            force_process=bool(row["force_process"]),
+            schema_version=int(row["schema_version"]),
+        )
 
     def record_run(self, rec: RunReportRecord) -> None:
         def op(conn: sqlite3.Connection) -> None:

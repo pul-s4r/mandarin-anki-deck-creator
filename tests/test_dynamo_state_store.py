@@ -52,3 +52,88 @@ def test_advance_drive_channel_token_dynamo_collision(store: DynamoStateStore) -
     assert len(state_errors) == 1
     got = store.get_drive_channel("ch1")
     assert got is not None and got.page_token in {"tok-c", "tok-d"}
+
+
+# ─────────────── M8: DriveChannelRecord extended fields ─────────────── #
+
+
+def test_drive_channel_m8_fields_dynamo(store: DynamoStateStore) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    rec = DriveChannelRecord(
+        channel_id="m8-chan",
+        resource_id="res-m8",
+        page_token="tok-m8",
+        source_set_name="set-a",
+        channel_token="my-secret",
+        last_advanced_at=now,
+    )
+    store.upsert_drive_channel(rec)
+    got = store.get_drive_channel("m8-chan")
+    assert got is not None
+    assert got.source_set_name == "set-a"
+    assert got.channel_token == "my-secret"
+
+
+# ─────────────── M8: PendingEditRecord ──────────────────────────────── #
+
+
+def test_pending_edit_upsert_and_list_dynamo(store: DynamoStateStore) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    past = now - timedelta(hours=1)
+
+    # Insert a ready edit.
+    rec = store.upsert_pending_edit_debounced(
+        user_id="default",
+        source_set_name="my-set",
+        file_id="file-1",
+        now=past,
+        quiet_seconds=10,
+        max_delay_seconds=7200,
+    )
+    assert rec.file_id == "file-1"
+
+    ready = store.list_ready_pending_edits(user_id="default", now=now)
+    assert any(r.file_id == "file-1" for r in ready)
+
+
+def test_pending_edit_clear_guarded_dynamo(store: DynamoStateStore) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    store.upsert_pending_edit_debounced(
+        user_id="default",
+        source_set_name="my-set",
+        file_id="file-2",
+        now=now,
+        quiet_seconds=10,
+        max_delay_seconds=7200,
+    )
+    cleared = store.clear_pending_edit(
+        user_id="default",
+        source_set_name="my-set",
+        file_id="file-2",
+        if_last_seen_before=now + timedelta(seconds=5),
+    )
+    assert cleared is True
+    assert store.get_pending_edit(user_id="default", source_set_name="my-set", file_id="file-2") is None
+
+
+def test_pending_edit_force_dynamo(store: DynamoStateStore) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    store.upsert_pending_edit_debounced(
+        user_id="default",
+        source_set_name="my-set",
+        file_id="file-3",
+        now=now,
+        quiet_seconds=3600,
+        max_delay_seconds=7200,
+    )
+    store.force_pending_edit(user_id="default", source_set_name="my-set", file_id="file-3")
+    ready = store.list_ready_pending_edits(user_id="default", now=now)
+    assert any(r.file_id == "file-3" for r in ready)
