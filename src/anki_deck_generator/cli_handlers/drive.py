@@ -139,7 +139,7 @@ def _webhook_simulate(args: argparse.Namespace) -> int:
 def _run_process_pending(args: argparse.Namespace) -> int:
     from anki_deck_generator.config.settings import Settings
     from anki_deck_generator.config.source_sets import load_source_sets_yaml, pick_source_set
-    from anki_deck_generator.export.exporter_factory import build_file_exporters_from_configs
+    from anki_deck_generator.export.exporter_factory import resolve_exporters_for_schedule
     from anki_deck_generator.sync.drive_events import process_pending
 
     store = _make_state_store(args)
@@ -152,11 +152,11 @@ def _run_process_pending(args: argparse.Namespace) -> int:
 
     source_set_cfg_path = getattr(args, "source_set_config", None)
     source_set = None
-    exporters = []
+    exporters: list = []
     if source_set_cfg_path and args.source_set:
         config = load_source_sets_yaml(Path(source_set_cfg_path))
         source_set = pick_source_set(config, args.source_set)
-        exporters = build_file_exporters_from_configs(source_set.exporters, csv_bom=settings.csv_bom)
+        exporters = resolve_exporters_for_schedule(source_set, cli_output=None, csv_bom=settings.csv_bom)
 
     count = process_pending(
         state_store=store,

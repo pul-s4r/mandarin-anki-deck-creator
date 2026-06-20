@@ -378,11 +378,17 @@ def run_incremental_sync(
                 )
 
     if not dry_run:
+        from anki_deck_generator.export.anki_direct import VocabularyAnkiDirectExporter
+
         chunk_units_this_run = report.stats.chunks_processed + report.stats.chunks_skipped
         for exp in exporters:
+            if isinstance(exp, VocabularyAnkiDirectExporter):
+                anki_report = exp.apply(state_store, user_id=user_id, run_id=run_id)
+                report.exports.setdefault("anki", []).append(anki_report)
+                continue
             if not isinstance(exp, FileTargetExporter):
                 raise TypeError(
-                    "run_incremental_sync requires FileTargetExporter (with output_path); "
+                    "run_incremental_sync requires FileTargetExporter or VocabularyAnkiDirectExporter; "
                     f"got {type(exp).__name__}"
                 )
             if isinstance(exp, VocabularyXlsxFileExporter):
