@@ -112,6 +112,29 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List what would change (metadata only for Drive); no LLM, DB writes, or export",
     )
+    sched.add_argument(
+        "--to-anki",
+        action="store_true",
+        help="Push cards to desktop Anki via AnkiConnect after sync (requires Anki running)",
+    )
+    sched.add_argument(
+        "--anki-deck-name",
+        type=str,
+        default=None,
+        help="Target Anki deck (required with --to-anki unless type: anki is in YAML exporters)",
+    )
+    sched.add_argument(
+        "--anki-model-name",
+        type=str,
+        default="Chinese vocabulary",
+        help="Anki note type name (default: Chinese vocabulary)",
+    )
+    sched.add_argument(
+        "--anki-connect-url",
+        type=str,
+        default="http://127.0.0.1:8765",
+        help="AnkiConnect base URL (default: http://127.0.0.1:8765)",
+    )
     sched.add_argument("-v", "--verbose", action="store_true")
 
     auth = sub.add_parser("auth", help="Authenticate an integration (e.g. OAuth for Google Drive)")

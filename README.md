@@ -1,6 +1,8 @@
 # Mandarin Anki deck generator
 
-Pipeline: PDF / Markdown / DOCX → plain text → Amazon Bedrock (LangChain) → CC-CEDICT enrichment → vocabulary CSV for Anki.
+Pipeline: PDF / Markdown / DOCX → plain text → Amazon Bedrock (LangChain) → CC-CEDICT enrichment → vocabulary cards for Anki.
+
+**Docs:** [Architecture & command map](docs/architecture.md) · [Change detection](docs/change-detection.md) · [E2E testing](docs/users/end-to-end-testing.md)
 
 ## Setup
 
@@ -47,7 +49,33 @@ anki-notes-pipeline schedule --source-set myset --state-db /path/to/state.db \
   --source-set-config sources.yaml --output deck.csv --cedict-path /path/to/cedict_ts.u8
 ```
 
-Re-running `schedule` on unchanged files skips ingest/LLM at the document level; edits reuse cached chunks when only part of a document changes.
+Re-running `schedule` on unchanged files skips ingest/LLM at the document level; edits reuse cached chunks when only part of a document changes. See [docs/change-detection.md](docs/change-detection.md).
+
+### Sync to desktop Anki (local direct)
+
+Install the AnkiConnect add-on in desktop Anki, keep Anki running, then either add an `anki` exporter to your source-set YAML or pass CLI flags:
+
+```yaml
+exporters:
+  - type: anki
+    deck_name: "Chinese::301"
+    model_name: "Chinese vocabulary"   # optional; must match your Anki note type fields
+```
+
+```bash
+pip install -e ".[sync,ankiweb]"
+
+anki-notes-pipeline schedule \
+  --source-set myset \
+  --state-db ~/.local/share/anki-notes-pipeline/state.db \
+  --source-set-config sources.yaml \
+  --to-anki --anki-deck-name "Chinese::301" \
+  --cedict-path /path/to/cedict_ts.u8
+```
+
+Cards land in Anki via AnkiConnect on `http://127.0.0.1:8765`. No web server or background agent is required for this path. The run report JSON includes `exports.anki` with created/updated counts.
+
+For the optional cloud-shaped pull-agent path (pipeline and Anki on different hosts), see [docs/users/ankiweb-agent.md](docs/users/ankiweb-agent.md).
 
 ## Debug logging helper
 
@@ -67,9 +95,11 @@ After Milestones 1–8, use the step-by-step guide with run commands and the per
 
 Regression tests under `tests/test_script_mode_baseline.py` compare CLI output to checked-in CSVs in `tests/baselines/outputs/` using a deterministic LLM stub. Set `ANKI_PIPELINE_LLM_FIXTURE_PATH` to `tests/baselines/llm_mock.json` (as CI does) so `anki-notes-pipeline run` does not call Bedrock. To refresh fixtures after intentional output changes, run `python tests/baselines/record.py` from the repo root with dev dependencies installed.
 
-## Event-driven Google Drive (Milestone 8)
+## Event-driven Google Drive (advanced / optional)
 
-M8 adds reactive processing via Drive push notifications: register watch channels, receive webhooks, debounce edits, and process settled changes through the incremental sync pipeline.
+The default local Drive workflow is **`schedule` on a cron timer** — no webhooks required. Partial document changes are handled automatically (see [change-detection.md](docs/change-detection.md)).
+
+The sections below add **near-real-time** processing via Drive push notifications. This requires `[google-drive]` + `[server]`, an HTTPS endpoint (ngrok for local dev), and is primarily for future cloud deployment (Epic F).
 
 ### Setup (requires `[google-drive]` extra + HTTPS endpoint)
 
@@ -123,9 +153,9 @@ anki-notes-pipeline drive process-pending \
   --source-set-config sources.yaml
 ```
 
-### Source-set YAML with edit settling
+### Source-set YAML with edit settling (webhook mode only)
 
-Add an `edit_settling` block to tune the debounce window:
+When using webhooks (not plain `schedule` polling), tune the debounce window:
 
 ```yaml
 schema_version: 1

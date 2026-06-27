@@ -68,7 +68,22 @@ class XlsxExporterConfig:
     destination: Path
 
 
-ExporterConfig = CsvExporterConfig | XlsxExporterConfig
+@dataclass(frozen=True)
+class AnkiExporterConfig:
+    """Direct desktop Anki export via AnkiConnect (local delivery mode)."""
+
+    type: Literal["anki"]
+    deck_name: str
+    model_name: str = "Chinese vocabulary"
+    anki_connect_url: str = "http://127.0.0.1:8765"
+    anki_connect_api_key: str | None = None
+    conflict_policy: str = "prefer-remote"
+    auto_create_deck: bool = True
+    auto_create_model: bool = True
+    auto_sync: bool = True
+
+
+ExporterConfig = CsvExporterConfig | XlsxExporterConfig | AnkiExporterConfig
 
 
 @dataclass(frozen=True)
@@ -91,6 +106,22 @@ def _parse_exporter_config(name: str, raw: object) -> ExporterConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"source_sets.{name}.exporters entries must be mappings")
     exp_type = raw.get("type")
+    if exp_type == "anki":
+        deck_name = raw.get("deck_name")
+        if not deck_name:
+            raise ValueError(f"Missing deck_name in source_sets.{name} anki exporter {raw!r}")
+        api_key = raw.get("anki_connect_api_key")
+        return AnkiExporterConfig(
+            type="anki",
+            deck_name=str(deck_name),
+            model_name=str(raw.get("model_name", "Chinese vocabulary")),
+            anki_connect_url=str(raw.get("anki_connect_url", "http://127.0.0.1:8765")),
+            anki_connect_api_key=str(api_key) if api_key else None,
+            conflict_policy=str(raw.get("conflict_policy", "prefer-remote")),
+            auto_create_deck=bool(raw.get("auto_create_deck", True)),
+            auto_create_model=bool(raw.get("auto_create_model", True)),
+            auto_sync=bool(raw.get("auto_sync", True)),
+        )
     dest = raw.get("destination")
     if not dest:
         raise ValueError(f"Missing destination in source_sets.{name} exporter {raw!r}")
@@ -100,6 +131,24 @@ def _parse_exporter_config(name: str, raw: object) -> ExporterConfig:
     if exp_type == "xlsx":
         return XlsxExporterConfig(type="xlsx", destination=path)
     raise ValueError(f"Unsupported exporter type {exp_type!r} in source_sets.{name}")
+
+
+def _exporter_json(cfg: ExporterConfig) -> dict[str, Any]:
+    if isinstance(cfg, AnkiExporterConfig):
+        out: dict[str, Any] = {
+            "type": cfg.type,
+            "deck_name": cfg.deck_name,
+            "model_name": cfg.model_name,
+            "anki_connect_url": cfg.anki_connect_url,
+            "conflict_policy": cfg.conflict_policy,
+            "auto_create_deck": cfg.auto_create_deck,
+            "auto_create_model": cfg.auto_create_model,
+            "auto_sync": cfg.auto_sync,
+        }
+        if cfg.anki_connect_api_key:
+            out["anki_connect_api_key"] = cfg.anki_connect_api_key
+        return out
+    return {"type": cfg.type, "destination": str(cfg.destination)}
 
 
 def _parse_edit_settling(name: str, body: dict[str, Any]) -> EditSettlingConfig:
@@ -224,9 +273,7 @@ def source_set_to_jsonable(config: dict[str, SourceSet]) -> dict[str, Any]:
     return {
         name: {
             "sources": [entry_json(s) for s in ss.sources],
-            "exporters": [
-                {"type": e.type, "destination": str(e.destination)} for e in ss.exporters
-            ],
+            "exporters": [_exporter_json(e) for e in ss.exporters],
             "edit_settling": {
                 "enabled": ss.edit_settling.enabled,
                 "quiet_minutes": ss.edit_settling.quiet_minutes,

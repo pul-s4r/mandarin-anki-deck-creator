@@ -251,13 +251,13 @@ def test_resolve_exporters_requires_cli_when_yaml_missing_exporters(tmp_path: Pa
         name="t",
         sources=(LocalFileSource(provider="local-filesystem", path=md, external_id="e"),),
     )
-    with pytest.raises(ValueError, match="--output"):
+    with pytest.raises(ValueError, match="Configure exporters"):
         resolve_exporters_for_schedule(sset, cli_output=None)
 
 
 def test_incremental_sync_writes_csv_and_xlsx_side_by_side(tmp_path: Path) -> None:
     from anki_deck_generator.config.settings import Settings
-    from anki_deck_generator.export.exporter_factory import build_file_exporters_from_configs
+    from anki_deck_generator.export.exporter_factory import build_schedule_exporters_from_configs
     from anki_deck_generator.state.sqlite_store import SqliteStateStore
     from anki_deck_generator.sync.orchestrator import run_incremental_sync
 
@@ -283,7 +283,7 @@ def test_incremental_sync_writes_csv_and_xlsx_side_by_side(tmp_path: Path) -> No
             XlsxExporterConfig(type="xlsx", destination=xlsx_out),
         ),
     )
-    exporters = build_file_exporters_from_configs(sset.exporters, csv_bom=False)
+    exporters = build_schedule_exporters_from_configs(sset.exporters, csv_bom=False)
     report = run_incremental_sync(
         sset,
         settings=settings,
