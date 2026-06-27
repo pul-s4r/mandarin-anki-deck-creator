@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "ci_gate": {
+    "enabled": true,
+    "commands": [
+      "pip install -e \".[dev,google-drive,ankiweb,server]\"",
+      "pytest -q"
+    ],
+    "timeout_seconds": 600
+  }
+}
