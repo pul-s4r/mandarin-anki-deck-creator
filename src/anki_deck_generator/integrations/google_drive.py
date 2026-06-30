@@ -121,7 +121,7 @@ def run_google_drive_oauth_and_save_token(*, client_secrets: Path, token_file: P
     token_file = token_file.expanduser().resolve()
     token_file.parent.mkdir(parents=True, exist_ok=True)
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets), scopes=[READONLY_DRIVE_SCOPE])
-    creds = flow.run_local_server(port=0)
+    creds = flow.run_local_server(port=8080)
     token_file.write_text(creds.to_json(), encoding="utf-8")
 
 
