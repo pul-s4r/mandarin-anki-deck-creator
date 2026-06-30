@@ -1,0 +1,112 @@
+# Source Set Configuration Template
+#
+# Copy this file and replace sample values with your actual paths.
+#
+# Usage:
+#   cp scripts/sources.yaml.example ~/Documents/my-sources.yaml
+#   # Edit ~/Documents/my-sources.yaml with your actual values
+#   ./scripts/run-live.sh --source-set-config ~/Documents/my-sources.yaml --source-set demo
+#
+# Schema reference: src/anki_deck_generator/config/source_sets.py
+
+schema_version: 1
+source_sets:
+  # ── Local files example ──────────────────────────────────────────────
+  demo:
+    sources:
+      - provider: local-filesystem
+        path: ~/Documents/mandarin-notes-sample.pdf
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-export.csv
+
+  # ── Local files with multiple exporters ──────────────────────────────
+  demo-multi-export:
+    sources:
+      - provider: local-filesystem
+        path: ~/Documents/mandarin-notes-sample.pdf
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-export.csv
+      - type: xlsx
+        destination: ~/Documents/demo-export.xlsx
+
+  # ── Multiple local sources ───────────────────────────────────────────
+  demo-multi-source:
+    sources:
+      - provider: local-filesystem
+        path: ~/Documents/notes-part1.pdf
+      - provider: local-filesystem
+        path: ~/Documents/notes-part2.pdf
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-multi-export.csv
+
+  # ── Google Drive example ─────────────────────────────────────────────
+  # Requires: anki-notes-pipeline auth google-drive --client-secrets <path>
+  demo-drive:
+    sources:
+      - provider: google-drive
+        folder_ids: ["YOUR_DRIVE_FOLDER_ID"]
+        file_ids: []
+        credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-drive-export.csv
+    edit_settling:
+      enabled: true
+      quiet_minutes: 10
+      max_delay_minutes: 120
+
+  # ── Google Drive with fast settling (for testing) ────────────────────
+  demo-drive-fast:
+    sources:
+      - provider: google-drive
+        folder_ids: ["YOUR_DRIVE_FOLDER_ID"]
+        file_ids: []
+        credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-drive-fast-export.csv
+    edit_settling:
+      enabled: true
+      quiet_minutes: 1
+      max_delay_minutes: 5
+
+  # ── Anki direct push example ─────────────────────────────────────────
+  # Used by: ./scripts/run-anki-upload.sh --source-set demo-anki
+  # Requires: Anki running with AnkiConnect plugin
+  demo-anki:
+    sources:
+      - provider: local-filesystem
+        path: ~/Documents/mandarin-notes-sample.pdf
+    exporters:
+      - type: anki
+        deck_name: "Chinese::301"
+        model_name: "Chinese vocabulary"
+        anki_connect_url: "http://127.0.0.1:8765"
+        anki_connect_api_key: null
+        conflict_policy: "prefer-remote"
+        auto_create_deck: true
+        auto_create_model: true
+        auto_sync: true
+
+  # ── Google Drive + Anki push ─────────────────────────────────────────
+  demo-drive-anki:
+    sources:
+      - provider: google-drive
+        folder_ids: ["YOUR_DRIVE_FOLDER_ID"]
+        file_ids: []
+        credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
+    exporters:
+      - type: csv
+        destination: ~/Documents/demo-drive-anki-export.csv
+      - type: anki
+        deck_name: "Chinese::301"
+        model_name: "Chinese vocabulary"
+        conflict_policy: "prefer-remote"
+        auto_sync: true
+    edit_settling:
+      enabled: true
+      quiet_minutes: 10
+      max_delay_minutes: 120
