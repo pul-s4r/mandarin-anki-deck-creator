@@ -86,10 +86,10 @@ def _record_paths(
     """Run pipeline with a stub LLM; return chunk_hash → chunk_text."""
     recorded_hashes: dict[str, str] = {}
 
-    def fake_extract(model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         h = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
         recorded_hashes[h] = chunk
-        return [_CARD]
+        return [_CARD], True
 
     import anki_deck_generator.pipeline as pipeline_mod
 

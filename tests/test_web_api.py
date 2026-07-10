@@ -43,7 +43,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         if "的" in chunk:
             return [
                 LlmVocabularyItem(
@@ -54,8 +54,8 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
                     part_of_speech="particle",
                     usage_notes="",
                 )
-            ]
-        return []
+            ], True
+        return [], True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
@@ -120,10 +120,10 @@ def test_sync_run_populates_agent_pending_queue(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setattr("anki_deck_generator.pipeline.build_bedrock_model", lambda _settings: MagicMock())
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         if "词" in chunk:
-            return [LlmVocabularyItem(simplified="词", meaning="word")]
-        return []
+            return [LlmVocabularyItem(simplified="词", meaning="word")], True
+        return [], True
 
     monkeypatch.setattr("anki_deck_generator.pipeline.extract_vocabulary_from_chunk", fake_extract)
     with TestClient(app) as api_client:

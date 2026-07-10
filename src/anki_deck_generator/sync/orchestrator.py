@@ -14,6 +14,7 @@ from anki_deck_generator.export.file_target import FileTargetExporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
 from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
 from anki_deck_generator.pipeline import (
+    PipelineContext,
     PipelineResult,
     PipelineStats,
     dedupe_llm_items,
@@ -139,26 +140,36 @@ def _run_llm_pipeline_for_source(
     def _on_chunk(seq: int, _sha: str, items: list) -> None:
         chunk_cards[sid][seq] = dedupe_llm_items(list(items))
 
-    all_cards, total_llm, proc, skipped = extract_llm_vocabulary_items(
-        normalized_text,
-        settings,
-        model=model,
+    ctx = PipelineContext(
         progress_callback=None,
         should_run_llm=_should_run_llm,
         load_cached_chunk_cards=_load_cached,
         on_chunk_processed=_on_chunk,
     )
+    all_cards, total_llm, proc, skipped, failed = extract_llm_vocabulary_items(
+        normalized_text,
+        settings,
+        model=model,
+        ctx=ctx,
+    )
     report.stats.chunks_processed += proc
     report.stats.chunks_skipped += skipped
     report.stats.sources_processed += 1
+    if failed:
+        logger.warning(
+            "Source %s: %d chunk(s) failed LLM extraction",
+            external_id,
+            failed,
+        )
 
     result = finish_pipeline_after_llm(
         all_cards,
         normalized_text,
         settings,
         model=model,
-        progress_callback=None,
+        ctx=PipelineContext(progress_callback=None),
         total_llm_chunks=total_llm,
+        chunks_failed=failed,
     )
 
     outcome = SyncRunOutcome(source_id=sid, external_id=external_id, skipped_document=False)

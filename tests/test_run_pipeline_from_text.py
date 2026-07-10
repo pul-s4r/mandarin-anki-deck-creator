@@ -19,7 +19,7 @@ def test_run_pipeline_from_text_rows_and_progress_order(
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         assert "的" in chunk
         return [
             LlmVocabularyItem(
@@ -30,7 +30,7 @@ def test_run_pipeline_from_text_rows_and_progress_order(
                 part_of_speech="particle",
                 usage_notes="",
             )
-        ]
+        ], True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",

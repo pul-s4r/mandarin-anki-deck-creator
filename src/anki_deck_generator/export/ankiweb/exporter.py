@@ -320,7 +320,9 @@ def _apply_create_or_duplicate(
         if nid_raw is None:
             note_id = _resolve_note_id(client, card)
             if note_id is None:
-                result.errors.append(f"addNotes returned null for card {card.card_id}; could not resolve note")
+                msg = f"addNotes returned null for card {card.card_id}; could not resolve note"
+                logger.warning("Anki export error: %s", msg)
+                result.errors.append(msg)
                 return False
             return _process_existing_note(
                 client=client,
@@ -338,12 +340,16 @@ def _apply_create_or_duplicate(
         return True
 
     if "duplicate" not in err.lower():
-        result.errors.append(f"cannot add note for card {card.card_id}: {err}")
+        msg = f"cannot add note for card {card.card_id}: {err}"
+        logger.warning("Anki export error: %s", msg)
+        result.errors.append(msg)
         return False
 
     note_id = _resolve_note_id(client, card)
     if note_id is None:
-        result.errors.append(f"duplicate note but no ext_id tag for card {card.card_id}")
+        msg = f"duplicate note but no ext_id tag for card {card.card_id}"
+        logger.warning("Anki export error: %s", msg)
+        result.errors.append(msg)
         return False
     return _process_existing_note(
         client=client,
@@ -418,6 +424,7 @@ def export_to_ankiweb(
             ):
                 needs_sync = True
         except AnkiConnectError as exc:
+            logger.warning("Anki export error for card %s: %s", card.card_id, exc)
             result.errors.append(str(exc))
 
     for card in pending_create:
@@ -441,6 +448,7 @@ def export_to_ankiweb(
             ):
                 needs_sync = True
         except AnkiConnectError as exc:
+            logger.warning("Anki export error for card %s: %s", card.card_id, exc)
             result.errors.append(str(exc))
 
     if needs_sync:
@@ -453,5 +461,12 @@ def export_to_ankiweb(
         except AnkiConnectError as exc:
             result.sync_status = f"failed: {exc}"
             logger.warning("AnkiConnect sync failed after export: %s", exc)
+
+    if result.errors:
+        logger.warning("Anki export had %d errors:", len(result.errors))
+        for err in result.errors[:10]:
+            logger.warning("  - %s", err)
+        if len(result.errors) > 10:
+            logger.warning("  ... and %d more", len(result.errors) - 10)
 
     return result

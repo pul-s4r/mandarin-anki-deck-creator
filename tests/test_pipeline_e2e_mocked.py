@@ -22,7 +22,7 @@ def test_run_pipeline_csv_with_cedict(tmp_path: Path, monkeypatch: pytest.Monkey
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         assert "的" in chunk
         return [
             LlmVocabularyItem(
@@ -33,7 +33,7 @@ def test_run_pipeline_csv_with_cedict(tmp_path: Path, monkeypatch: pytest.Monkey
                 part_of_speech="particle",
                 usage_notes="",
             )
-        ]
+        ], True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
@@ -59,7 +59,7 @@ def test_run_pipeline_llm_translation_fallback_without_cedict(
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         assert "lesson" in chunk
         return [
             LlmVocabularyItem(
@@ -70,16 +70,16 @@ def test_run_pipeline_llm_translation_fallback_without_cedict(
                 part_of_speech="",
                 usage_notes="",
             )
-        ]
+        ], True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
         fake_extract,
     )
 
-    def fake_translate(_model, terms: list[str]) -> dict[str, str]:
+    def fake_translate(_model, terms: list[str]) -> tuple[dict[str, str], bool]:
         assert terms == ["生词"]
-        return {"生词": "new word"}
+        return {"生词": "new word"}, True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.translate_simplified_terms",
@@ -112,7 +112,7 @@ def test_run_pipeline_cedict_decomposition_fallback(
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         return [
             LlmVocabularyItem(
                 simplified="团圆饭",
@@ -122,7 +122,7 @@ def test_run_pipeline_cedict_decomposition_fallback(
                 part_of_speech="",
                 usage_notes="",
             )
-        ]
+        ], True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
@@ -131,9 +131,9 @@ def test_run_pipeline_cedict_decomposition_fallback(
 
     called: dict[str, bool] = {"translate": False}
 
-    def fake_translate(_model, terms: list[str]) -> dict[str, str]:
+    def fake_translate(_model, terms: list[str]) -> tuple[dict[str, str], bool]:
         called["translate"] = True
-        return {}
+        return {}, True
 
     monkeypatch.setattr(
         "anki_deck_generator.pipeline.translate_simplified_terms",

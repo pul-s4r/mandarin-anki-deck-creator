@@ -37,8 +37,8 @@ class FixtureLlmModel:
     """
     Deterministic stand-in for ChatBedrockConverse when ANKI_PIPELINE_LLM_FIXTURE_PATH is set.
 
-    `extract_vocabulary_from_chunk` / `translate_simplified_terms` branch on this type instead
-    of calling `.invoke()` so we do not need to mimic Bedrock message shapes.
+    Implements the LlmClient Protocol (Item 5) and surfaces failure flags
+    (Item 1) — always returns success=True since fixtures are deterministic.
     """
 
     def __init__(self, data: LlmFixtureData) -> None:
@@ -48,7 +48,7 @@ class FixtureLlmModel:
     def from_path(cls, path: Path) -> FixtureLlmModel:
         return cls(LlmFixtureData.load(path))
 
-    def vocabulary_for_chunk(self, chunk_text: str) -> list[LlmVocabularyItem]:
+    def vocabulary_for_chunk(self, chunk_text: str) -> tuple[list[LlmVocabularyItem], bool]:
         key = chunk_content_key(chunk_text)
         raw_cards = self._data.chunks.get(key)
         if raw_cards is None:
@@ -57,9 +57,9 @@ class FixtureLlmModel:
                 f"LLM fixture missing chunk key {key!r} (snippet={snippet!r}). "
                 "Regenerate tests/baselines/llm_mock.json with tests/baselines/record.py."
             )
-        return [LlmVocabularyItem.model_validate(c) for c in raw_cards]
+        return [LlmVocabularyItem.model_validate(c) for c in raw_cards], True
 
-    def translations_for_terms(self, terms: list[str]) -> dict[str, str]:
+    def translate_terms(self, terms: list[str]) -> tuple[dict[str, str], bool]:
         out: dict[str, str] = {}
         for t in terms:
             s = t.strip()
@@ -69,8 +69,8 @@ class FixtureLlmModel:
                 out[s] = self._data.translations[s]
             else:
                 logger.warning("LLM fixture missing translation for term %r", s)
-        return out
+        return out, True
 
     def invoke(self, _messages: list[BaseMessage]) -> Any:
         """Not used when fixture path is set; present so accidental use fails loudly."""
-        raise RuntimeError("FixtureLlmModel.invoke should not be called; use vocabulary_for_chunk / translations_for_terms.")
+        raise RuntimeError("FixtureLlmModel.invoke should not be called; use vocabulary_for_chunk / translate_terms.")

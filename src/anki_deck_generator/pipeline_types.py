@@ -18,6 +18,8 @@ class PipelineStats:
     llm_translation_fallback_count: int
     decomposition_fallback_count: int
     sentence_link_count: int
+    chunks_failed: int = 0
+    translation_fallback_failed: bool = False
 
 
 @dataclass

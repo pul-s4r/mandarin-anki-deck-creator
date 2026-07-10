@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+import time
+from typing import Any, Protocol
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
 
 from anki_deck_generator.config.settings import Settings
@@ -21,6 +22,36 @@ from anki_deck_generator.llm.schemas import (
 logger = logging.getLogger(__name__)
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+
+# ── Item 5: LlmClient Protocol ──────────────────────────────────────────────
+
+
+class LlmClient(Protocol):
+    """Interface for LLM providers used by the pipeline."""
+
+    def vocabulary_for_chunk(self, text: str) -> tuple[list[LlmVocabularyItem], bool]: ...
+
+    def translate_terms(self, terms: list[str]) -> tuple[dict[str, str], bool]: ...
+
+
+# ── Item 5: _BedrockLlmClient adapter ───────────────────────────────────────
+
+
+class _BedrockLlmClient:
+    """Adapter wrapping ChatBedrockConverse to implement LlmClient Protocol."""
+
+    def __init__(self, model: ChatBedrockConverse) -> None:
+        self._model = model
+
+    def vocabulary_for_chunk(self, text: str) -> tuple[list[LlmVocabularyItem], bool]:
+        return (_fallback_json_invoke(self._model, text), True)
+
+    def translate_terms(self, terms: list[str]) -> tuple[dict[str, str], bool]:
+        return (_translate_bedrock(self._model, terms), True)
+
+
+# ── Message helpers ─────────────────────────────────────────────────────────
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -58,7 +89,38 @@ JSON Schema for your response (conform exactly):
 """
 
 
-def build_bedrock_model(settings: Settings) -> ChatBedrockConverse | FixtureLlmModel:
+# ── Item 2: Retry helper ────────────────────────────────────────────────────
+
+
+def _retry_invoke(
+    model: ChatBedrockConverse,
+    messages: list[BaseMessage],
+    *,
+    max_attempts: int = 3,
+    delay: float = 1.0,
+    multiplier: float = 2.0,
+) -> Any:
+    """Invoke Bedrock with exponential-backoff retry for transient errors."""
+    for attempt in range(max_attempts):
+        try:
+            return model.invoke(messages)
+        except Exception:
+            if attempt == max_attempts - 1:
+                raise
+            logger.warning(
+                "Bedrock invoke attempt %d/%d failed, retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+            delay *= multiplier
+
+
+# ── Builder ─────────────────────────────────────────────────────────────────
+
+
+def build_bedrock_model(settings: Settings) -> LlmClient:
     fp = settings.llm_fixture_path
     if fp is not None and fp.is_file():
         return FixtureLlmModel.from_path(fp)
@@ -71,17 +133,27 @@ def build_bedrock_model(settings: Settings) -> ChatBedrockConverse | FixtureLlmM
         kwargs["region_name"] = settings.aws_region
     if settings.bedrock_top_p is not None:
         kwargs["top_p"] = settings.bedrock_top_p
-    return ChatBedrockConverse(**kwargs)
+    return _BedrockLlmClient(ChatBedrockConverse(**kwargs))
+
+
+# ── Item 1 + 5: Unified public API ─────────────────────────────────────────
 
 
 def extract_vocabulary_from_chunk(
-    model: ChatBedrockConverse | FixtureLlmModel, chunk_text: str
-) -> list[LlmVocabularyItem]:
-    if isinstance(model, FixtureLlmModel):
-        return model.vocabulary_for_chunk(chunk_text)
-    # NOTE: Bedrock structured output can be brittle across models and releases.
-    # We always use an explicit JSON-only response contract and validate locally.
-    return _fallback_json_invoke(model, chunk_text)
+    model: LlmClient, chunk_text: str
+) -> tuple[list[LlmVocabularyItem], bool]:
+    """Extract vocabulary from a text chunk via the LlmClient protocol."""
+    return model.vocabulary_for_chunk(chunk_text)
+
+
+def translate_simplified_terms(
+    model: LlmClient, terms: list[str]
+) -> tuple[dict[str, str], bool]:
+    """Translate simplified terms via the LlmClient protocol."""
+    return model.translate_terms(terms)
+
+
+# ── Internal Bedrock implementations ────────────────────────────────────────
 
 
 def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
@@ -91,13 +163,16 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
         + llm_vocabulary_response_json_schema_text()
     )
     messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human)]
-    raw = model.invoke(messages)
+    try:
+        raw = _retry_invoke(model, messages)
+    except Exception:
+        logger.exception("Bedrock invoke failed permanently for chunk (len=%d)", len(chunk_text))
+        return []
     text = _message_content_to_text(raw.content)
     text = _FENCE.sub("", text).strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Try to recover if the model wrapped JSON in extra text.
         recovered = _extract_first_json_object(text)
         if recovered is None:
             logger.error("JSON fallback parse failed; snippet=%s", text[:200])
@@ -115,25 +190,7 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
         return []
 
 
-def _extract_first_json_object(text: str) -> str | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
-
-def translate_simplified_terms(
-    model: ChatBedrockConverse | FixtureLlmModel, terms: list[str]
-) -> dict[str, str]:
+def _translate_bedrock(model: ChatBedrockConverse, terms: list[str]) -> dict[str, str]:
     cleaned = [t.strip() for t in terms if t.strip()]
     if not cleaned:
         return {}
@@ -145,15 +202,16 @@ def translate_simplified_terms(
             seen.add(t)
             uniq.append(t)
 
-    if isinstance(model, FixtureLlmModel):
-        return model.translations_for_terms(uniq)
-
     human = _TRANSLATION_USER_TEMPLATE.format(
         terms="\n".join(uniq),
         schema=llm_translation_batch_json_schema_text(),
     )
     messages = [SystemMessage(content=_TRANSLATION_SYSTEM_PROMPT), HumanMessage(content=human)]
-    raw = model.invoke(messages)
+    try:
+        raw = _retry_invoke(model, messages)
+    except Exception:
+        logger.exception("Bedrock invoke failed permanently for translation")
+        return {}
     text = _message_content_to_text(raw.content)
     text = _FENCE.sub("", text).strip()
     try:
@@ -179,3 +237,19 @@ def translate_simplified_terms(
         if item.simplified and item.english:
             out[item.simplified] = item.english
     return out
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None

@@ -113,10 +113,10 @@ def test_incremental_cold_matches_pipeline(tmp_path: Path, baselines: tuple[Path
 def test_chunk_level_skips_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[str] = []
 
-    def spy(model: object, chunk: str) -> list:
+    def spy(model: object, chunk: str) -> tuple[list, bool]:
         calls.append(chunk)
         label = "A" if chunk.startswith("A") else "B"
-        return [LlmVocabularyItem(simplified=label, meaning=label.lower(), traditional="", pinyin="", part_of_speech="", usage_notes="")]
+        return [LlmVocabularyItem(simplified=label, meaning=label.lower(), traditional="", pinyin="", part_of_speech="", usage_notes="")], True
 
     monkeypatch.setattr(pipeline_module, "extract_vocabulary_from_chunk", spy)
     monkeypatch.setattr(

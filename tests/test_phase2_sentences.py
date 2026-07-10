@@ -19,9 +19,8 @@ def test_sentences_disabled_does_not_write_sidecar(tmp_path: Path, monkeypatch: 
         "anki_deck_generator.pipeline.build_bedrock_model",
         lambda _settings: MagicMock(),
     )
-    monkeypatch.setattr(
-        "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
-        lambda _model, _chunk: [
+    def fake_extract(_model: object, _chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
+        return [
             LlmVocabularyItem(
                 simplified="房东",
                 traditional="",
@@ -38,7 +37,11 @@ def test_sentences_disabled_does_not_write_sidecar(tmp_path: Path, monkeypatch: 
                 part_of_speech="",
                 usage_notes="",
             ),
-        ],
+        ], True
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
+        fake_extract,
     )
 
     settings = Settings(skip_lines_filter=False, enable_sentences=False)
@@ -61,7 +64,7 @@ def test_sentence_single_assignment_importance_prefers_longest(tmp_path: Path, m
         lambda _settings: MagicMock(),
     )
 
-    def fake_extract(_model, chunk: str) -> list[LlmVocabularyItem]:
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
         # ensure vocab extraction still sees terms
         assert "房租" in chunk or "房\n" in chunk
         return [
@@ -74,7 +77,7 @@ def test_sentence_single_assignment_importance_prefers_longest(tmp_path: Path, m
                 part_of_speech="",
                 usage_notes="",
             ),
-        ]
+        ], True
 
     monkeypatch.setattr("anki_deck_generator.pipeline.extract_vocabulary_from_chunk", fake_extract)
 
