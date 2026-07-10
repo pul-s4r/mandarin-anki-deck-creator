@@ -94,6 +94,35 @@ def test_run_pipeline_llm_translation_fallback_without_cedict(
     assert "LLM translation fallback" in data
 
 
+def test_run_pipeline_chunks_failed_on_llm_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    md = tmp_path / "notes.md"
+    md.write_text("lesson\n", encoding="utf-8")
+    out = tmp_path / "out.csv"
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.build_bedrock_model",
+        lambda _settings: MagicMock(),
+    )
+
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
+        return [], False
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
+        fake_extract,
+    )
+
+    settings = Settings(skip_lines_filter=False, enable_sentences=False)
+    run_pipeline(md, out, settings)
+    data = out.read_text(encoding="utf-8")
+    # CSV should be header-only (no cards extracted due to LLM failure)
+    assert data.strip().startswith("Key,")
+    assert "生词" not in data
+
+
 def test_run_pipeline_cedict_decomposition_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

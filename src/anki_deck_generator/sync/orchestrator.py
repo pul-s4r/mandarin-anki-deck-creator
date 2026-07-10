@@ -12,7 +12,7 @@ from anki_deck_generator.export.base import Exporter
 from anki_deck_generator.export.exporters import VocabularyXlsxFileExporter
 from anki_deck_generator.export.file_target import FileTargetExporter
 from anki_deck_generator.ingest.router import extract_text_from_bytes
-from anki_deck_generator.llm.bedrock_chain import build_bedrock_model
+from anki_deck_generator.llm.bedrock_chain import LlmClient, build_bedrock_model
 from anki_deck_generator.pipeline import (
     PipelineContext,
     PipelineResult,
@@ -114,7 +114,7 @@ def _run_llm_pipeline_for_source(
     normalized_text: str,
     settings: Settings,
     state_store: StateStore,
-    model: object,
+    model: LlmClient,
     user_id: str,
     chunk_cards: dict[str, dict[int, list]],
     report: SyncReport,
@@ -419,6 +419,8 @@ def run_incremental_sync(
                     llm_translation_fallback_count=0,
                     decomposition_fallback_count=0,
                     sentence_link_count=0,
+                    chunks_failed=0,
+                    translation_fallback_failed=False,
                 ),
             )
             data = exp.export(pr)

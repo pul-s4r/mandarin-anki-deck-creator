@@ -45,10 +45,10 @@ class _BedrockLlmClient:
         self._model = model
 
     def vocabulary_for_chunk(self, text: str) -> tuple[list[LlmVocabularyItem], bool]:
-        return (_fallback_json_invoke(self._model, text), True)
+        return _fallback_json_invoke(self._model, text)
 
     def translate_terms(self, terms: list[str]) -> tuple[dict[str, str], bool]:
-        return (_translate_bedrock(self._model, terms), True)
+        return _translate_bedrock(self._model, terms)
 
 
 # ── Message helpers ─────────────────────────────────────────────────────────
@@ -156,7 +156,9 @@ def translate_simplified_terms(
 # ── Internal Bedrock implementations ────────────────────────────────────────
 
 
-def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[LlmVocabularyItem]:
+def _fallback_json_invoke(
+    model: ChatBedrockConverse, chunk_text: str
+) -> tuple[list[LlmVocabularyItem], bool]:
     human = _USER_TEMPLATE.format(chunk_text=chunk_text)
     human += (
         "\n\nJSON Schema for your response (conform exactly; property descriptions are authoritative):\n"
@@ -167,7 +169,7 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
         raw = _retry_invoke(model, messages)
     except Exception:
         logger.exception("Bedrock invoke failed permanently for chunk (len=%d)", len(chunk_text))
-        return []
+        return [], False
     text = _message_content_to_text(raw.content)
     text = _FENCE.sub("", text).strip()
     try:
@@ -176,24 +178,26 @@ def _fallback_json_invoke(model: ChatBedrockConverse, chunk_text: str) -> list[L
         recovered = _extract_first_json_object(text)
         if recovered is None:
             logger.error("JSON fallback parse failed; snippet=%s", text[:200])
-            return []
+            return [], False
         try:
             data = json.loads(recovered)
         except json.JSONDecodeError:
             logger.error("JSON fallback recovery parse failed; snippet=%s", recovered[:200])
-            return []
+            return [], False
     try:
         result = LlmVocabularyResult.model_validate(data)
-        return list(result.cards)
+        return list(result.cards), True
     except Exception:
         logger.exception("validate fallback JSON failed")
-        return []
+        return [], False
 
 
-def _translate_bedrock(model: ChatBedrockConverse, terms: list[str]) -> dict[str, str]:
+def _translate_bedrock(
+    model: ChatBedrockConverse, terms: list[str]
+) -> tuple[dict[str, str], bool]:
     cleaned = [t.strip() for t in terms if t.strip()]
     if not cleaned:
-        return {}
+        return {}, True
 
     uniq: list[str] = []
     seen: set[str] = set()
@@ -211,7 +215,7 @@ def _translate_bedrock(model: ChatBedrockConverse, terms: list[str]) -> dict[str
         raw = _retry_invoke(model, messages)
     except Exception:
         logger.exception("Bedrock invoke failed permanently for translation")
-        return {}
+        return {}, False
     text = _message_content_to_text(raw.content)
     text = _FENCE.sub("", text).strip()
     try:
@@ -220,23 +224,23 @@ def _translate_bedrock(model: ChatBedrockConverse, terms: list[str]) -> dict[str
         recovered = _extract_first_json_object(text)
         if recovered is None:
             logger.error("Translation JSON parse failed; snippet=%s", text[:200])
-            return {}
+            return {}, False
         try:
             data = json.loads(recovered)
         except json.JSONDecodeError:
             logger.error("Translation JSON recovery parse failed; snippet=%s", recovered[:200])
-            return {}
+            return {}, False
     try:
         batch = LlmTranslationBatch.model_validate(data)
     except Exception:
         logger.exception("validate translation JSON failed")
-        return {}
+        return {}, False
 
     out: dict[str, str] = {}
     for item in batch.translations:
         if item.simplified and item.english:
             out[item.simplified] = item.english
-    return out
+    return out, True
 
 
 def _extract_first_json_object(text: str) -> str | None:
