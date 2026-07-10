@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     bedrock_top_p: Optional[float] = None
     bedrock_top_k: Optional[int] = None
     bedrock_max_tokens: int = 8192
+    bedrock_retry_max_attempts: int = 3
+    bedrock_retry_delay: float = 1.0
 
     chunk_size: int = 12000
     chunk_overlap: int = 400

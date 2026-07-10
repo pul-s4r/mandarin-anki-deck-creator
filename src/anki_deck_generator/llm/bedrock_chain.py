@@ -6,6 +6,7 @@ import re
 import time
 from typing import Any, Protocol
 
+from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
 
@@ -22,6 +23,52 @@ from anki_deck_generator.llm.schemas import (
 logger = logging.getLogger(__name__)
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# Transient error codes that warrant retry
+_RETRYABLE_CODES = frozenset({
+    "ThrottlingException", "Throttling", "LimitExceeded",
+    "InternalServerException", "ServiceUnavailable",
+    "OverloadedException",
+})
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transient Bedrock/network error worth retrying."""
+    if isinstance(exc, (ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError)):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in _RETRYABLE_CODES:
+            return True
+    return False
+
+
+def _retry_invoke(
+    model: ChatBedrockConverse,
+    messages: list[BaseMessage],
+    *,
+    max_attempts: int = 3,
+    delay: float = 1.0,
+    multiplier: float = 2.0,
+) -> Any:
+    """Invoke Bedrock with exponential-backoff retry for transient errors."""
+    for attempt in range(max_attempts):
+        try:
+            return model.invoke(messages)
+        except Exception as exc:
+            if attempt == max_attempts - 1:
+                raise
+            if not _is_transient_error(exc):
+                raise
+            logger.warning(
+                "Bedrock invoke attempt %d/%d failed (transient: %s), retrying in %.1fs",
+                attempt + 1,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            time.sleep(delay)
+            delay *= multiplier
 
 
 # ── Item 5: LlmClient Protocol ──────────────────────────────────────────────
@@ -41,14 +88,22 @@ class LlmClient(Protocol):
 class _BedrockLlmClient:
     """Adapter wrapping ChatBedrockConverse to implement LlmClient Protocol."""
 
-    def __init__(self, model: ChatBedrockConverse) -> None:
+    def __init__(
+        self,
+        model: ChatBedrockConverse,
+        *,
+        retry_max_attempts: int = 3,
+        retry_delay: float = 1.0,
+    ) -> None:
         self._model = model
+        self._retry_max_attempts = retry_max_attempts
+        self._retry_delay = retry_delay
 
     def vocabulary_for_chunk(self, text: str) -> tuple[list[LlmVocabularyItem], bool]:
-        return _fallback_json_invoke(self._model, text)
+        return _fallback_json_invoke(self._model, text, self._retry_max_attempts, self._retry_delay)
 
     def translate_terms(self, terms: list[str]) -> tuple[dict[str, str], bool]:
-        return _translate_bedrock(self._model, terms)
+        return _translate_bedrock(self._model, terms, self._retry_max_attempts, self._retry_delay)
 
 
 # ── Message helpers ─────────────────────────────────────────────────────────
@@ -89,34 +144,6 @@ JSON Schema for your response (conform exactly):
 """
 
 
-# ── Item 2: Retry helper ────────────────────────────────────────────────────
-
-
-def _retry_invoke(
-    model: ChatBedrockConverse,
-    messages: list[BaseMessage],
-    *,
-    max_attempts: int = 3,
-    delay: float = 1.0,
-    multiplier: float = 2.0,
-) -> Any:
-    """Invoke Bedrock with exponential-backoff retry for transient errors."""
-    for attempt in range(max_attempts):
-        try:
-            return model.invoke(messages)
-        except Exception:
-            if attempt == max_attempts - 1:
-                raise
-            logger.warning(
-                "Bedrock invoke attempt %d/%d failed, retrying in %.1fs",
-                attempt + 1,
-                max_attempts,
-                delay,
-            )
-            time.sleep(delay)
-            delay *= multiplier
-
-
 # ── Builder ─────────────────────────────────────────────────────────────────
 
 
@@ -133,7 +160,11 @@ def build_bedrock_model(settings: Settings) -> LlmClient:
         kwargs["region_name"] = settings.aws_region
     if settings.bedrock_top_p is not None:
         kwargs["top_p"] = settings.bedrock_top_p
-    return _BedrockLlmClient(ChatBedrockConverse(**kwargs))
+    return _BedrockLlmClient(
+        ChatBedrockConverse(**kwargs),
+        retry_max_attempts=settings.bedrock_retry_max_attempts,
+        retry_delay=settings.bedrock_retry_delay,
+    )
 
 
 # ── Item 1 + 5: Unified public API ─────────────────────────────────────────
@@ -157,7 +188,10 @@ def translate_simplified_terms(
 
 
 def _fallback_json_invoke(
-    model: ChatBedrockConverse, chunk_text: str
+    model: ChatBedrockConverse,
+    chunk_text: str,
+    max_attempts: int = 3,
+    delay: float = 1.0,
 ) -> tuple[list[LlmVocabularyItem], bool]:
     human = _USER_TEMPLATE.format(chunk_text=chunk_text)
     human += (
@@ -166,7 +200,7 @@ def _fallback_json_invoke(
     )
     messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=human)]
     try:
-        raw = _retry_invoke(model, messages)
+        raw = _retry_invoke(model, messages, max_attempts=max_attempts, delay=delay)
     except Exception:
         logger.exception("Bedrock invoke failed permanently for chunk (len=%d)", len(chunk_text))
         return [], False
@@ -193,7 +227,10 @@ def _fallback_json_invoke(
 
 
 def _translate_bedrock(
-    model: ChatBedrockConverse, terms: list[str]
+    model: ChatBedrockConverse,
+    terms: list[str],
+    max_attempts: int = 3,
+    delay: float = 1.0,
 ) -> tuple[dict[str, str], bool]:
     cleaned = [t.strip() for t in terms if t.strip()]
     if not cleaned:
@@ -212,7 +249,7 @@ def _translate_bedrock(
     )
     messages = [SystemMessage(content=_TRANSLATION_SYSTEM_PROMPT), HumanMessage(content=human)]
     try:
-        raw = _retry_invoke(model, messages)
+        raw = _retry_invoke(model, messages, max_attempts=max_attempts, delay=delay)
     except Exception:
         logger.exception("Bedrock invoke failed permanently for translation")
         return {}, False

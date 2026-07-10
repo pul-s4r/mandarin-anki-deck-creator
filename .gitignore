@@ -17,3 +17,6 @@ web-server-plan-r2-1.md
 .cursor/hooks/review-logs/
 .cursor/hooks/disable-review-hooks
 *.apkg
+
+# Local source-set config
+sources.yaml
