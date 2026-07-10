@@ -3,10 +3,17 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LlmVocabularyItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    """Extra fields ignored because the table parser (preprocess/tables.py)
+    legitimately mutates .pinyin and .meaning attributes post-construction
+    to append continuation lines.  Mutation bypasses validators but is
+    intentional and documented here."""
+
     simplified: str = Field(description="Simplified Chinese headword")
     traditional: str = Field(default="", description="Traditional form if known")
     pinyin: str = Field(default="", description="Hanyu Pinyin with tone marks when possible")
