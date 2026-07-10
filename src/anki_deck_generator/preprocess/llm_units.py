@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from anki_deck_generator.config.settings import Settings
-from anki_deck_generator.preprocess.blocks import segment_table_blocks
+from anki_deck_generator.preprocess.blocks import TextBlock, segment_table_blocks
 from anki_deck_generator.preprocess.chunk import chunk_text
 from anki_deck_generator.preprocess.fingerprints import sha256_utf8
 from anki_deck_generator.preprocess.tables import parse_table_block
@@ -21,13 +21,19 @@ class LlmTextUnit:
     kind: Literal["text_chunk", "table_fallback"]
 
 
-def list_llm_text_units(text: str, settings: Settings) -> list[LlmTextUnit]:
+def list_llm_text_units(
+    text: str,
+    settings: Settings,
+    *,
+    blocks: list[TextBlock] | None = None,
+) -> list[LlmTextUnit]:
     """
     Enumerate LLM units in the same order as ``extract_llm_vocabulary_items``.
 
     ``text`` must already be Unicode-normalized and optionally metadata-filtered.
     """
-    blocks = segment_table_blocks(text)
+    if blocks is None:
+        blocks = segment_table_blocks(text)
     text_chunk_lists: list[list[str]] = []
     for block in blocks:
         if block.kind == "table":

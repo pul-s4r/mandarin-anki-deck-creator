@@ -7,7 +7,7 @@ import pytest
 
 from anki_deck_generator.config.settings import Settings
 from anki_deck_generator.llm.schemas import LlmVocabularyItem
-from anki_deck_generator.pipeline import run_pipeline
+from anki_deck_generator.pipeline import run_pipeline, run_pipeline_from_text
 
 
 def test_run_pipeline_csv_with_cedict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,3 +183,88 @@ def test_run_pipeline_cedict_decomposition_fallback(
     assert "reunion" in data.lower()
     assert "meal" in data.lower()
     assert "CEDICT decomposition" in data
+
+
+def test_run_pipeline_unreadable_cedict_skips_enrichment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    md = tmp_path / "notes.md"
+    md.write_text("lesson\n", encoding="utf-8")
+    cedict = tmp_path / "cedict.u8"
+    cedict.write_text("garbage binary\xff\xfe", encoding="utf-8")
+    out = tmp_path / "out.csv"
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.build_bedrock_model",
+        lambda _settings: MagicMock(),
+    )
+
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
+        return [
+            LlmVocabularyItem(
+                simplified="生词",
+                traditional="",
+                pinyin="",
+                meaning="",
+                part_of_speech="",
+                usage_notes="",
+            )
+        ], True
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
+        fake_extract,
+    )
+
+    settings = Settings(cedict_path=cedict, skip_lines_filter=False, enable_sentences=False)
+    run_pipeline(md, out, settings)
+    data = out.read_text(encoding="utf-8")
+    assert "生词" in data
+    assert "enriched_count" not in data  # enrichment skipped, meaning stays empty
+
+
+def test_finish_pipeline_unreadable_cedict_no_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from anki_deck_generator.dictionary.source import FileLineDictionarySource
+
+    md = tmp_path / "notes.md"
+    md.write_text("lesson\n", encoding="utf-8")
+    cedict = tmp_path / "cedict.u8"
+    cedict.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.build_bedrock_model",
+        lambda _settings: MagicMock(),
+    )
+
+    def fake_extract(_model, chunk: str) -> tuple[list[LlmVocabularyItem], bool]:
+        return [
+            LlmVocabularyItem(
+                simplified="生词",
+                traditional="",
+                pinyin="",
+                meaning="",
+                part_of_speech="",
+                usage_notes="",
+            )
+        ], True
+
+    monkeypatch.setattr(
+        "anki_deck_generator.pipeline.extract_vocabulary_from_chunk",
+        fake_extract,
+    )
+
+    orig_init = FileLineDictionarySource.__init__
+
+    def broken_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(FileLineDictionarySource, "__init__", broken_init)
+
+    settings = Settings(cedict_path=cedict, skip_lines_filter=False, enable_sentences=False)
+    result = run_pipeline_from_text("lesson\n", settings)
+    assert result.stats.enriched_count == 0

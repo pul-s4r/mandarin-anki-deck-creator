@@ -129,7 +129,7 @@ def extract_llm_vocabulary_items(
 
     if blocks is None:
         blocks = segment_table_blocks(text)
-    llm_units = list_llm_text_units(text, settings)
+    llm_units = list_llm_text_units(text, settings, blocks=blocks)
     total_chunks = len(llm_units)
     chunk_cursor = 0
 
@@ -455,6 +455,7 @@ def run_pipeline_from_text(
     if progress_callback:
         progress_callback("normalize", 1, 1)
 
+    blocks = segment_table_blocks(text)
     model = build_bedrock_model(settings)
 
     all_cards, total_chunks, _processed, _skipped, chunks_failed = extract_llm_vocabulary_items_legacy(
@@ -462,6 +463,7 @@ def run_pipeline_from_text(
         settings,
         model=model,
         progress_callback=progress_callback,
+        blocks=blocks,
     )
 
     return finish_pipeline_after_llm_legacy(
@@ -471,6 +473,7 @@ def run_pipeline_from_text(
         model=model,
         progress_callback=progress_callback,
         total_llm_chunks=total_chunks,
+        blocks=blocks,
         chunks_failed=chunks_failed,
     )
 
