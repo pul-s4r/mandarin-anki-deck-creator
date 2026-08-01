@@ -10,11 +10,20 @@ import json
 import logging
 import os
 
+from anki_deck_generator.lambda_handlers.lambda_init import init_all
+
 logger = logging.getLogger(__name__)
+
+_initialized = False
 
 
 def handler(event: dict, context: object) -> dict:
     """AWS Lambda entry point for Drive push notifications (API Gateway proxy)."""
+    global _initialized
+    if not _initialized:
+        init_all()
+        _initialized = True
+
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     channel_id = headers.get("x-goog-channel-id", "")
     channel_token = headers.get("x-goog-channel-token", "")

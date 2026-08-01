@@ -8,13 +8,21 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
+
+from anki_deck_generator.lambda_handlers.lambda_init import init_all
 
 logger = logging.getLogger(__name__)
+
+_initialized = False
 
 
 def handler(event: dict, context: object) -> dict:
     """AWS Lambda entry point for scheduled or event-driven sync."""
+    global _initialized
+    if not _initialized:
+        init_all()
+        _initialized = True
+
     trigger = event.get("trigger", "schedule")
     source_set_name = event.get("source_set_name") or os.environ.get("ANKI_SOURCE_SET_NAME", "")
     user_id = event.get("user_id", "default")
@@ -38,14 +46,14 @@ def handler(event: dict, context: object) -> dict:
 
 def _run(*, trigger: str, source_set_name: str, user_id: str) -> int:
     from anki_deck_generator.config.settings import Settings
+    from anki_deck_generator.state import get_store
     from anki_deck_generator.sync.drive_events import process_pending
-    from anki_deck_generator.state.sqlite_store import SqliteStateStore
-
-    db_path = os.environ.get("ANKI_STATE_DB_PATH", "/tmp/state.db")
-    store = SqliteStateStore(Path(db_path))
-    store.init_schema()
 
     settings = Settings()
+    store = get_store(settings)
+    if store is None:
+        raise RuntimeError("State store not configured")
+
     return process_pending(
         state_store=store,
         source_set_name=source_set_name,

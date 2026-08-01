@@ -20,3 +20,6 @@ web-server-plan-r2-1.md
 
 # Local source-set config
 sources.yaml
+
+# AWS CLI output files
+get-caller-identity-*.json

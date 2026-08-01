@@ -9,11 +9,20 @@ from __future__ import annotations
 import logging
 import os
 
+from anki_deck_generator.lambda_handlers.lambda_init import init_all
+
 logger = logging.getLogger(__name__)
+
+_initialized = False
 
 
 def handler(event: dict, context: object) -> dict:
     """AWS Lambda entry point for watch channel renewal."""
+    global _initialized
+    if not _initialized:
+        init_all()
+        _initialized = True
+
     credentials_file = os.environ.get("GOOGLE_DRIVE_CREDENTIALS_FILE", "")
     webhook_url = os.environ.get("DRIVE_WEBHOOK_URL", "")
     user_id = event.get("user_id", "default")
@@ -37,14 +46,14 @@ def handler(event: dict, context: object) -> dict:
 
 
 def _renew(*, credentials_file: str, webhook_url: str, user_id: str) -> list[str]:
-    from pathlib import Path
-
-    from anki_deck_generator.state.sqlite_store import SqliteStateStore
+    from anki_deck_generator.config.settings import Settings
+    from anki_deck_generator.state import get_store
     from anki_deck_generator.sync.drive_watch import renew_expiring_channels
 
-    db_path = os.environ.get("ANKI_STATE_DB_PATH", "/tmp/state.db")
-    store = SqliteStateStore(Path(db_path))
-    store.init_schema()
+    settings = Settings()
+    store = get_store(settings)
+    if store is None:
+        raise RuntimeError("State store not configured")
 
     return renew_expiring_channels(
         credentials_file=credentials_file,

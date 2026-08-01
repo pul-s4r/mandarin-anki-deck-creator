@@ -47,7 +47,7 @@ source_sets:
   demo-drive:
     sources:
       - provider: google-drive
-        folder_ids: ["1CaiQXztmPQwoUxYeK5W1irz-JhuVObuW"]
+        folder_ids: ["YOUR_DRIVE_FOLDER_ID"]
         file_ids: []
         credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
     exporters:
@@ -96,7 +96,7 @@ source_sets:
     sources:
       - provider: google-drive
         folder_ids: []
-        file_ids: ["10LGwKwNDgvOJGz1WrQ_Qx9Otc3WIG0e4OiwL45Q1WJ4"]
+        file_ids: ["YOUR_DRIVE_FILE_ID"]
         credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
     exporters:
       - type: csv
@@ -109,7 +109,7 @@ source_sets:
     sources:
       - provider: google-drive
         folder_ids: []
-        file_ids: ["10LGwKwNDgvOJGz1WrQ_Qx9Otc3WIG0e4OiwL45Q1WJ4"]
+        file_ids: ["YOUR_DRIVE_FILE_ID"]
         credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
     exporters:
       - type: csv
@@ -124,7 +124,7 @@ source_sets:
     sources:
       - provider: google-drive
         folder_ids: []
-        file_ids: ["10LGwKwNDgvOJGz1WrQ_Qx9Otc3WIG0e4OiwL45Q1WJ4"]
+        file_ids: ["YOUR_DRIVE_FILE_ID"]
         credentials_file: ~/.config/anki-notes-pipeline/google-drive-token.json
     exporters:
       - type: csv
@@ -134,7 +134,7 @@ source_sets:
         model_name: "Chinese vocabulary"
         conflict_policy: "prefer-remote"
         auto_sync: true
-    edit_settling:
+    edit_settelling:
       enabled: true
       quiet_minutes: 10
       max_delay_minutes: 120

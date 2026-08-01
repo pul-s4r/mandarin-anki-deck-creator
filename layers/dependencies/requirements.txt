@@ -1,0 +1,13 @@
+boto3>=1.35
+langchain>=0.3
+langchain-aws>=1.4
+langchain-core>=0.3
+pydantic>=2
+pydantic-settings>=2
+pymupdf>=1.24
+python-docx>=1.1
+python-dotenv>=1.0
+pyyaml>=6
+google-api-python-client>=2
+google-auth>=2
+google-auth-oauthlib>=1

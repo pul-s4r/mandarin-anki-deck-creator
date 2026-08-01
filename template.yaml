@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Mandarin Anki Deck Creator - Serverless Lambda deployment
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 2048
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        ANKI_PIPELINE_STATE_BACKEND: dynamodb
+        ANKI_PIPELINE_DYNAMODB_TABLE_NAME: !Ref StateTable
+        ANKI_PIPELINE_BEDROCK_MODEL_ID: us.meta.llama4-scout-17b-instruct-v1:0
+        AWS_REGION_NAME: !Ref AWS::Region
+        DRIVE_CREDENTIALS_SECRET_ARN: !Ref DriveCredentialsSecret
+        SOURCE_CONFIG_BUCKET: !Ref SourceConfigBucket
+        SOURCE_CONFIG_KEY: sources.yaml
+        CEDICT_BUCKET: !Ref SourceConfigBucket
+        CEDICT_KEY: cedict_ts.u8
+
+Parameters:
+  SourceSetConfigPath:
+    Type: String
+    Default: /tmp/sources.yaml
+    Description: Path where source set YAML will be available
+  DriveCredentialsPath:
+    Type: String
+    Default: /tmp/google-drive-token.json
+    Description: Path where Drive OAuth token will be available
+  CedictPath:
+    Type: String
+    Default: /opt/cedict/cedict_ts.u8
+    Description: Path to CEDICT dictionary (Lambda Layer or S3)
+
+Resources:
+  # DynamoDB single-table state store
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: anki-pipeline-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: simplified
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: card_by_key
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: simplified
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl_unix
+        Enabled: true
+
+  # Lambda Layer for CEDICT dictionary
+  CedictLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: cedict-dictionary
+      Description: CEDICT Chinese-English dictionary
+      ContentUri: layers/cedict/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  # Lambda Layer for heavy dependencies
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: anki-pipeline-dependencies
+      Description: PyMuPDF, python-docx, langchain dependencies
+      ContentUri: layers/dependencies/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  # Sync Lambda function (Mode B - scheduled)
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: anki_deck_generator/lambda_handlers/handler_sync.handler
+      CodeUri: src/
+      Description: Incremental sync processor (scheduled or event-driven)
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - !Ref CedictLayer
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          ANKI_PIPELINE_SOURCE_SET_CONFIG: !Ref SourceSetConfigPath
+          ANKI_PIPELINE_CEDICT_PATH: !Ref CedictPath
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref DriveCredentialsSecret
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${SourceConfigBucket}/*
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+      Events:
+        ScheduledSync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Name: AnkiPipelineSyncSchedule
+            Description: Hourly sync job
+            Enabled: true
+
+  # Webhook Lambda function (Mode A - Drive push notifications)
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: anki_deck_generator/lambda_handlers/handler_drive_webhook.handler
+      CodeUri: src/
+      Description: Drive webhook receiver (API Gateway proxy)
+      Timeout: 30
+      MemorySize: 512
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          ANKI_PIPELINE_SOURCE_SET_CONFIG: !Ref SourceConfigPath
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${SourceConfigBucket}/*
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+      Events:
+        DriveWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /api/drive/notifications
+            Method: POST
+            ApiId: !Ref HttpApi
+
+  # Watch renewal Lambda function
+  WatchRenewalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: anki_deck_generator/lambda_handlers/handler_watch_renewal.handler
+      CodeUri: src/
+      Description: Drive watch channel renewal (scheduled)
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          GOOGLE_DRIVE_CREDENTIALS_FILE: !Ref DriveCredentialsPath
+          DRIVE_WEBHOOK_URL: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/api/drive/notifications
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref DriveCredentialsSecret
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${SourceConfigBucket}/*
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+      Events:
+        DailyRenewal:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Name: AnkiPipelineWatchRenewal
+            Description: Daily watch channel renewal
+            Enabled: true
+
+  # HTTP API for webhook endpoint
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+
+  # Secrets Manager for Drive OAuth token
+  DriveCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: anki-pipeline/drive-credentials
+      Description: Google Drive OAuth token for watch channels
+
+  # S3 bucket for source config and CEDICT
+  SourceConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub anki-pipeline-config-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+
+Outputs:
+  WebhookUrl:
+    Description: Drive webhook URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/api/drive/notifications
+  StateTableName:
+    Description: DynamoDB table name
+    Value: !Ref StateTable
+  SyncFunctionArn:
+    Description: Sync Lambda ARN
+    Value: !GetAtt SyncFunction.Arn
+  WebhookFunctionArn:
+    Description: Webhook Lambda ARN
+    Value: !GetAtt WebhookFunction.Arn
+  WatchRenewalFunctionArn:
+    Description: Watch renewal Lambda ARN
+    Value: !GetAtt WatchRenewalFunction.Arn
